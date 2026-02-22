@@ -67,6 +67,7 @@ pub struct App {
     pub selected: usize,
     pub detail_scroll: usize,
     pub detail_conversation: Option<Conversation>,
+    pub detail_loaded_for: Option<i64>,
     pub agent_filter: Option<Agent>,
     pub time_filter: TimeFilter,
     pub ranking_mode: RankingMode,
@@ -94,6 +95,7 @@ impl App {
             selected: 0,
             detail_scroll: 0,
             detail_conversation: None,
+            detail_loaded_for: None,
             agent_filter: None,
             time_filter: TimeFilter::All,
             ranking_mode: RankingMode::RecentHeavy,
@@ -314,6 +316,39 @@ impl App {
         self.search_generation.load(Ordering::SeqCst)
     }
 
+    fn selected_conversation_id(&self) -> Option<i64> {
+        self.results.get(self.selected).map(|r| r.conversation_id)
+    }
+
+    pub fn ensure_detail_loaded(&mut self, storage: &Storage) {
+        let selected_id = self.selected_conversation_id();
+
+        if selected_id.is_none() {
+            self.detail_conversation = None;
+            self.detail_loaded_for = None;
+            return;
+        }
+
+        if self.detail_loaded_for == selected_id {
+            return;
+        }
+
+        if let Some(id) = selected_id {
+            match storage.get_conversation(id) {
+                Ok(conv) => {
+                    self.detail_conversation = conv;
+                    self.detail_loaded_for = Some(id);
+                    self.detail_scroll = 0;
+                }
+                Err(e) => {
+                    self.detail_conversation = None;
+                    self.detail_loaded_for = None;
+                    self.status = format!("Failed to load detail: {}", e);
+                }
+            }
+        }
+    }
+
     pub fn update_results(&mut self, results: Vec<SearchResult>, total: usize, time_ms: u64, generation: u64) {
         // Only update if this is the latest search
         if generation == self.get_current_search_generation() {
@@ -322,10 +357,18 @@ impl App {
             self.search_time_ms = time_ms;
             self.status = format!("{} hits in {}ms", total, time_ms);
 
+            if self.results.is_empty() {
+                self.selected = 0;
+            }
+
             // Adjust selection if out of bounds
             if self.selected >= self.results.len() && !self.results.is_empty() {
                 self.selected = self.results.len() - 1;
             }
+
+            // Force detail reload for new result set / selection
+            self.detail_conversation = None;
+            self.detail_loaded_for = None;
         }
     }
 }
@@ -372,6 +415,9 @@ fn run_app_loop<B: Backend>(
     let mut last_search_gen = 0u64;
 
     loop {
+        // Keep detail pane synchronized with current selection
+        app.ensure_detail_loaded(storage);
+
         // Draw UI
         terminal.draw(|f| ui::draw(f, app, storage))?;
 
@@ -408,7 +454,10 @@ fn run_app_loop<B: Backend>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{Message, Role, SourceFile};
     use crate::search::SearchResult;
+    use crate::storage::Storage;
+    use tempfile::NamedTempFile;
 
     fn sample_result(id: i64) -> SearchResult {
         SearchResult {
@@ -443,5 +492,58 @@ mod tests {
 
         assert!(app.results.is_empty());
         assert_eq!(app.total_hits, 0);
+    }
+
+    #[test]
+    fn ensure_detail_loaded_populates_full_conversation() {
+        let db_file = NamedTempFile::new().unwrap();
+        let mut storage = Storage::new(db_file.path()).unwrap();
+
+        let conv = Conversation {
+            agent: Agent::PiAgent,
+            external_id: Some("test-session".to_string()),
+            title: Some("A long detail test".to_string()),
+            workspace: Some(std::path::PathBuf::from("/tmp")),
+            source_path: std::path::PathBuf::from("/tmp/sess.jsonl"),
+            source_files: vec![SourceFile {
+                path: std::path::PathBuf::from("/tmp/sess.jsonl"),
+                mtime: 1,
+                size: 1,
+            }],
+            source_fingerprint: "fp".to_string(),
+            started_at: Some(1),
+            ended_at: Some(2),
+            messages: vec![
+                Message {
+                    idx: 0,
+                    role: Role::User,
+                    content: "first message".to_string(),
+                    timestamp: Some(1),
+                    model: None,
+                },
+                Message {
+                    idx: 1,
+                    role: Role::Assistant,
+                    content: "second message".to_string(),
+                    timestamp: Some(2),
+                    model: Some("model-x".to_string()),
+                },
+            ],
+        };
+
+        let upsert = storage.upsert_conversation(&conv).unwrap();
+
+        let mut app = App::new();
+        app.results = vec![sample_result(upsert.conversation_id)];
+        app.selected = 0;
+
+        app.ensure_detail_loaded(&storage);
+
+        assert_eq!(app.detail_loaded_for, Some(upsert.conversation_id));
+        assert!(app.detail_conversation.is_some());
+        let loaded = app.detail_conversation.unwrap();
+        assert_eq!(loaded.messages.len(), 2);
+        assert_eq!(loaded.messages[0].content, "first message");
+        assert_eq!(loaded.messages[1].content, "second message");
     }
 }

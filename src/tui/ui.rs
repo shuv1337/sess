@@ -6,10 +6,10 @@ use ratatui::{
     Frame,
 };
 
-use crate::model::Agent;
+use crate::model::{Agent, Role};
 use crate::search::RankingMode;
 use crate::storage::Storage;
-use crate::tui::app::{App, Focus, TimeFilter};
+use crate::tui::app::{App, Focus};
 
 pub fn draw(f: &mut Frame, app: &App, _storage: &Storage) {
     let chunks = Layout::default()
@@ -178,12 +178,55 @@ fn draw_detail_pane(f: &mut Frame, app: &App, area: Rect) {
 
         text.extend(vec![Line::from("")]);
 
-        // Preview
-        text.extend(vec![Line::from(Span::styled(
-            "Preview:",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        ))]);
-        text.extend(vec![Line::from(result.preview.clone())]);
+        if let Some(conv) = &app.detail_conversation {
+            text.extend(vec![Line::from(Span::styled(
+                format!("Messages ({}):", conv.messages.len()),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ))]);
+            text.extend(vec![Line::from("")]);
+
+            for message in &conv.messages {
+                let role_label = format!("[{}]", message.role.as_str());
+                let mut header = vec![
+                    Span::styled(role_label, Style::default().fg(role_color(&message.role)).add_modifier(Modifier::BOLD)),
+                ];
+
+                if let Some(ts) = message.timestamp {
+                    let ts_str = chrono::DateTime::from_timestamp_millis(ts)
+                        .map(|dt| dt.format(" %H:%M:%S").to_string())
+                        .unwrap_or_default();
+                    header.push(Span::styled(ts_str, Style::default().fg(Color::DarkGray)));
+                }
+
+                if let Some(model) = &message.model {
+                    header.push(Span::styled(format!("  {}", model), Style::default().fg(Color::DarkGray)));
+                }
+
+                text.extend(vec![Line::from(header)]);
+
+                for line in message.content.lines() {
+                    text.extend(vec![Line::from(vec![Span::raw("  "), Span::raw(line.to_string())])]);
+                }
+
+                if message.content.is_empty() {
+                    text.extend(vec![Line::from("  ")]);
+                }
+
+                text.extend(vec![Line::from("")]);
+            }
+        } else {
+            // Fallback while loading detail
+            text.extend(vec![Line::from(Span::styled(
+                "Preview:",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ))]);
+            text.extend(vec![Line::from(result.preview.clone())]);
+            text.extend(vec![Line::from("")]);
+            text.extend(vec![Line::from(Span::styled(
+                "Loading full conversation...",
+                Style::default().fg(Color::DarkGray),
+            ))]);
+        }
 
         let paragraph = Paragraph::new(text)
             .wrap(Wrap { trim: false })
@@ -298,6 +341,15 @@ fn ranking_label(mode: RankingMode) -> &'static str {
         RankingMode::Relevance => "Relevance",
         RankingMode::Newest => "Newest",
         RankingMode::Oldest => "Oldest",
+    }
+}
+
+fn role_color(role: &Role) -> Color {
+    match role {
+        Role::User => Color::Cyan,
+        Role::Assistant => Color::Green,
+        Role::Tool => Color::Yellow,
+        Role::System => Color::Gray,
     }
 }
 
