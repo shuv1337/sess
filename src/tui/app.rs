@@ -125,6 +125,7 @@ impl App {
     pub fn on_key(&mut self, key: crossterm::event::KeyEvent) -> bool {
         // Global keys
         match key.code {
+            KeyCode::Char('q') if key.modifiers.is_empty() => return false,
             KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => return false,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return false,
             KeyCode::Char('?') => {
@@ -457,6 +458,7 @@ mod tests {
     use crate::model::{Message, Role, SourceFile};
     use crate::search::SearchResult;
     use crate::storage::Storage;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use tempfile::NamedTempFile;
 
     fn sample_result(id: i64) -> SearchResult {
@@ -545,5 +547,19 @@ mod tests {
         assert_eq!(loaded.messages.len(), 2);
         assert_eq!(loaded.messages[0].content, "first message");
         assert_eq!(loaded.messages[1].content, "second message");
+    }
+
+    #[test]
+    fn q_quits_app() {
+        let mut app = App::new();
+        let should_continue = app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!should_continue);
+    }
+
+    #[test]
+    fn ctrl_c_quits_app() {
+        let mut app = App::new();
+        let should_continue = app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(!should_continue);
     }
 }
