@@ -38,6 +38,12 @@ impl Clone for TantivyIndex {
             .try_into()
             .expect("Failed to clone reader");
 
+        // IMPORTANT: Reload the reader to ensure it sees existing index data.
+        // The OnCommitWithDelay policy only reloads on FUTURE commits,
+        // so we must manually reload to see data that was committed before
+        // this reader was created.
+        reader.reload().expect("Failed to reload reader");
+
         Self {
             index: self.index.clone(),
             schema: self.schema.clone(),
@@ -99,6 +105,9 @@ impl TantivyIndex {
             .reader_builder()
             .reload_policy(ReloadPolicy::OnCommitWithDelay)
             .try_into()?;
+
+        // Reload reader to ensure we see any existing index data
+        reader.reload()?;
 
         Ok(Self {
             index,
