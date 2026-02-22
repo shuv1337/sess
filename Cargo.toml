@@ -29,6 +29,7 @@ regex = "1"
 walkdir = "2"
 dirs = "5"
 base64 = "0.22"
+uuid = "1"
 
 # Logging
 tracing = "0.1"

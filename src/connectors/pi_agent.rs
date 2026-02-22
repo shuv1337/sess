@@ -46,6 +46,37 @@ impl PiAgentConnector {
             .as_ref()
             .map(|h| h.join(".local").join("share").join("shiv"))
     }
+
+    fn openclaw_dir(&self) -> Option<PathBuf> {
+        if let Ok(openclaw_dir) = std::env::var("OPENCLAW_HOME") {
+            return Some(PathBuf::from(openclaw_dir));
+        }
+        self.home_dir.as_ref().map(|h| h.join(".openclaw"))
+    }
+
+    fn session_roots_for(&self, root: &Path) -> Vec<PathBuf> {
+        let mut session_roots = Vec::new();
+
+        let direct_sessions = root.join("sessions");
+        if direct_sessions.exists() {
+            session_roots.push(direct_sessions);
+        }
+
+        // OpenClaw layout: ~/.openclaw/agents/<agent>/sessions
+        let agents_dir = root.join("agents");
+        if agents_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(&agents_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path().join("sessions");
+                    if path.exists() {
+                        session_roots.push(path);
+                    }
+                }
+            }
+        }
+
+        session_roots
+    }
 }
 
 impl Default for PiAgentConnector {
@@ -65,6 +96,10 @@ impl Connector for PiAgentConnector {
                 .shiv_dir()
                 .map(|p| p.join("sessions").exists())
                 .unwrap_or(false)
+            || self
+                .openclaw_dir()
+                .map(|p| p.join("agents").exists())
+                .unwrap_or(false)
     }
 
     fn default_roots(&self) -> Vec<PathBuf> {
@@ -77,6 +112,11 @@ impl Connector for PiAgentConnector {
                 roots.push(shiv);
             }
         }
+        if let Some(openclaw) = self.openclaw_dir() {
+            if !roots.contains(&openclaw) {
+                roots.push(openclaw);
+            }
+        }
         roots
     }
 
@@ -84,55 +124,49 @@ impl Connector for PiAgentConnector {
         let mut conversations = Vec::new();
 
         for root in roots {
-            let sessions_root = root.join("sessions");
-            if !sessions_root.exists() {
-                continue;
-            }
+            for sessions_root in self.session_roots_for(root) {
+                // Walk session directories
+                for entry in WalkDir::new(&sessions_root)
+                    .follow_links(true)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                    .filter(|e| {
+                        e.file_type().is_file()
+                            && e.path().extension().map(|ext| ext == "jsonl").unwrap_or(false)
+                    })
+                {
+                    let path = entry.path();
+                    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-            // Walk session directories
-            for entry in WalkDir::new(&sessions_root)
-                .follow_links(true)
-                .into_iter()
-                .filter_map(|e| e.ok())
-                .filter(|e| {
-                    e.file_type().is_file()
-                        && e.path().extension().map(|ext| ext == "jsonl").unwrap_or(false)
-                })
-            {
-                let path = entry.path();
-                let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-
-                // Supported session naming conventions:
-                // - pi-agent: {timestamp}_{uuid}.jsonl
-                // - shiv archive: session-{timestamp}.jsonl
-                if !(file_name.contains('_') || file_name.starts_with("session-")) {
-                    continue;
-                }
-
-                // Check if file was modified since the given timestamp
-                if !file_modified_since(path, since_ts) {
-                    continue;
-                }
-
-                match parse_pi_session(path) {
-                    Ok(Some(conv)) => {
-                        conversations.push(conv);
+                    if !is_supported_session_filename(file_name) {
+                        continue;
                     }
-                    Ok(None) => {
-                        // Empty or no messages, skip
+
+                    // Check if file was modified since the given timestamp
+                    if !file_modified_since(path, since_ts) {
+                        continue;
                     }
-                    Err(e) => {
-                        let action = self.on_parse_error(path, &e);
-                        match action {
-                            crate::connectors::ErrorAction::Skip => {
-                                tracing::warn!("Failed to parse {}: {}", path.display(), e);
-                            }
-                            crate::connectors::ErrorAction::Fail => {
-                                return Err(e);
-                            }
-                            crate::connectors::ErrorAction::SkipAgent => {
-                                tracing::warn!("Skipping remaining Pi Agent files due to error");
-                                return Ok(conversations);
+
+                    match parse_pi_session(path) {
+                        Ok(Some(conv)) => {
+                            conversations.push(conv);
+                        }
+                        Ok(None) => {
+                            // Empty or no messages, skip
+                        }
+                        Err(e) => {
+                            let action = self.on_parse_error(path, &e);
+                            match action {
+                                crate::connectors::ErrorAction::Skip => {
+                                    tracing::warn!("Failed to parse {}: {}", path.display(), e);
+                                }
+                                crate::connectors::ErrorAction::Fail => {
+                                    return Err(e);
+                                }
+                                crate::connectors::ErrorAction::SkipAgent => {
+                                    tracing::warn!("Skipping remaining Pi Agent files due to error");
+                                    return Ok(conversations);
+                                }
                             }
                         }
                     }
@@ -142,6 +176,27 @@ impl Connector for PiAgentConnector {
 
         Ok(conversations)
     }
+}
+
+fn is_supported_session_filename(file_name: &str) -> bool {
+    // pi-agent: {timestamp}_{uuid}.jsonl
+    if file_name.contains('_') {
+        return true;
+    }
+
+    // shiv archive format: session-{timestamp}.jsonl
+    if file_name.starts_with("session-") {
+        return true;
+    }
+
+    // openclaw: {uuid}.jsonl
+    if let Some(stem) = file_name.strip_suffix(".jsonl") {
+        if uuid::Uuid::parse_str(stem).is_ok() {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn parse_pi_session(path: &Path) -> Result<Option<Conversation>> {
@@ -567,10 +622,11 @@ mod tests {
     }
 
     #[test]
-    fn test_pi_connector_default_roots_include_shiv() {
+    fn test_pi_connector_default_roots_include_shiv_and_openclaw() {
         let home = TempDir::new().unwrap();
         std::fs::create_dir_all(home.path().join(".pi/agent/sessions")).unwrap();
         std::fs::create_dir_all(home.path().join(".local/share/shiv/sessions")).unwrap();
+        std::fs::create_dir_all(home.path().join(".openclaw/agents/main/sessions")).unwrap();
 
         let connector = PiAgentConnector {
             home_dir: Some(home.path().to_path_buf()),
@@ -579,7 +635,47 @@ mod tests {
         let roots = connector.default_roots();
         assert!(roots.contains(&home.path().join(".pi/agent")));
         assert!(roots.contains(&home.path().join(".local/share/shiv")));
+        assert!(roots.contains(&home.path().join(".openclaw")));
         assert!(connector.detect());
+    }
+
+    #[test]
+    fn test_supported_session_filename_openclaw_uuid() {
+        assert!(is_supported_session_filename(
+            "8a39b2de-8817-4448-84fb-3733494d81d7.jsonl"
+        ));
+        assert!(is_supported_session_filename("12345_uuid.jsonl"));
+        assert!(is_supported_session_filename("session-1770371965142.jsonl"));
+        assert!(!is_supported_session_filename("notes.jsonl"));
+    }
+
+    #[test]
+    fn test_pi_connector_scan_openclaw_layout() {
+        let home = TempDir::new().unwrap();
+        let sessions_dir = home.path().join(".openclaw/agents/main/sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_file = sessions_dir.join("8a39b2de-8817-4448-84fb-3733494d81d7.jsonl");
+        std::fs::write(
+            &session_file,
+            r#"{"type":"session","id":"s1","cwd":"/home/user/project","modelId":"m1"}
+{"type":"message","timestamp":"2024-01-15T10:00:00Z","message":{"role":"user","content":"hello openclaw"}}
+"#,
+        )
+        .unwrap();
+
+        let connector = PiAgentConnector {
+            home_dir: Some(home.path().to_path_buf()),
+        };
+
+        let conversations = connector
+            .scan(&[home.path().join(".openclaw")], None)
+            .unwrap();
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(
+            conversations[0].workspace,
+            Some(PathBuf::from("/home/user/project"))
+        );
     }
 
     #[test]
