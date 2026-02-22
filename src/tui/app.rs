@@ -346,7 +346,7 @@ pub fn run_app(storage: &Storage, tantivy: &Arc<crate::search::index::TantivyInd
     let mut app = App::new();
 
     // Initial search
-    search_thread.search(app.build_search_query());
+    search_thread.search(app.build_search_query(), app.get_current_search_generation());
 
     // Run main loop
     let res = run_app_loop(&mut terminal, &mut app, &search_thread, storage);
@@ -388,7 +388,7 @@ fn run_app_loop<B: Backend>(
         // Trigger search if needed
         let current_gen = app.get_current_search_generation();
         if current_gen != last_search_gen {
-            search_thread.search(app.build_search_query());
+            search_thread.search(app.build_search_query(), current_gen);
             last_search_gen = current_gen;
         }
 
@@ -402,5 +402,46 @@ fn run_app_loop<B: Backend>(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::search::SearchResult;
+
+    fn sample_result(id: i64) -> SearchResult {
+        SearchResult {
+            conversation_id: id,
+            agent: Agent::PiAgent,
+            title: Some("test".to_string()),
+            workspace: Some("/tmp".to_string()),
+            source_path: "/tmp/session.jsonl".to_string(),
+            preview: "preview".to_string(),
+            created_at: Some(1),
+            score: 1.0,
+            snippet: None,
+        }
+    }
+
+    #[test]
+    fn update_results_accepts_matching_generation() {
+        let mut app = App::new();
+        app.trigger_search(); // generation = 1
+        app.update_results(vec![sample_result(1)], 1, 5, 1);
+
+        assert_eq!(app.results.len(), 1);
+        assert_eq!(app.total_hits, 1);
+        assert_eq!(app.search_time_ms, 5);
+    }
+
+    #[test]
+    fn update_results_ignores_stale_generation() {
+        let mut app = App::new();
+        app.trigger_search(); // generation = 1
+        app.update_results(vec![sample_result(1)], 1, 5, 0); // stale
+
+        assert!(app.results.is_empty());
+        assert_eq!(app.total_hits, 0);
     }
 }
