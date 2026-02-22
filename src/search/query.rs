@@ -1,9 +1,10 @@
+use std::ops::Bound;
 use std::time::Instant;
 
 use anyhow::{Result};
 use tantivy::{
     collector::{Count, TopDocs},
-    query::{AllQuery, BooleanQuery, Occur, TermQuery},
+    query::{AllQuery, BooleanQuery, Occur, RangeQuery, TermQuery},
     schema::{IndexRecordOption, Value as TantivyValue},
     Term,
 };
@@ -151,14 +152,18 @@ pub fn execute(
         subqueries.push((Occur::Must, Box::new(term_query)));
     }
 
-    // Time range filters - use Term queries instead of RangeQuery for simplicity
-    if let Some(since) = query.since {
-        // We'll filter by using a greater than or equal check via score adjustment
-        // For now, just include all and filter in post-processing
-    }
-
-    if let Some(_until) = query.until {
-        // Same here
+    // Time range filter
+    if query.since.is_some() || query.until.is_some() {
+        let lower = query
+            .since
+            .map(Bound::Included)
+            .unwrap_or(Bound::Unbounded);
+        let upper = query
+            .until
+            .map(Bound::Included)
+            .unwrap_or(Bound::Unbounded);
+        let range_query = RangeQuery::new_i64_bounds("created_at".to_string(), lower, upper);
+        subqueries.push((Occur::Must, Box::new(range_query)));
     }
 
     let final_query: Box<dyn tantivy::query::Query> = if subqueries.is_empty() {
@@ -217,22 +222,6 @@ pub fn execute(
 
         let created_at = doc.get_first(field_created_at).and_then(|v| v.as_i64());
 
-        // Apply since/until filters in post-processing
-        if let Some(since) = query.since {
-            if let Some(ts) = created_at {
-                if ts < since {
-                    continue;
-                }
-            }
-        }
-
-        if let Some(until) = query.until {
-            if let Some(ts) = created_at {
-                if ts > until {
-                    continue;
-                }
-            }
-        }
 
         // Calculate blended score
         let bm25_score = *_score;
@@ -781,7 +770,8 @@ mod tests {
             ..Default::default()
         };
         let results = execute(&query, &index).unwrap();
-        assert!(results.hits.is_empty()); // Filtered out by post-processing
+        assert!(results.hits.is_empty());
+        assert_eq!(results.total_hits, 0);
     }
 
     #[test]
