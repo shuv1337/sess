@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -8,8 +7,8 @@ use base64::Engine;
 use serde_json::Value;
 use walkdir::WalkDir;
 
-use crate::connectors::{file_modified_since, flatten_json_content, parse_role, source_file, Connector};
-use crate::model::{Agent, Conversation, Message, Role, SourceFile, source_fingerprint};
+use crate::connectors::{file_modified_since, parse_role, source_file, Connector};
+use crate::model::{Agent, Conversation, Message, Role, source_fingerprint};
 
 pub struct PiAgentConnector {
     home_dir: Option<PathBuf>,
@@ -38,6 +37,15 @@ impl PiAgentConnector {
         }
         self.home_dir.as_ref().map(|h| h.join(".pi").join("agent"))
     }
+
+    fn shiv_dir(&self) -> Option<PathBuf> {
+        if let Ok(shiv_dir) = std::env::var("SHIV_AGENT_DIR") {
+            return Some(PathBuf::from(shiv_dir));
+        }
+        self.home_dir
+            .as_ref()
+            .map(|h| h.join(".local").join("share").join("shiv"))
+    }
 }
 
 impl Default for PiAgentConnector {
@@ -52,13 +60,24 @@ impl Connector for PiAgentConnector {
     }
 
     fn detect(&self) -> bool {
-        self.sessions_dir()
-            .map(|p| p.exists())
-            .unwrap_or(false)
+        self.sessions_dir().map(|p| p.exists()).unwrap_or(false)
+            || self
+                .shiv_dir()
+                .map(|p| p.join("sessions").exists())
+                .unwrap_or(false)
     }
 
     fn default_roots(&self) -> Vec<PathBuf> {
-        self.pi_dir().into_iter().collect()
+        let mut roots = Vec::new();
+        if let Some(pi) = self.pi_dir() {
+            roots.push(pi);
+        }
+        if let Some(shiv) = self.shiv_dir() {
+            if !roots.contains(&shiv) {
+                roots.push(shiv);
+            }
+        }
+        roots
     }
 
     fn scan(&self, roots: &[PathBuf], since_ts: Option<i64>) -> Result<Vec<Conversation>> {
@@ -83,8 +102,10 @@ impl Connector for PiAgentConnector {
                 let path = entry.path();
                 let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-                // Pi-agent naming convention: {timestamp}_{uuid}.jsonl
-                if !file_name.contains('_') {
+                // Supported session naming conventions:
+                // - pi-agent: {timestamp}_{uuid}.jsonl
+                // - shiv archive: session-{timestamp}.jsonl
+                if !(file_name.contains('_') || file_name.starts_with("session-")) {
                     continue;
                 }
 
@@ -526,7 +547,13 @@ mod tests {
 {"type":"message","timestamp":"2024-01-15T10:00:00Z","message":{"role":"user","content":"Hello"}}
 "#).unwrap();
 
-        // File without underscore (should be skipped)
+        // Shiv archive-style file name should also be accepted
+        let archive_file = sessions_dir.join("session-1770371965142.jsonl");
+        std::fs::write(&archive_file, r#"{"type":"session","id":"s2","cwd":"/test","modelId":"m1"}
+{"type":"message","timestamp":"2024-01-15T10:01:00Z","message":{"role":"assistant","content":"Archived hello"}}
+"#).unwrap();
+
+        // File without underscore or session- prefix should be skipped
         let other_file = sessions_dir.join("nounder.jsonl");
         std::fs::write(&other_file, r#"{"type":"message","timestamp":"2024-01-15T10:00:00Z","message":{"role":"user","content":"Skip me"}}
 "#).unwrap();
@@ -536,7 +563,23 @@ mod tests {
         };
 
         let conversations = connector.scan(&[dir.path().to_path_buf()], None).unwrap();
-        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations.len(), 2);
+    }
+
+    #[test]
+    fn test_pi_connector_default_roots_include_shiv() {
+        let home = TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".pi/agent/sessions")).unwrap();
+        std::fs::create_dir_all(home.path().join(".local/share/shiv/sessions")).unwrap();
+
+        let connector = PiAgentConnector {
+            home_dir: Some(home.path().to_path_buf()),
+        };
+
+        let roots = connector.default_roots();
+        assert!(roots.contains(&home.path().join(".pi/agent")));
+        assert!(roots.contains(&home.path().join(".local/share/shiv")));
+        assert!(connector.detect());
     }
 
     #[test]
