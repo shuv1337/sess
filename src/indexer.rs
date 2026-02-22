@@ -43,8 +43,9 @@ impl Indexer {
         let tantivy_path = data_dir.join("tantivy");
 
         let storage = Storage::new(&db_path)?;
-        let mut tantivy = TantivyIndex::open_or_create(&tantivy_path)?;
-        tantivy.start_writer()?;
+        // Don't start writer here - only start it when actually indexing
+        // This avoids holding an exclusive file lock when just reading
+        let tantivy = TantivyIndex::open_or_create(&tantivy_path)?;
 
         let semantic = if enable_semantic {
             match SemanticIndex::new() {
@@ -73,6 +74,9 @@ impl Indexer {
     pub fn full_index(&mut self) -> Result<IndexStats> {
         let start = std::time::Instant::now();
         let mut stats = IndexStats::default();
+
+        // Ensure writer is started for indexing
+        self.tantivy.start_writer()?;
 
         // Collect all source paths for staleness detection
         let mut all_source_paths: HashSet<PathBuf> = HashSet::new();
@@ -130,6 +134,9 @@ impl Indexer {
     pub fn incremental_index(&mut self) -> Result<IndexStats> {
         let start = std::time::Instant::now();
         let mut stats = IndexStats::default();
+
+        // Ensure writer is started for indexing
+        self.tantivy.start_writer()?;
 
         // Get last scan timestamp
         let since_ts = self.storage
@@ -198,6 +205,9 @@ impl Indexer {
     pub fn rebuild(&mut self) -> Result<IndexStats> {
         let start = std::time::Instant::now();
         let mut stats = IndexStats::default();
+
+        // Ensure writer is started for rebuilding
+        self.tantivy.start_writer()?;
 
         // Get all conversations from SQLite
         let conversations = self.storage.get_all_conversations()?;
@@ -369,6 +379,9 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let mut indexer = Indexer::new(&temp_dir.path().to_path_buf(), false).unwrap();
 
+        // Start writer for indexing
+        indexer.tantivy.start_writer().unwrap();
+
         let conv = crate::model::Conversation {
             agent: Agent::ClaudeCode,
             external_id: Some("test".to_string()),
@@ -414,6 +427,9 @@ mod tests {
     fn test_index_conversation_idempotent() {
         let temp_dir = TempDir::new().unwrap();
         let mut indexer = Indexer::new(&temp_dir.path().to_path_buf(), false).unwrap();
+
+        // Start writer for indexing
+        indexer.tantivy.start_writer().unwrap();
 
         let conv = crate::model::Conversation {
             agent: Agent::Codex,
