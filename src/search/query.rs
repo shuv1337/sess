@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use anyhow::{Result};
 use tantivy::{
-    collector::TopDocs,
+    collector::{Count, TopDocs},
     query::{AllQuery, BooleanQuery, Occur, TermQuery},
     schema::{IndexRecordOption, Value as TantivyValue},
     Term,
@@ -171,6 +171,7 @@ pub fn execute(
     };
 
     // Execute search
+    let total_hits = searcher.search(&final_query, &Count)?;
     let collector = TopDocs::with_limit(query.limit + query.offset);
     let top_docs = searcher.search(&final_query, &collector)?;
 
@@ -267,7 +268,7 @@ pub fn execute(
 
     Ok(SearchResults {
         hits,
-        total_hits: top_docs.len(),
+        total_hits,
         query_time_ms,
     })
 }
