@@ -25,7 +25,11 @@ impl SemanticIndex {
     /// Generate embedding for text
     pub fn embed(&self, text: &str) -> Result<Vec<f32>> {
         let truncated = if text.len() > 1000 {
-            &text[..1000]
+            let mut end = 1000;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            &text[..end]
         } else {
             text
         };
