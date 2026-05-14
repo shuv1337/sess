@@ -201,11 +201,7 @@ impl Conversation {
 
     /// Calculate the max mtime across all source files.
     pub fn source_mtime_max(&self) -> i64 {
-        self.source_files
-            .iter()
-            .map(|f| f.mtime)
-            .max()
-            .unwrap_or(0)
+        self.source_files.iter().map(|f| f.mtime).max().unwrap_or(0)
     }
 }
 
@@ -264,7 +260,9 @@ pub fn parse_timestamp(val: &serde_json::Value) -> Option<i64> {
             // Try ISO 8601 parsing
             if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
                 Some(dt.timestamp_millis())
-            } else if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f%:z") {
+            } else if let Ok(dt) =
+                chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f%:z")
+            {
                 Some(dt.and_utc().timestamp_millis())
             } else {
                 None
@@ -359,19 +357,29 @@ mod tests {
     #[test]
     fn test_agent_icon_and_color() {
         // Ensure each agent has a unique icon
-        let icons: Vec<&str> = [Agent::ClaudeCode, Agent::Codex, Agent::OpenCode, Agent::PiAgent]
-            .iter()
-            .map(|a| a.icon())
-            .collect();
+        let icons: Vec<&str> = [
+            Agent::ClaudeCode,
+            Agent::Codex,
+            Agent::OpenCode,
+            Agent::PiAgent,
+        ]
+        .iter()
+        .map(|a| a.icon())
+        .collect();
         assert_eq!(icons.len(), 4);
         for i in 0..icons.len() {
-            for j in (i+1)..icons.len() {
+            for j in (i + 1)..icons.len() {
                 assert_ne!(icons[i], icons[j]);
             }
         }
 
         // Color codes are valid RGB tuples
-        for agent in [Agent::ClaudeCode, Agent::Codex, Agent::OpenCode, Agent::PiAgent] {
+        for agent in [
+            Agent::ClaudeCode,
+            Agent::Codex,
+            Agent::OpenCode,
+            Agent::PiAgent,
+        ] {
             let (r, g, b) = agent.color_code();
             assert!(r <= 255 && g <= 255 && b <= 255);
         }
@@ -454,18 +462,40 @@ mod tests {
     #[test]
     fn test_first_user_message() {
         let conv = make_conv(vec![
-            Message { idx: 0, role: Role::System, content: "System msg".into(), timestamp: None, model: None },
-            Message { idx: 1, role: Role::User, content: "Hello!".into(), timestamp: None, model: None },
-            Message { idx: 2, role: Role::User, content: "Second".into(), timestamp: None, model: None },
+            Message {
+                idx: 0,
+                role: Role::System,
+                content: "System msg".into(),
+                timestamp: None,
+                model: None,
+            },
+            Message {
+                idx: 1,
+                role: Role::User,
+                content: "Hello!".into(),
+                timestamp: None,
+                model: None,
+            },
+            Message {
+                idx: 2,
+                role: Role::User,
+                content: "Second".into(),
+                timestamp: None,
+                model: None,
+            },
         ]);
         assert_eq!(conv.first_user_message(), Some("Hello!"));
     }
 
     #[test]
     fn test_first_user_message_none() {
-        let conv = make_conv(vec![
-            Message { idx: 0, role: Role::Assistant, content: "Hi".into(), timestamp: None, model: None },
-        ]);
+        let conv = make_conv(vec![Message {
+            idx: 0,
+            role: Role::Assistant,
+            content: "Hi".into(),
+            timestamp: None,
+            model: None,
+        }]);
         assert_eq!(conv.first_user_message(), None);
     }
 
@@ -478,9 +508,13 @@ mod tests {
 
     #[test]
     fn test_derive_title_from_first_user_message() {
-        let conv = make_conv(vec![
-            Message { idx: 0, role: Role::User, content: "Help me with auth\nMore details...".into(), timestamp: None, model: None },
-        ]);
+        let conv = make_conv(vec![Message {
+            idx: 0,
+            role: Role::User,
+            content: "Help me with auth\nMore details...".into(),
+            timestamp: None,
+            model: None,
+        }]);
         assert_eq!(conv.derive_title(), "Help me with auth");
     }
 
@@ -503,8 +537,20 @@ mod tests {
     #[test]
     fn test_full_text() {
         let conv = make_conv(vec![
-            Message { idx: 0, role: Role::User, content: "Hello".into(), timestamp: None, model: None },
-            Message { idx: 1, role: Role::Assistant, content: "World".into(), timestamp: None, model: None },
+            Message {
+                idx: 0,
+                role: Role::User,
+                content: "Hello".into(),
+                timestamp: None,
+                model: None,
+            },
+            Message {
+                idx: 1,
+                role: Role::Assistant,
+                content: "World".into(),
+                timestamp: None,
+                model: None,
+            },
         ]);
         let text = conv.full_text();
         assert!(text.contains("[user] Hello"));
@@ -513,9 +559,13 @@ mod tests {
 
     #[test]
     fn test_preview_short() {
-        let conv = make_conv(vec![
-            Message { idx: 0, role: Role::User, content: "Short".into(), timestamp: None, model: None },
-        ]);
+        let conv = make_conv(vec![Message {
+            idx: 0,
+            role: Role::User,
+            content: "Short".into(),
+            timestamp: None,
+            model: None,
+        }]);
         let preview = conv.preview();
         assert!(!preview.ends_with("..."));
     }
@@ -523,9 +573,13 @@ mod tests {
     #[test]
     fn test_preview_long_truncated() {
         let long_msg = "x".repeat(500);
-        let conv = make_conv(vec![
-            Message { idx: 0, role: Role::User, content: long_msg, timestamp: None, model: None },
-        ]);
+        let conv = make_conv(vec![Message {
+            idx: 0,
+            role: Role::User,
+            content: long_msg,
+            timestamp: None,
+            model: None,
+        }]);
         let preview = conv.preview();
         assert!(preview.len() <= 310); // ~300 + "..."
         assert!(preview.ends_with("..."));
@@ -540,9 +594,21 @@ mod tests {
             workspace: None,
             source_path: PathBuf::from("/test"),
             source_files: vec![
-                SourceFile { path: PathBuf::from("/a"), mtime: 100, size: 10 },
-                SourceFile { path: PathBuf::from("/b"), mtime: 300, size: 20 },
-                SourceFile { path: PathBuf::from("/c"), mtime: 200, size: 30 },
+                SourceFile {
+                    path: PathBuf::from("/a"),
+                    mtime: 100,
+                    size: 10,
+                },
+                SourceFile {
+                    path: PathBuf::from("/b"),
+                    mtime: 300,
+                    size: 20,
+                },
+                SourceFile {
+                    path: PathBuf::from("/c"),
+                    mtime: 200,
+                    size: 30,
+                },
             ],
             source_fingerprint: "x".into(),
             started_at: None,
@@ -563,8 +629,16 @@ mod tests {
     #[test]
     fn test_source_fingerprint_stable() {
         let files = vec![
-            SourceFile { path: PathBuf::from("/a/b.json"), mtime: 1000, size: 500 },
-            SourceFile { path: PathBuf::from("/c/d.json"), mtime: 2000, size: 1000 },
+            SourceFile {
+                path: PathBuf::from("/a/b.json"),
+                mtime: 1000,
+                size: 500,
+            },
+            SourceFile {
+                path: PathBuf::from("/c/d.json"),
+                mtime: 2000,
+                size: 1000,
+            },
         ];
         let fp1 = source_fingerprint(&files);
         let fp2 = source_fingerprint(&files);
@@ -572,8 +646,16 @@ mod tests {
 
         // Order shouldn't matter
         let files_rev = vec![
-            SourceFile { path: PathBuf::from("/c/d.json"), mtime: 2000, size: 1000 },
-            SourceFile { path: PathBuf::from("/a/b.json"), mtime: 1000, size: 500 },
+            SourceFile {
+                path: PathBuf::from("/c/d.json"),
+                mtime: 2000,
+                size: 1000,
+            },
+            SourceFile {
+                path: PathBuf::from("/a/b.json"),
+                mtime: 1000,
+                size: 500,
+            },
         ];
         let fp3 = source_fingerprint(&files_rev);
         assert_eq!(fp1, fp3);
@@ -581,15 +663,31 @@ mod tests {
 
     #[test]
     fn test_source_fingerprint_changes_on_mtime() {
-        let files1 = vec![SourceFile { path: PathBuf::from("/a"), mtime: 1000, size: 500 }];
-        let files2 = vec![SourceFile { path: PathBuf::from("/a"), mtime: 2000, size: 500 }];
+        let files1 = vec![SourceFile {
+            path: PathBuf::from("/a"),
+            mtime: 1000,
+            size: 500,
+        }];
+        let files2 = vec![SourceFile {
+            path: PathBuf::from("/a"),
+            mtime: 2000,
+            size: 500,
+        }];
         assert_ne!(source_fingerprint(&files1), source_fingerprint(&files2));
     }
 
     #[test]
     fn test_source_fingerprint_changes_on_size() {
-        let files1 = vec![SourceFile { path: PathBuf::from("/a"), mtime: 1000, size: 500 }];
-        let files2 = vec![SourceFile { path: PathBuf::from("/a"), mtime: 1000, size: 600 }];
+        let files1 = vec![SourceFile {
+            path: PathBuf::from("/a"),
+            mtime: 1000,
+            size: 500,
+        }];
+        let files2 = vec![SourceFile {
+            path: PathBuf::from("/a"),
+            mtime: 1000,
+            size: 600,
+        }];
         assert_ne!(source_fingerprint(&files1), source_fingerprint(&files2));
     }
 

@@ -1,9 +1,9 @@
 use ratatui::{
+    Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
-    Frame,
 };
 
 use crate::model::{Agent, Role};
@@ -15,9 +15,9 @@ pub fn draw(f: &mut Frame, app: &App, _storage: &Storage) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // Search bar
-            Constraint::Min(10),    // Main content
-            Constraint::Length(1),  // Status bar
+            Constraint::Length(3), // Search bar
+            Constraint::Min(10),   // Main content
+            Constraint::Length(1), // Status bar
         ])
         .split(f.area());
 
@@ -57,10 +57,7 @@ fn draw_search_bar(f: &mut Frame, app: &App, area: Rect) {
 fn draw_main_content(f: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(50),
-            Constraint::Percentage(50),
-        ])
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
 
     draw_results_list(f, app, chunks[0]);
@@ -85,23 +82,23 @@ fn draw_results_list(f: &mut Frame, app: &App, area: Rect) {
             let agent_color = agent_color(result.agent);
             let agent_icon = result.agent.icon();
 
-            let title = result.title.clone().unwrap_or_else(|| "Untitled".to_string());
-            let date = result.created_at.map(|ts| {
-                chrono::DateTime::from_timestamp_millis(ts)
-                    .map(|dt| dt.format("%Y-%m-%d").to_string())
-                    .unwrap_or_default()
-            }).unwrap_or_default();
+            let title = result
+                .title
+                .clone()
+                .unwrap_or_else(|| "Untitled".to_string());
+            let date = result
+                .created_at
+                .map(|ts| {
+                    chrono::DateTime::from_timestamp_millis(ts)
+                        .map(|dt| dt.format("%Y-%m-%d").to_string())
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
 
             let line = Line::from(vec![
-                Span::styled(
-                    format!("{} ", agent_icon),
-                    Style::default().fg(agent_color),
-                ),
+                Span::styled(format!("{} ", agent_icon), Style::default().fg(agent_color)),
                 Span::raw(title),
-                Span::styled(
-                    format!(" {}", date),
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled(format!(" {}", date), Style::default().fg(Color::DarkGray)),
             ]);
 
             ListItem::new(line).style(if i == app.selected {
@@ -181,15 +178,20 @@ fn draw_detail_pane(f: &mut Frame, app: &App, area: Rect) {
         if let Some(conv) = &app.detail_conversation {
             text.extend(vec![Line::from(Span::styled(
                 format!("Messages ({}):", conv.messages.len()),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             ))]);
             text.extend(vec![Line::from("")]);
 
             for message in &conv.messages {
                 let role_label = format!("[{}]", message.role.as_str());
-                let mut header = vec![
-                    Span::styled(role_label, Style::default().fg(role_color(&message.role)).add_modifier(Modifier::BOLD)),
-                ];
+                let mut header = vec![Span::styled(
+                    role_label,
+                    Style::default()
+                        .fg(role_color(&message.role))
+                        .add_modifier(Modifier::BOLD),
+                )];
 
                 if let Some(ts) = message.timestamp {
                     let ts_str = chrono::DateTime::from_timestamp_millis(ts)
@@ -199,13 +201,19 @@ fn draw_detail_pane(f: &mut Frame, app: &App, area: Rect) {
                 }
 
                 if let Some(model) = &message.model {
-                    header.push(Span::styled(format!("  {}", model), Style::default().fg(Color::DarkGray)));
+                    header.push(Span::styled(
+                        format!("  {}", model),
+                        Style::default().fg(Color::DarkGray),
+                    ));
                 }
 
                 text.extend(vec![Line::from(header)]);
 
                 for line in message.content.lines() {
-                    text.extend(vec![Line::from(vec![Span::raw("  "), Span::raw(line.to_string())])]);
+                    text.extend(vec![Line::from(vec![
+                        Span::raw("  "),
+                        Span::raw(line.to_string()),
+                    ])]);
                 }
 
                 if message.content.is_empty() {
@@ -218,7 +226,9 @@ fn draw_detail_pane(f: &mut Frame, app: &App, area: Rect) {
             // Fallback while loading detail
             text.extend(vec![Line::from(Span::styled(
                 "Preview:",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             ))]);
             text.extend(vec![Line::from(result.preview.clone())]);
             text.extend(vec![Line::from("")]);
@@ -234,8 +244,7 @@ fn draw_detail_pane(f: &mut Frame, app: &App, area: Rect) {
 
         f.render_widget(paragraph, inner);
     } else {
-        let placeholder = Paragraph::new("No results selected")
-            .alignment(Alignment::Center);
+        let placeholder = Paragraph::new("No results selected").alignment(Alignment::Center);
         f.render_widget(placeholder, inner);
     }
 }
@@ -373,4 +382,3 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         ])
         .split(popup_layout[1])[1]
 }
-

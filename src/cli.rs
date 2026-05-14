@@ -160,7 +160,10 @@ pub fn parse_date(s: &str) -> anyhow::Result<i64> {
         return Ok(dt.timestamp_millis());
     }
 
-    anyhow::bail!("Invalid date format: {}. Use ISO date (2024-01-01), relative (7d), or 'today'", s)
+    anyhow::bail!(
+        "Invalid date format: {}. Use ISO date (2024-01-01), relative (7d), or 'today'",
+        s
+    )
 }
 
 #[derive(Serialize)]
@@ -212,21 +215,28 @@ impl SearchOutput {
             query: query.to_string(),
             total_hits: results.total_hits,
             query_time_ms: results.query_time_ms,
-            hits: results.hits.into_iter().map(|h| SearchHitOutput {
-                id: h.conversation_id,
-                agent: h.agent.slug().to_string(),
-                title: h.title.unwrap_or_else(|| "Untitled".to_string()),
-                workspace: h.workspace,
-                source_path: h.source_path,
-                preview: h.preview,
-                created_at: h.created_at.map(|ts| {
-                    chrono::DateTime::from_timestamp_millis(ts)
-                        .map(|dt| dt.to_rfc3339())
-                        .unwrap_or_default()
-                }).unwrap_or_default(),
-                score: h.score,
-                snippet: h.snippet,
-            }).collect(),
+            hits: results
+                .hits
+                .into_iter()
+                .map(|h| SearchHitOutput {
+                    id: h.conversation_id,
+                    agent: h.agent.slug().to_string(),
+                    title: h.title.unwrap_or_else(|| "Untitled".to_string()),
+                    workspace: h.workspace,
+                    source_path: h.source_path,
+                    preview: h.preview,
+                    created_at: h
+                        .created_at
+                        .map(|ts| {
+                            chrono::DateTime::from_timestamp_millis(ts)
+                                .map(|dt| dt.to_rfc3339())
+                                .unwrap_or_default()
+                        })
+                        .unwrap_or_default(),
+                    score: h.score,
+                    snippet: h.snippet,
+                })
+                .collect(),
         }
     }
 }
@@ -235,11 +245,18 @@ impl StatsOutput {
     pub fn from_storage_stats(stats: crate::storage::StorageStats) -> Self {
         use std::collections::HashMap;
 
-        let agents: HashMap<String, AgentStatsOutput> = stats.by_agent.into_iter()
-            .map(|(agent, s)| (agent.slug().to_string(), AgentStatsOutput {
-                conversations: s.conversations,
-                messages: s.messages,
-            }))
+        let agents: HashMap<String, AgentStatsOutput> = stats
+            .by_agent
+            .into_iter()
+            .map(|(agent, s)| {
+                (
+                    agent.slug().to_string(),
+                    AgentStatsOutput {
+                        conversations: s.conversations,
+                        messages: s.messages,
+                    },
+                )
+            })
             .collect();
 
         Self {

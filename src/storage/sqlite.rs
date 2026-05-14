@@ -72,8 +72,9 @@ impl Storage {
              PRAGMA synchronous = NORMAL;
              PRAGMA foreign_keys = ON;
              PRAGMA cache_size = -64000;  -- 64MB
-            "
-        ).context("Failed to set database pragmas")?;
+            ",
+        )
+        .context("Failed to set database pragmas")?;
 
         let mut storage = Self {
             conn,
@@ -96,14 +97,21 @@ impl Storage {
         )?;
 
         for migration in MIGRATIONS {
-            let exists: bool = self.conn.query_row(
-                "SELECT 1 FROM schema_migrations WHERE version = ?",
-                [migration.version],
-                |_| Ok(true),
-            ).unwrap_or(false);
+            let exists: bool = self
+                .conn
+                .query_row(
+                    "SELECT 1 FROM schema_migrations WHERE version = ?",
+                    [migration.version],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
 
             if !exists {
-                tracing::info!("Applying migration {}: {}", migration.version, migration.name);
+                tracing::info!(
+                    "Applying migration {}: {}",
+                    migration.version,
+                    migration.name
+                );
                 self.conn.execute_batch(migration.sql)?;
                 self.conn.execute(
                     "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
@@ -120,11 +128,14 @@ impl Storage {
 
     /// Check if a conversation needs reindexing
     pub fn needs_reindex(&self, source_path: &Path, fingerprint: &str) -> Result<bool> {
-        let existing: Option<String> = self.conn.query_row(
-            "SELECT source_fingerprint FROM conversations WHERE source_path = ?",
-            [source_path.to_string_lossy().as_ref()],
-            |row| row.get(0),
-        ).optional()?;
+        let existing: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT source_fingerprint FROM conversations WHERE source_path = ?",
+                [source_path.to_string_lossy().as_ref()],
+                |row| row.get(0),
+            )
+            .optional()?;
 
         match existing {
             Some(existing_fp) => Ok(existing_fp != fingerprint),
@@ -137,16 +148,21 @@ impl Storage {
         let tx = self.conn.transaction()?;
 
         let source_path_str = conv.source_path.to_string_lossy().to_string();
-        let workspace_str = conv.workspace.as_ref().map(|p| p.to_string_lossy().to_string());
+        let workspace_str = conv
+            .workspace
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string());
         let indexed_at = chrono::Utc::now().timestamp_millis();
         let mtime_max = conv.source_mtime_max();
 
         // Check if conversation exists
-        let existing: Option<i64> = tx.query_row(
-            "SELECT id FROM conversations WHERE source_path = ?",
-            [&source_path_str],
-            |row| row.get(0),
-        ).optional()?;
+        let existing: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM conversations WHERE source_path = ?",
+                [&source_path_str],
+                |row| row.get(0),
+            )
+            .optional()?;
 
         let (conv_id, inserted, changed) = if let Some(id) = existing {
             // Check fingerprint to see if we need to update
@@ -239,7 +255,7 @@ impl Storage {
             "SELECT id, agent, external_id, title, workspace, source_path,
                     started_at, ended_at, source_fingerprint
              FROM conversations
-             ORDER BY id"
+             ORDER BY id",
         )?;
 
         let rows = stmt.query_map([], |row| {
@@ -275,34 +291,37 @@ impl Storage {
 
     /// Get a conversation with all messages
     pub fn get_conversation(&self, id: i64) -> Result<Option<Conversation>> {
-        let row: Option<ConversationRow> = self.conn.query_row(
-            "SELECT id, agent, external_id, title, workspace, source_path,
+        let row: Option<ConversationRow> = self
+            .conn
+            .query_row(
+                "SELECT id, agent, external_id, title, workspace, source_path,
                     started_at, ended_at, source_fingerprint
              FROM conversations WHERE id = ?",
-            [id],
-            |row| {
-                let agent_slug: String = row.get(1)?;
-                let agent = match agent_slug.as_str() {
-                    "claude_code" => Agent::ClaudeCode,
-                    "codex" => Agent::Codex,
-                    "opencode" => Agent::OpenCode,
-                    "pi_agent" => Agent::PiAgent,
-                    _ => Agent::ClaudeCode,
-                };
+                [id],
+                |row| {
+                    let agent_slug: String = row.get(1)?;
+                    let agent = match agent_slug.as_str() {
+                        "claude_code" => Agent::ClaudeCode,
+                        "codex" => Agent::Codex,
+                        "opencode" => Agent::OpenCode,
+                        "pi_agent" => Agent::PiAgent,
+                        _ => Agent::ClaudeCode,
+                    };
 
-                Ok(ConversationRow {
-                    id: row.get(0)?,
-                    agent,
-                    external_id: row.get(2)?,
-                    title: row.get(3)?,
-                    workspace: row.get(4)?,
-                    source_path: row.get(5)?,
-                    started_at: row.get(6)?,
-                    ended_at: row.get(7)?,
-                    source_fingerprint: row.get(8)?,
-                })
-            },
-        ).optional()?;
+                    Ok(ConversationRow {
+                        id: row.get(0)?,
+                        agent,
+                        external_id: row.get(2)?,
+                        title: row.get(3)?,
+                        workspace: row.get(4)?,
+                        source_path: row.get(5)?,
+                        started_at: row.get(6)?,
+                        ended_at: row.get(7)?,
+                        source_fingerprint: row.get(8)?,
+                    })
+                },
+            )
+            .optional()?;
 
         let row = match row {
             Some(r) => r,
@@ -339,7 +358,7 @@ impl Storage {
             "SELECT idx, role, content, timestamp, model
              FROM messages
              WHERE conversation_id = ?
-             ORDER BY idx"
+             ORDER BY idx",
         )?;
 
         let rows = stmt.query_map([conversation_id], |row| {
@@ -370,7 +389,10 @@ impl Storage {
     }
 
     /// Delete stale conversations (not in the given set)
-    pub fn delete_stale(&mut self, valid_source_paths: &std::collections::HashSet<PathBuf>) -> Result<usize> {
+    pub fn delete_stale(
+        &mut self,
+        valid_source_paths: &std::collections::HashSet<PathBuf>,
+    ) -> Result<usize> {
         let tx = self.conn.transaction()?;
 
         // Get all source paths
@@ -395,17 +417,13 @@ impl Storage {
 
     /// Get storage statistics
     pub fn stats(&self) -> Result<StorageStats> {
-        let total_conversations: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM conversations",
-            [],
-            |row| row.get(0),
-        )?;
+        let total_conversations: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))?;
 
-        let total_messages: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM messages",
-            [],
-            |row| row.get(0),
-        )?;
+        let total_messages: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))?;
 
         // Get stats by agent
         let mut stmt = self.conn.prepare(
@@ -413,7 +431,7 @@ impl Storage {
              (SELECT COUNT(*) FROM messages WHERE conversation_id IN
               (SELECT id FROM conversations c2 WHERE c2.agent = c1.agent)) as msg_count
              FROM conversations c1
-             GROUP BY agent"
+             GROUP BY agent",
         )?;
 
         let mut by_agent = HashMap::new();
@@ -427,10 +445,13 @@ impl Storage {
                 _ => Agent::ClaudeCode,
             };
 
-            Ok((agent, AgentStats {
-                conversations: row.get::<_, i64>(1)? as usize,
-                messages: row.get::<_, i64>(2)? as usize,
-            }))
+            Ok((
+                agent,
+                AgentStats {
+                    conversations: row.get::<_, i64>(1)? as usize,
+                    messages: row.get::<_, i64>(2)? as usize,
+                },
+            ))
         })?;
 
         for row in rows {
@@ -442,11 +463,11 @@ impl Storage {
         let db_size = fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
 
         // Get last indexed timestamp
-        let last_indexed: Option<i64> = self.conn.query_row(
-            "SELECT MAX(indexed_at) FROM conversations",
-            [],
-            |row| row.get::<_, Option<i64>>(0),
-        )?;
+        let last_indexed: Option<i64> =
+            self.conn
+                .query_row("SELECT MAX(indexed_at) FROM conversations", [], |row| {
+                    row.get::<_, Option<i64>>(0)
+                })?;
 
         Ok(StorageStats {
             total_conversations: total_conversations as usize,
@@ -459,7 +480,8 @@ impl Storage {
 
     /// Store an embedding
     pub fn store_embedding(&self, conv_id: i64, embedding: &[f32]) -> Result<()> {
-        let bytes = embedding.iter()
+        let bytes = embedding
+            .iter()
             .flat_map(|f| f.to_le_bytes())
             .collect::<Vec<u8>>();
 
@@ -473,15 +495,19 @@ impl Storage {
 
     /// Get an embedding
     pub fn get_embedding(&self, conv_id: i64) -> Result<Option<Vec<f32>>> {
-        let bytes: Option<Vec<u8>> = self.conn.query_row(
-            "SELECT embedding FROM embeddings WHERE conversation_id = ?",
-            [conv_id],
-            |row| row.get(0),
-        ).optional()?;
+        let bytes: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT embedding FROM embeddings WHERE conversation_id = ?",
+                [conv_id],
+                |row| row.get(0),
+            )
+            .optional()?;
 
         match bytes {
             Some(b) => {
-                let floats = b.chunks_exact(4)
+                let floats = b
+                    .chunks_exact(4)
                     .map(|chunk| {
                         let bytes: [u8; 4] = chunk.try_into().unwrap();
                         f32::from_le_bytes(bytes)
@@ -495,14 +521,15 @@ impl Storage {
 
     /// Get all embeddings
     pub fn get_all_embeddings(&self) -> Result<Vec<(i64, Vec<f32>)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT conversation_id, embedding FROM embeddings"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT conversation_id, embedding FROM embeddings")?;
 
         let rows = stmt.query_map([], |row| {
             let id: i64 = row.get(0)?;
             let bytes: Vec<u8> = row.get(1)?;
-            let floats = bytes.chunks_exact(4)
+            let floats = bytes
+                .chunks_exact(4)
                 .map(|chunk| {
                     let bytes: [u8; 4] = chunk.try_into().unwrap();
                     f32::from_le_bytes(bytes)
@@ -524,7 +551,7 @@ impl Storage {
         let mut stmt = self.conn.prepare(
             "SELECT source_path, source_fingerprint
              FROM conversations
-             WHERE agent = ?"
+             WHERE agent = ?",
         )?;
 
         let rows = stmt.query_map([agent.slug()], |row| {
@@ -553,11 +580,12 @@ impl Storage {
 
     /// Get a metadata value
     pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
-        let value: Option<String> = self.conn.query_row(
-            "SELECT value FROM meta WHERE key = ?",
-            [key],
-            |row| row.get(0),
-        ).optional()?;
+        let value: Option<String> = self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key = ?", [key], |row| {
+                row.get(0)
+            })
+            .optional()?;
         Ok(value)
     }
 }
@@ -580,7 +608,7 @@ fn insert_messages(tx: &Transaction, conversation_id: i64, messages: &[Message])
     let mut stmt = tx.prepare(
         "INSERT INTO messages
             (conversation_id, idx, role, content, timestamp, model, content_hash)
-         VALUES (?, ?, ?, ?, ?, ?, ?)"
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
     )?;
 
     for msg in messages {
@@ -680,7 +708,9 @@ mod tests {
         let outcome = storage.upsert_conversation(&conv).unwrap();
 
         let embedding: Vec<f32> = vec![0.1, 0.2, 0.3, 0.4, 0.5];
-        storage.store_embedding(outcome.conversation_id, &embedding).unwrap();
+        storage
+            .store_embedding(outcome.conversation_id, &embedding)
+            .unwrap();
 
         let retrieved = storage.get_embedding(outcome.conversation_id).unwrap();
         assert!(retrieved.is_some());
@@ -705,12 +735,19 @@ mod tests {
         let outcome = storage.upsert_conversation(&conv).unwrap();
 
         let emb1: Vec<f32> = vec![1.0, 2.0, 3.0];
-        storage.store_embedding(outcome.conversation_id, &emb1).unwrap();
+        storage
+            .store_embedding(outcome.conversation_id, &emb1)
+            .unwrap();
 
         let emb2: Vec<f32> = vec![4.0, 5.0, 6.0];
-        storage.store_embedding(outcome.conversation_id, &emb2).unwrap();
+        storage
+            .store_embedding(outcome.conversation_id, &emb2)
+            .unwrap();
 
-        let retrieved = storage.get_embedding(outcome.conversation_id).unwrap().unwrap();
+        let retrieved = storage
+            .get_embedding(outcome.conversation_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(retrieved, emb2);
     }
 
@@ -728,8 +765,12 @@ mod tests {
         conv2.source_fingerprint = "def456".to_string();
         let o2 = storage.upsert_conversation(&conv2).unwrap();
 
-        storage.store_embedding(o1.conversation_id, &[1.0, 2.0]).unwrap();
-        storage.store_embedding(o2.conversation_id, &[3.0, 4.0]).unwrap();
+        storage
+            .store_embedding(o1.conversation_id, &[1.0, 2.0])
+            .unwrap();
+        storage
+            .store_embedding(o2.conversation_id, &[3.0, 4.0])
+            .unwrap();
 
         let all = storage.get_all_embeddings().unwrap();
         assert_eq!(all.len(), 2);
@@ -741,7 +782,9 @@ mod tests {
         let storage = Storage::new(temp_file.path()).unwrap();
 
         // Non-existent path always needs reindex
-        let needs = storage.needs_reindex(Path::new("/new/path"), "fp123").unwrap();
+        let needs = storage
+            .needs_reindex(Path::new("/new/path"), "fp123")
+            .unwrap();
         assert!(needs);
     }
 
@@ -753,7 +796,9 @@ mod tests {
         let conv = create_test_conversation();
         storage.upsert_conversation(&conv).unwrap();
 
-        let needs = storage.needs_reindex(&conv.source_path, &conv.source_fingerprint).unwrap();
+        let needs = storage
+            .needs_reindex(&conv.source_path, &conv.source_fingerprint)
+            .unwrap();
         assert!(!needs);
     }
 
@@ -765,7 +810,9 @@ mod tests {
         let conv = create_test_conversation();
         storage.upsert_conversation(&conv).unwrap();
 
-        let needs = storage.needs_reindex(&conv.source_path, "different_fingerprint").unwrap();
+        let needs = storage
+            .needs_reindex(&conv.source_path, "different_fingerprint")
+            .unwrap();
         assert!(needs);
     }
 
@@ -794,7 +841,10 @@ mod tests {
         assert_eq!(o1.conversation_id, o2.conversation_id); // Same row
 
         // Verify messages were replaced
-        let retrieved = storage.get_conversation(o2.conversation_id).unwrap().unwrap();
+        let retrieved = storage
+            .get_conversation(o2.conversation_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(retrieved.messages.len(), 3);
     }
 
@@ -815,7 +865,10 @@ mod tests {
         let conv = create_test_conversation();
         let outcome = storage.upsert_conversation(&conv).unwrap();
 
-        let retrieved = storage.get_conversation(outcome.conversation_id).unwrap().unwrap();
+        let retrieved = storage
+            .get_conversation(outcome.conversation_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(retrieved.agent, Agent::ClaudeCode);
         assert_eq!(retrieved.external_id, Some("test-123".to_string()));
         assert_eq!(retrieved.title, Some("Test Conversation".to_string()));

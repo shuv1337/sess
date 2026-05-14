@@ -1,12 +1,12 @@
 use std::ops::Bound;
 use std::time::Instant;
 
-use anyhow::{Result};
+use anyhow::Result;
 use tantivy::{
+    Term,
     collector::{Count, TopDocs},
     query::{AllQuery, BooleanQuery, Occur, RangeQuery, TermQuery},
     schema::{IndexRecordOption, Value as TantivyValue},
-    Term,
 };
 
 use crate::model::Agent;
@@ -17,10 +17,10 @@ use crate::search::index::TantivyIndex;
 pub enum RankingMode {
     #[default]
     RecentHeavy, // BM25 * 0.3 + recency * 0.7
-    Balanced,    // BM25 * 0.5 + recency * 0.5
-    Relevance,   // BM25 * 0.8 + recency * 0.2
-    Newest,      // Pure date sort descending
-    Oldest,      // Pure date sort ascending
+    Balanced,  // BM25 * 0.5 + recency * 0.5
+    Relevance, // BM25 * 0.8 + recency * 0.2
+    Newest,    // Pure date sort descending
+    Oldest,    // Pure date sort ascending
 }
 
 impl RankingMode {
@@ -109,10 +109,7 @@ pub struct SearchResults {
 }
 
 /// Execute a search query
-pub fn execute(
-    query: &SearchQuery,
-    index: &TantivyIndex,
-) -> Result<SearchResults> {
+pub fn execute(query: &SearchQuery, index: &TantivyIndex) -> Result<SearchResults> {
     let start = Instant::now();
     let searcher = index.reader().searcher();
 
@@ -131,10 +128,7 @@ pub fn execute(
 
     // Text query (if not empty)
     if !query.text.trim().is_empty() {
-        let text_query = parse_text_query(
-            &query.text,
-            vec![field_title, field_content],
-        )?;
+        let text_query = parse_text_query(&query.text, vec![field_title, field_content])?;
         subqueries.push((Occur::Must, text_query));
     }
 
@@ -154,14 +148,8 @@ pub fn execute(
 
     // Time range filter
     if query.since.is_some() || query.until.is_some() {
-        let lower = query
-            .since
-            .map(Bound::Included)
-            .unwrap_or(Bound::Unbounded);
-        let upper = query
-            .until
-            .map(Bound::Included)
-            .unwrap_or(Bound::Unbounded);
+        let lower = query.since.map(Bound::Included).unwrap_or(Bound::Unbounded);
+        let upper = query.until.map(Bound::Included).unwrap_or(Bound::Unbounded);
         let range_query = RangeQuery::new_i64_bounds("created_at".to_string(), lower, upper);
         subqueries.push((Occur::Must, Box::new(range_query)));
     }
@@ -204,7 +192,9 @@ pub fn execute(
             _ => Agent::ClaudeCode,
         };
 
-        let title = doc.get_first(field_title).and_then(|v| v.as_str().map(|s| s.to_string()));
+        let title = doc
+            .get_first(field_title)
+            .and_then(|v| v.as_str().map(|s| s.to_string()));
 
         let workspace = doc
             .get_first(field_workspace)
@@ -221,7 +211,6 @@ pub fn execute(
             .unwrap_or_default();
 
         let created_at = doc.get_first(field_created_at).and_then(|v| v.as_i64());
-
 
         // Calculate blended score
         let bm25_score = *_score;
@@ -276,7 +265,10 @@ fn parse_text_query(
     if terms.len() == 1 && fields.len() == 1 {
         // Single term, single field
         let term = Term::from_field_text(fields[0], terms[0]);
-        return Ok(Box::new(TermQuery::new(term, IndexRecordOption::WithFreqsAndPositions)));
+        return Ok(Box::new(TermQuery::new(
+            term,
+            IndexRecordOption::WithFreqsAndPositions,
+        )));
     }
 
     // Multi-field OR query
@@ -288,7 +280,10 @@ fn parse_text_query(
             let term = Term::from_field_text(field, term_str);
             term_queries.push((
                 Occur::Should,
-                Box::new(TermQuery::new(term, IndexRecordOption::WithFreqsAndPositions)),
+                Box::new(TermQuery::new(
+                    term,
+                    IndexRecordOption::WithFreqsAndPositions,
+                )),
             ));
         }
         field_queries.push((Occur::Should, Box::new(BooleanQuery::new(term_queries))));
@@ -329,7 +324,10 @@ fn generate_snippet(preview: &str, query: &str) -> Option<String> {
             // Highlight the term
             let highlighted = snippet.replace(
                 &term.to_lowercase(),
-                &format!("<mark>{}</mark>", &snippet[pos - start..pos - start + term.len()]),
+                &format!(
+                    "<mark>{}</mark>",
+                    &snippet[pos - start..pos - start + term.len()]
+                ),
             );
 
             return Some(highlighted);
@@ -419,9 +417,18 @@ mod tests {
 
     #[test]
     fn test_ranking_mode_from_str() {
-        assert_eq!(RankingMode::from_str("recent"), Some(RankingMode::RecentHeavy));
-        assert_eq!(RankingMode::from_str("balanced"), Some(RankingMode::Balanced));
-        assert_eq!(RankingMode::from_str("relevance"), Some(RankingMode::Relevance));
+        assert_eq!(
+            RankingMode::from_str("recent"),
+            Some(RankingMode::RecentHeavy)
+        );
+        assert_eq!(
+            RankingMode::from_str("balanced"),
+            Some(RankingMode::Balanced)
+        );
+        assert_eq!(
+            RankingMode::from_str("relevance"),
+            Some(RankingMode::Relevance)
+        );
         assert_eq!(RankingMode::from_str("newest"), Some(RankingMode::Newest));
         assert_eq!(RankingMode::from_str("oldest"), Some(RankingMode::Oldest));
         assert_eq!(RankingMode::from_str("NEWEST"), Some(RankingMode::Newest));
@@ -543,8 +550,8 @@ mod tests {
             make_search_result(2, Agent::Codex, "Keyword only", 0.8),
         ];
         let semantic = vec![
-            (1, 0.95),  // Also found semantically
-            (3, 0.90),  // Semantic only (won't appear since not in result_map)
+            (1, 0.95), // Also found semantically
+            (3, 0.90), // Semantic only (won't appear since not in result_map)
         ];
 
         let fused = rrf_fusion(&keyword, &semantic, 60, 10);
@@ -558,7 +565,14 @@ mod tests {
     #[test]
     fn test_rrf_fusion_limit() {
         let keyword: Vec<SearchResult> = (0..20)
-            .map(|i| make_search_result(i, Agent::ClaudeCode, &format!("Result {}", i), 1.0 - i as f32 * 0.01))
+            .map(|i| {
+                make_search_result(
+                    i,
+                    Agent::ClaudeCode,
+                    &format!("Result {}", i),
+                    1.0 - i as f32 * 0.01,
+                )
+            })
             .collect();
 
         let fused = rrf_fusion(&keyword, &[], 60, 5);
@@ -573,9 +587,7 @@ mod tests {
 
     #[test]
     fn test_rrf_fusion_k_parameter() {
-        let keyword = vec![
-            make_search_result(1, Agent::ClaudeCode, "First", 1.0),
-        ];
+        let keyword = vec![make_search_result(1, Agent::ClaudeCode, "First", 1.0)];
 
         // Different k values should produce different scores
         let fused_k60 = rrf_fusion(&keyword, &[], 60, 10);
@@ -617,15 +629,13 @@ mod tests {
             source_fingerprint: "fp".to_string(),
             started_at: Some(1705312800000),
             ended_at: Some(1705312900000),
-            messages: vec![
-                crate::model::Message {
-                    idx: 0,
-                    role: crate::model::Role::User,
-                    content: "Help me build authentication middleware".to_string(),
-                    timestamp: Some(1705312800000),
-                    model: None,
-                },
-            ],
+            messages: vec![crate::model::Message {
+                idx: 0,
+                role: crate::model::Role::User,
+                content: "Help me build authentication middleware".to_string(),
+                timestamp: Some(1705312800000),
+                model: None,
+            }],
         };
 
         index.add_conversation(&conv, 1).unwrap();

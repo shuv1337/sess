@@ -7,7 +7,7 @@ use base64::Engine;
 use serde_json::Value;
 use walkdir::WalkDir;
 
-use crate::connectors::{file_modified_since, parse_role, source_file, Connector};
+use crate::connectors::{Connector, file_modified_since, parse_role, source_file};
 use crate::model::{Agent, Conversation, Message, Role, source_fingerprint};
 
 pub struct PiAgentConnector {
@@ -132,7 +132,10 @@ impl Connector for PiAgentConnector {
                     .filter_map(|e| e.ok())
                     .filter(|e| {
                         e.file_type().is_file()
-                            && e.path().extension().map(|ext| ext == "jsonl").unwrap_or(false)
+                            && e.path()
+                                .extension()
+                                .map(|ext| ext == "jsonl")
+                                .unwrap_or(false)
                     })
                 {
                     let path = entry.path();
@@ -164,7 +167,9 @@ impl Connector for PiAgentConnector {
                                     return Err(e);
                                 }
                                 crate::connectors::ErrorAction::SkipAgent => {
-                                    tracing::warn!("Skipping remaining Pi Agent files due to error");
+                                    tracing::warn!(
+                                        "Skipping remaining Pi Agent files due to error"
+                                    );
                                     return Ok(conversations);
                                 }
                             }
@@ -200,8 +205,7 @@ fn is_supported_session_filename(file_name: &str) -> bool {
 }
 
 fn parse_pi_session(path: &Path) -> Result<Option<Conversation>> {
-    let file = File::open(path)
-        .with_context(|| format!("Failed to open {}", path.display()))?;
+    let file = File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
     let reader = BufReader::new(file);
 
     let source_file = source_file(path)
@@ -265,17 +269,15 @@ fn parse_pi_session(path: &Path) -> Result<Option<Conversation>> {
                         .unwrap_or(Role::User);
 
                     // Extract timestamp from outer value
-                    let timestamp = value
-                        .get("timestamp")
-                        .and_then(|v| {
-                            if let Some(s) = v.as_str() {
-                                chrono::DateTime::parse_from_rfc3339(s)
-                                    .ok()
-                                    .map(|dt| dt.timestamp_millis())
-                            } else {
-                                v.as_i64()
-                            }
-                        });
+                    let timestamp = value.get("timestamp").and_then(|v| {
+                        if let Some(s) = v.as_str() {
+                            chrono::DateTime::parse_from_rfc3339(s)
+                                .ok()
+                                .map(|dt| dt.timestamp_millis())
+                        } else {
+                            v.as_i64()
+                        }
+                    });
 
                     if let Some(ts) = timestamp {
                         timestamps.push(ts);
@@ -320,13 +322,10 @@ fn parse_pi_session(path: &Path) -> Result<Option<Conversation>> {
             .and_then(decode_safe_path)
     });
 
-    let title = messages
-        .iter()
-        .find(|m| m.role == Role::User)
-        .map(|m| {
-            let first_line = m.content.lines().next().unwrap_or(&m.content);
-            crate::model::truncate_title(first_line, 100)
-        });
+    let title = messages.iter().find(|m| m.role == Role::User).map(|m| {
+        let first_line = m.content.lines().next().unwrap_or(&m.content);
+        crate::model::truncate_title(first_line, 100)
+    });
 
     let started_at = timestamps.iter().min().copied();
     let ended_at = timestamps.iter().max().copied();
@@ -365,12 +364,19 @@ fn extract_pi_content(content: &Value) -> String {
                 if let Value::Object(obj) = block {
                     let block_type = obj.get("type").and_then(|v| v.as_str());
                     match block_type {
-                        Some("text") => obj.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                        Some("thinking") => {
-                            obj.get("thinking").and_then(|v| v.as_str()).map(|s| format!("[Thinking] {}", s))
-                        }
+                        Some("text") => obj
+                            .get("text")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        Some("thinking") => obj
+                            .get("thinking")
+                            .and_then(|v| v.as_str())
+                            .map(|s| format!("[Thinking] {}", s)),
                         Some("toolCall") => {
-                            let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+                            let name = obj
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown");
                             let args = obj
                                 .get("arguments")
                                 .map(|v| v.to_string())
@@ -403,11 +409,7 @@ fn decode_safe_path(safe_path: &str) -> Option<PathBuf> {
     // approximation if that path actually exists on disk.
     let trimmed = safe_path.strip_prefix("--")?.strip_suffix("--")?;
     let approx = PathBuf::from(format!("/ {}", trimmed.replace('-', "/")));
-    if approx.exists() {
-        Some(approx)
-    } else {
-        None
-    }
+    if approx.exists() { Some(approx) } else { None }
 }
 
 #[cfg(test)]
@@ -598,9 +600,13 @@ mod tests {
 
         // File with underscore (matches naming convention)
         let session_file = sessions_dir.join("12345_uuid.jsonl");
-        std::fs::write(&session_file, r#"{"type":"session","id":"s1","cwd":"/test","modelId":"m1"}
+        std::fs::write(
+            &session_file,
+            r#"{"type":"session","id":"s1","cwd":"/test","modelId":"m1"}
 {"type":"message","timestamp":"2024-01-15T10:00:00Z","message":{"role":"user","content":"Hello"}}
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         // Shiv archive-style file name should also be accepted
         let archive_file = sessions_dir.join("session-1770371965142.jsonl");
@@ -683,7 +689,9 @@ mod tests {
         let connector = PiAgentConnector {
             home_dir: Some(PathBuf::from("/nonexistent")),
         };
-        let result = connector.scan(&[PathBuf::from("/nonexistent/root")], None).unwrap();
+        let result = connector
+            .scan(&[PathBuf::from("/nonexistent/root")], None)
+            .unwrap();
         assert!(result.is_empty());
     }
 }

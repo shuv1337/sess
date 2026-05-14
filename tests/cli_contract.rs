@@ -4,7 +4,7 @@ use assert_cmd::Command;
 use serde_json::Value;
 use tempfile::TempDir;
 
-use session_search::model::{source_fingerprint, Agent, Conversation, Message, Role, SourceFile};
+use session_search::model::{Agent, Conversation, Message, Role, SourceFile, source_fingerprint};
 use session_search::search::TantivyIndex;
 use session_search::storage::Storage;
 
@@ -189,7 +189,10 @@ fn cli_workspace_filter_is_strict() {
     let hits = json["hits"].as_array().expect("hits array");
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0]["workspace"], "/home/user/repos/voice-app");
-    assert_eq!(hits[0]["id"].as_i64().unwrap(), seeded.ids.pi_voice-app_recent);
+    assert_eq!(
+        hits[0]["id"].as_i64().unwrap(),
+        seeded.ids.pi_voice-app_recent
+    );
 }
 
 #[test]
@@ -205,7 +208,10 @@ fn cli_agent_filter_returns_only_requested_agent() {
     let hits = json["hits"].as_array().expect("hits array");
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0]["agent"], "pi_agent");
-    assert_eq!(hits[0]["id"].as_i64().unwrap(), seeded.ids.pi_voice-app_recent);
+    assert_eq!(
+        hits[0]["id"].as_i64().unwrap(),
+        seeded.ids.pi_voice-app_recent
+    );
 }
 
 #[test]
@@ -246,7 +252,10 @@ fn cli_since_filter_applies_to_total_and_hits() {
     assert_eq!(json["total_hits"].as_u64().unwrap(), 1);
     let hits = json["hits"].as_array().unwrap();
     assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0]["id"].as_i64().unwrap(), seeded.ids.pi_voice-app_recent);
+    assert_eq!(
+        hits[0]["id"].as_i64().unwrap(),
+        seeded.ids.pi_voice-app_recent
+    );
 }
 
 #[test]
@@ -270,6 +279,8 @@ fn cli_json_shape_contract_for_bots() {
 
     // Non-matching conversation should never appear in voice search
     let hits = json["hits"].as_array().unwrap();
-    let has_nonvoice_conv = hits.iter().any(|h| h["id"].as_i64() == Some(seeded.ids.claude_nonvoice));
+    let has_nonvoice_conv = hits
+        .iter()
+        .any(|h| h["id"].as_i64() == Some(seeded.ids.claude_nonvoice));
     assert!(!has_nonvoice_conv);
 }

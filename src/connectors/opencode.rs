@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use walkdir::WalkDir;
 
-use crate::connectors::{file_modified_since, source_file, Connector};
+use crate::connectors::{Connector, file_modified_since, source_file};
 use crate::model::{Agent, Conversation, Message, Role, SourceFile, source_fingerprint};
 
 /// Progress information for OpenCode scanning.
@@ -41,7 +41,10 @@ impl OpenCodeConnector {
             .map(PathBuf::from)
             .or_else(|| {
                 dirs::home_dir().map(|h| {
-                    h.join(".local").join("share").join("opencode").join("storage")
+                    h.join(".local")
+                        .join("share")
+                        .join("opencode")
+                        .join("storage")
                 })
             });
 
@@ -73,9 +76,7 @@ impl Connector for OpenCodeConnector {
     }
 
     fn detect(&self) -> bool {
-        self.session_dir()
-            .map(|p| p.exists())
-            .unwrap_or(false)
+        self.session_dir().map(|p| p.exists()).unwrap_or(false)
     }
 
     fn default_roots(&self) -> Vec<PathBuf> {
@@ -132,11 +133,17 @@ impl Connector for OpenCodeConnector {
             .into_par_iter()
             .filter_map(|(session_id, session)| {
                 // Get message IDs for this session
-                let msg_ids = session_messages.get(&session_id).cloned().unwrap_or_default();
+                let msg_ids = session_messages
+                    .get(&session_id)
+                    .cloned()
+                    .unwrap_or_default();
 
                 // Load parts for each message
                 let mut messages: Vec<Message> = Vec::new();
-                let mut all_source_files = session_sources.get(&session_id).cloned().unwrap_or_default();
+                let mut all_source_files = session_sources
+                    .get(&session_id)
+                    .cloned()
+                    .unwrap_or_default();
 
                 for msg_id in &msg_ids {
                     if let Some(msg_meta) = message_map.get(msg_id) {
@@ -149,10 +156,22 @@ impl Connector for OpenCodeConnector {
                                         all_source_files.push(part.source_file.clone());
 
                                         let content = match part.part_type.as_str() {
-                                            "text" => part.data.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                                            "subtask" => part.data.get("prompt").and_then(|v| v.as_str()).map(|s| format!("[Subtask] {}", s)),
+                                            "text" => part
+                                                .data
+                                                .get("text")
+                                                .and_then(|v| v.as_str())
+                                                .map(|s| s.to_string()),
+                                            "subtask" => part
+                                                .data
+                                                .get("prompt")
+                                                .and_then(|v| v.as_str())
+                                                .map(|s| format!("[Subtask] {}", s)),
                                             "tool" => {
-                                                let tool_name = part.data.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+                                                let tool_name = part
+                                                    .data
+                                                    .get("name")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("unknown");
                                                 Some(format!("[Tool: {}]", tool_name))
                                             }
                                             _ => None,
@@ -188,13 +207,10 @@ impl Connector for OpenCodeConnector {
                 }
 
                 let title = session.title.clone().or_else(|| {
-                    messages
-                        .iter()
-                        .find(|m| m.role == Role::User)
-                        .map(|m| {
-                            let first_line = m.content.lines().next().unwrap_or(&m.content);
-                            crate::model::truncate_title(first_line, 100)
-                        })
+                    messages.iter().find(|m| m.role == Role::User).map(|m| {
+                        let first_line = m.content.lines().next().unwrap_or(&m.content);
+                        crate::model::truncate_title(first_line, 100)
+                    })
                 });
 
                 let started_at = messages.iter().filter_map(|m| m.timestamp).min();
@@ -253,14 +269,19 @@ struct PartMeta {
     source_file: SourceFile,
 }
 
-fn load_sessions(session_dir: &Path, since_ts: Option<i64>) -> Result<HashMap<String, SessionMeta>> {
+fn load_sessions(
+    session_dir: &Path,
+    since_ts: Option<i64>,
+) -> Result<HashMap<String, SessionMeta>> {
     let mut sessions = HashMap::new();
 
     for entry in WalkDir::new(session_dir)
         .follow_links(true)
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file() && e.path().extension().map(|e| e == "json").unwrap_or(false))
+        .filter(|e| {
+            e.file_type().is_file() && e.path().extension().map(|e| e == "json").unwrap_or(false)
+        })
     {
         let path = entry.path();
 
@@ -304,8 +325,8 @@ struct SessionTime {
 }
 
 fn parse_session_file(path: &Path) -> Result<Option<SessionMeta>> {
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let content =
+        fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
 
     let data: SessionJson = serde_json::from_str(&content)
         .with_context(|| format!("Failed to parse {}", path.display()))?;
@@ -391,8 +412,8 @@ struct MessageModel {
 }
 
 fn parse_message_file(path: &Path) -> Result<Option<MessageMeta>> {
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let content =
+        fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
 
     let data: MessageJson = serde_json::from_str(&content)
         .with_context(|| format!("Failed to parse {}", path.display()))?;
@@ -458,8 +479,8 @@ struct PartJson {
 }
 
 fn parse_part_file(path: &Path) -> Result<Option<PartMeta>> {
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let content =
+        fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
 
     let data: PartJson = serde_json::from_str(&content)
         .with_context(|| format!("Failed to parse {}", path.display()))?;
@@ -503,7 +524,8 @@ mod tests {
                 "title": "Test Session",
                 "time": {"created": 1705312800000, "updated": 1705312900000}
             }"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Message files
         fs::write(
@@ -515,7 +537,8 @@ mod tests {
                 "time": {"created": 1705312800000},
                 "model": {"modelID": "gpt-4"}
             }"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         fs::write(
             message_dir.join("msg2.json"),
@@ -526,7 +549,8 @@ mod tests {
                 "time": {"created": 1705312805000},
                 "model": {"modelID": "gpt-4"}
             }"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Part files
         fs::write(
@@ -537,7 +561,8 @@ mod tests {
                 "type": "text",
                 "text": "Hello, can you help me?"
             }"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         fs::write(
             part_dir_msg2.join("part2.json"),
@@ -547,7 +572,8 @@ mod tests {
                 "type": "text",
                 "text": "Sure, I can help!"
             }"#,
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     #[test]
@@ -563,7 +589,8 @@ mod tests {
                 "title": "My Session",
                 "time": {"created": 1705312800000, "updated": 1705312900000}
             }"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let session = parse_session_file(&path).unwrap().unwrap();
         assert_eq!(session.id, "sess1");
@@ -578,10 +605,7 @@ mod tests {
     fn test_parse_session_file_minimal() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("sess2.json");
-        fs::write(
-            &path,
-            r#"{"id": "sess2", "projectID": "proj1"}"#,
-        ).unwrap();
+        fs::write(&path, r#"{"id": "sess2", "projectID": "proj1"}"#).unwrap();
 
         let session = parse_session_file(&path).unwrap().unwrap();
         assert_eq!(session.id, "sess2");
@@ -603,7 +627,8 @@ mod tests {
                 "time": {"created": 1705312800000},
                 "model": {"modelID": "claude-3-opus"}
             }"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let msg = parse_message_file(&path).unwrap().unwrap();
         assert_eq!(msg.id, "msg1");
@@ -620,7 +645,8 @@ mod tests {
         fs::write(
             &path,
             r#"{"id": "msg1", "sessionID": "s1", "role": "unknown_role"}"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let msg = parse_message_file(&path).unwrap().unwrap();
         assert_eq!(msg.role, Role::User); // Defaults to user
@@ -633,13 +659,17 @@ mod tests {
         fs::write(
             &path,
             r#"{"id": "p1", "messageID": "m1", "type": "text", "text": "Hello world"}"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let part = parse_part_file(&path).unwrap().unwrap();
         assert_eq!(part.id, "p1");
         assert_eq!(part.message_id, "m1");
         assert_eq!(part.part_type, "text");
-        assert_eq!(part.data.get("text").unwrap().as_str().unwrap(), "Hello world");
+        assert_eq!(
+            part.data.get("text").unwrap().as_str().unwrap(),
+            "Hello world"
+        );
     }
 
     #[test]
@@ -649,11 +679,15 @@ mod tests {
         fs::write(
             &path,
             r#"{"id": "p2", "messageID": "m1", "type": "subtask", "prompt": "Analyze the code"}"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let part = parse_part_file(&path).unwrap().unwrap();
         assert_eq!(part.part_type, "subtask");
-        assert_eq!(part.data.get("prompt").unwrap().as_str().unwrap(), "Analyze the code");
+        assert_eq!(
+            part.data.get("prompt").unwrap().as_str().unwrap(),
+            "Analyze the code"
+        );
     }
 
     #[test]
@@ -663,7 +697,8 @@ mod tests {
         fs::write(
             &path,
             r#"{"id": "p3", "messageID": "m1", "type": "tool", "name": "read_file"}"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let part = parse_part_file(&path).unwrap().unwrap();
         assert_eq!(part.part_type, "tool");
@@ -678,12 +713,14 @@ mod tests {
         fs::write(
             session_dir.join("s1.json"),
             r#"{"id": "s1", "projectID": "proj1", "directory": "/test"}"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         fs::write(
             session_dir.join("s2.json"),
             r#"{"id": "s2", "projectID": "proj1", "directory": "/test2"}"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let sessions = load_sessions(dir.path(), None).unwrap();
         assert_eq!(sessions.len(), 2);
@@ -700,7 +737,8 @@ mod tests {
         fs::write(
             session_dir.join("s1.json"),
             r#"{"id": "s1", "projectID": "proj1"}"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Far future timestamp should exclude files
         let future = chrono::Utc::now().timestamp_millis() + 1_000_000;
@@ -715,7 +753,8 @@ mod tests {
         fs::write(
             dir.path().join("good.json"),
             r#"{"id": "s1", "projectID": "proj1"}"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let sessions = load_sessions(dir.path(), None).unwrap();
         assert_eq!(sessions.len(), 1);
@@ -729,11 +768,13 @@ mod tests {
         fs::write(
             dir.path().join("b_part.json"),
             r#"{"id": "b", "messageID": "m1", "type": "text", "text": "Second"}"#,
-        ).unwrap();
+        )
+        .unwrap();
         fs::write(
             dir.path().join("a_part.json"),
             r#"{"id": "a", "messageID": "m1", "type": "text", "text": "First"}"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let parts = load_parts(dir.path()).unwrap();
         assert_eq!(parts.len(), 2);
@@ -794,7 +835,8 @@ mod tests {
         fs::write(
             session_dir.join("orphan.json"),
             r#"{"id": "orphan", "projectID": "proj1", "title": "No Messages"}"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let connector = OpenCodeConnector {
             storage_root: Some(dir.path().to_path_buf()),

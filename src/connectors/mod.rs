@@ -4,15 +4,15 @@ use std::sync::Arc;
 use anyhow::Result;
 use serde_json::Value;
 
-use crate::model::{parse_timestamp, Agent, Conversation, Role, SourceFile};
+use crate::model::{Agent, Conversation, Role, SourceFile, parse_timestamp};
 
 /// Action to take when a file fails to parse.
 #[derive(Debug, Clone, Copy, Default)]
 pub enum ErrorAction {
     #[default]
-    Skip,       // Log warning and continue (default)
-    Fail,       // Stop entire scan immediately
-    SkipAgent,  // Skip remaining files for this agent
+    Skip, // Log warning and continue (default)
+    Fail,      // Stop entire scan immediately
+    SkipAgent, // Skip remaining files for this agent
 }
 
 /// Connector trait for scanning agent session files.
@@ -265,7 +265,10 @@ mod tests {
     #[test]
     fn test_file_modified_since_nonexistent() {
         // Non-existent file should default to include
-        assert!(file_modified_since(std::path::Path::new("/nonexistent/file"), None));
+        assert!(file_modified_since(
+            std::path::Path::new("/nonexistent/file"),
+            None
+        ));
     }
 
     // ── source_file ────────────────────────────────────────

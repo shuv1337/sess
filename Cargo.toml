@@ -45,6 +45,9 @@ crossterm = "0.28"
 # Parallel processing
 rayon = "1"
 
+# Duration parsing for --max-age
+humantime = "2.1"
+
 [dev-dependencies]
 tempfile = "3"
 assert_cmd = "2"

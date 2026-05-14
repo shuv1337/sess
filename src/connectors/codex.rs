@@ -7,7 +7,9 @@ use serde::Deserialize;
 use serde_json::Value;
 use walkdir::WalkDir;
 
-use crate::connectors::{file_modified_since, flatten_json_content, parse_role, source_file, Connector};
+use crate::connectors::{
+    Connector, file_modified_since, flatten_json_content, parse_role, source_file,
+};
 use crate::model::{Agent, Conversation, Message, Role, SourceFile, source_fingerprint};
 
 pub struct CodexConnector {
@@ -42,9 +44,7 @@ impl Connector for CodexConnector {
     }
 
     fn detect(&self) -> bool {
-        self.sessions_dir()
-            .map(|p| p.exists())
-            .unwrap_or(false)
+        self.sessions_dir().map(|p| p.exists()).unwrap_or(false)
     }
 
     fn default_roots(&self) -> Vec<PathBuf> {
@@ -69,8 +69,8 @@ impl Connector for CodexConnector {
                         return false;
                     }
                     let name = e.file_name().to_string_lossy();
-                    name.starts_with("rollout-") && 
-                        (name.ends_with(".jsonl") || name.ends_with(".json"))
+                    name.starts_with("rollout-")
+                        && (name.ends_with(".jsonl") || name.ends_with(".json"))
                 })
             {
                 let path = entry.path();
@@ -121,8 +121,7 @@ fn parse_codex_session(path: &Path) -> Result<Option<Conversation>> {
 }
 
 fn parse_codex_jsonl(path: &Path) -> Result<Option<Conversation>> {
-    let file = File::open(path)
-        .with_context(|| format!("Failed to open {}", path.display()))?;
+    let file = File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
     let reader = BufReader::new(file);
 
     let source_file = source_file(path)
@@ -133,21 +132,36 @@ fn parse_codex_jsonl(path: &Path) -> Result<Option<Conversation>> {
     let mut timestamps: Vec<i64> = Vec::new();
 
     for (line_num, line) in reader.lines().enumerate() {
-        let line = line.with_context(|| format!("Failed to read line {} from {}", line_num + 1, path.display()))?;
+        let line = line.with_context(|| {
+            format!(
+                "Failed to read line {} from {}",
+                line_num + 1,
+                path.display()
+            )
+        })?;
 
         if line.trim().is_empty() {
             continue;
         }
 
-        let value: Value = serde_json::from_str(&line)
-            .with_context(|| format!("Failed to parse JSON on line {} of {}", line_num + 1, path.display()))?;
+        let value: Value = serde_json::from_str(&line).with_context(|| {
+            format!(
+                "Failed to parse JSON on line {} of {}",
+                line_num + 1,
+                path.display()
+            )
+        })?;
 
         let entry_type = value.get("type").and_then(|v| v.as_str());
 
         match entry_type {
             Some("session_meta") => {
                 // Extract workspace from session metadata
-                if let Some(cwd) = value.get("payload").and_then(|p| p.get("cwd")).and_then(|v| v.as_str()) {
+                if let Some(cwd) = value
+                    .get("payload")
+                    .and_then(|p| p.get("cwd"))
+                    .and_then(|v| v.as_str())
+                {
                     workspace = Some(PathBuf::from(cwd));
                 }
             }
@@ -168,11 +182,13 @@ fn parse_codex_jsonl(path: &Path) -> Result<Option<Conversation>> {
 
                     if !content.trim().is_empty() {
                         // Try to get timestamp from the payload or outer value
-                        let timestamp = value.get("timestamp")
+                        let timestamp = value
+                            .get("timestamp")
                             .and_then(|v| v.as_f64())
                             .map(|ts| (ts * 1000.0) as i64)
                             .or_else(|| {
-                                payload.get("timestamp")
+                                payload
+                                    .get("timestamp")
                                     .and_then(|v| v.as_f64())
                                     .map(|ts| (ts * 1000.0) as i64)
                             });
@@ -199,7 +215,8 @@ fn parse_codex_jsonl(path: &Path) -> Result<Option<Conversation>> {
                     match event_type {
                         Some("user_message") => {
                             if let Some(message) = payload.get("message").and_then(|v| v.as_str()) {
-                                let timestamp = value.get("timestamp")
+                                let timestamp = value
+                                    .get("timestamp")
                                     .and_then(|v| v.as_f64())
                                     .map(|ts| (ts * 1000.0) as i64);
 
@@ -218,7 +235,8 @@ fn parse_codex_jsonl(path: &Path) -> Result<Option<Conversation>> {
                         }
                         Some("agent_reasoning") => {
                             if let Some(text) = payload.get("text").and_then(|v| v.as_str()) {
-                                let timestamp = value.get("timestamp")
+                                let timestamp = value
+                                    .get("timestamp")
                                     .and_then(|v| v.as_f64())
                                     .map(|ts| (ts * 1000.0) as i64);
 
@@ -251,13 +269,10 @@ fn parse_codex_jsonl(path: &Path) -> Result<Option<Conversation>> {
         return Ok(None);
     }
 
-    let title = messages
-        .iter()
-        .find(|m| m.role == Role::User)
-        .map(|m| {
-            let first_line = m.content.lines().next().unwrap_or(&m.content);
-            crate::model::truncate_title(first_line, 100)
-        });
+    let title = messages.iter().find(|m| m.role == Role::User).map(|m| {
+        let first_line = m.content.lines().next().unwrap_or(&m.content);
+        crate::model::truncate_title(first_line, 100)
+    });
 
     let started_at = timestamps.iter().min().copied();
     let ended_at = timestamps.iter().max().copied();
@@ -303,8 +318,8 @@ struct LegacySessionItem {
 }
 
 fn parse_codex_json(path: &Path) -> Result<Option<Conversation>> {
-    let mut file = File::open(path)
-        .with_context(|| format!("Failed to open {}", path.display()))?;
+    let mut file =
+        File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
     let mut contents = String::new();
     file.read_to_string(&mut contents)
         .with_context(|| format!("Failed to read {}", path.display()))?;
@@ -325,7 +340,9 @@ fn parse_codex_json(path: &Path) -> Result<Option<Conversation>> {
         .enumerate()
         .filter_map(|(idx, item)| {
             let role = parse_role(&item.role)?;
-            let content = item.content.as_ref()
+            let content = item
+                .content
+                .as_ref()
                 .map(flatten_json_content)
                 .unwrap_or_default();
 
@@ -352,13 +369,10 @@ fn parse_codex_json(path: &Path) -> Result<Option<Conversation>> {
         return Ok(None);
     }
 
-    let title = messages
-        .iter()
-        .find(|m| m.role == Role::User)
-        .map(|m| {
-            let first_line = m.content.lines().next().unwrap_or(&m.content);
-            crate::model::truncate_title(first_line, 100)
-        });
+    let title = messages.iter().find(|m| m.role == Role::User).map(|m| {
+        let first_line = m.content.lines().next().unwrap_or(&m.content);
+        crate::model::truncate_title(first_line, 100)
+    });
 
     let started_at = timestamps.iter().min().copied();
     let ended_at = timestamps.iter().max().copied();
@@ -403,7 +417,10 @@ mod tests {
 
         let conv = result.unwrap();
         assert_eq!(conv.agent, Agent::Codex);
-        assert_eq!(conv.workspace, Some(PathBuf::from("/home/user/codex-project")));
+        assert_eq!(
+            conv.workspace,
+            Some(PathBuf::from("/home/user/codex-project"))
+        );
         assert_eq!(conv.messages.len(), 2);
         assert_eq!(conv.messages[0].role, Role::User);
         assert_eq!(conv.messages[0].content, "Can you help with this code?");
@@ -425,7 +442,10 @@ mod tests {
 
         let mut temp_file = NamedTempFile::new().unwrap();
         temp_file.write_all(json_content.as_bytes()).unwrap();
-        temp_file.as_file_mut().set_len(json_content.len() as u64).unwrap();
+        temp_file
+            .as_file_mut()
+            .set_len(json_content.len() as u64)
+            .unwrap();
         let path = temp_file.path().with_extension("json");
         std::fs::copy(temp_file.path(), &path).unwrap();
 
@@ -563,7 +583,9 @@ mod tests {
         let connector = CodexConnector {
             home_dir: Some(PathBuf::from("/nonexistent")),
         };
-        let result = connector.scan(&[PathBuf::from("/totally/nonexistent")], None).unwrap();
+        let result = connector
+            .scan(&[PathBuf::from("/totally/nonexistent")], None)
+            .unwrap();
         assert!(result.is_empty());
     }
 }

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use fastembed::{TextEmbedding, EmbeddingModel, InitOptions};
+use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
 /// Semantic index using FastEmbed
 pub struct SemanticIndex {
@@ -10,8 +10,8 @@ pub struct SemanticIndex {
 impl SemanticIndex {
     /// Create a new semantic index with the default model (AllMiniLML6V2, 384-dim)
     pub fn new() -> Result<Self> {
-        let options = InitOptions::new(EmbeddingModel::AllMiniLML6V2)
-            .with_show_download_progress(true);
+        let options =
+            InitOptions::new(EmbeddingModel::AllMiniLML6V2).with_show_download_progress(true);
 
         let model = TextEmbedding::try_new(options)
             .context("Failed to initialize FastEmbed. Use --no-semantic to skip.")?;
@@ -34,11 +34,14 @@ impl SemanticIndex {
             text
         };
 
-        let embeddings = self.embedder
+        let embeddings = self
+            .embedder
             .embed(vec![truncated], None)
             .context("Failed to generate embedding")?;
 
-        embeddings.into_iter().next()
+        embeddings
+            .into_iter()
+            .next()
             .context("No embedding generated")
     }
 
@@ -50,7 +53,11 @@ impl SemanticIndex {
         let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
         let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
         let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if na == 0.0 || nb == 0.0 { 0.0 } else { dot / (na * nb) }
+        if na == 0.0 || nb == 0.0 {
+            0.0
+        } else {
+            dot / (na * nb)
+        }
     }
 
     /// Search for similar conversations using brute-force cosine similarity

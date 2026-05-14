@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use crate::connectors::{all_connectors, Connector};
+use crate::connectors::{Connector, all_connectors};
 use crate::model::{Agent, Conversation};
 use crate::search::{SemanticIndex, TantivyIndex};
 use crate::storage::{Storage, UpsertOutcome};
@@ -54,7 +54,10 @@ impl Indexer {
                     Some(idx)
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to initialize semantic search: {}. Use --no-semantic to suppress this warning.", e);
+                    tracing::warn!(
+                        "Failed to initialize semantic search: {}. Use --no-semantic to suppress this warning.",
+                        e
+                    );
                     None
                 }
             }
@@ -116,7 +119,10 @@ impl Indexer {
         }
 
         // Update last scan timestamp
-        self.storage.set_meta("last_scan_ts", &chrono::Utc::now().timestamp_millis().to_string())?;
+        self.storage.set_meta(
+            "last_scan_ts",
+            &chrono::Utc::now().timestamp_millis().to_string(),
+        )?;
 
         stats.time_ms = start.elapsed().as_millis() as u64;
 
@@ -139,7 +145,8 @@ impl Indexer {
         self.tantivy.start_writer()?;
 
         // Get last scan timestamp
-        let since_ts = self.storage
+        let since_ts = self
+            .storage
             .get_meta("last_scan_ts")?
             .and_then(|s| s.parse().ok());
 
@@ -161,7 +168,10 @@ impl Indexer {
 
             for conv in conversations {
                 // Check if we need to reindex
-                if !self.storage.needs_reindex(&conv.source_path, &conv.source_fingerprint)? {
+                if !self
+                    .storage
+                    .needs_reindex(&conv.source_path, &conv.source_fingerprint)?
+                {
                     all_source_paths.insert(conv.source_path.clone());
                     continue; // Skip unchanged conversations
                 }
@@ -186,7 +196,10 @@ impl Indexer {
         }
 
         // Update last scan timestamp
-        self.storage.set_meta("last_scan_ts", &chrono::Utc::now().timestamp_millis().to_string())?;
+        self.storage.set_meta(
+            "last_scan_ts",
+            &chrono::Utc::now().timestamp_millis().to_string(),
+        )?;
 
         stats.time_ms = start.elapsed().as_millis() as u64;
 
@@ -232,21 +245,22 @@ impl Indexer {
         stats.conversations_indexed = full_conversations.len();
         stats.time_ms = start.elapsed().as_millis() as u64;
 
-        tracing::info!("Rebuild complete: {} conversations in {}ms", stats.conversations_indexed, stats.time_ms);
+        tracing::info!(
+            "Rebuild complete: {} conversations in {}ms",
+            stats.conversations_indexed,
+            stats.time_ms
+        );
 
         Ok(stats)
     }
 
     /// Index a single conversation
-    fn index_conversation(
-        &mut self,
-        conv: &Conversation,
-        stats: &mut IndexStats,
-    ) -> Result<()> {
+    fn index_conversation(&mut self, conv: &Conversation, stats: &mut IndexStats) -> Result<()> {
         let outcome = self.storage.upsert_conversation(conv)?;
 
         if outcome.changed {
-            self.tantivy.add_conversation(conv, outcome.conversation_id)?;
+            self.tantivy
+                .add_conversation(conv, outcome.conversation_id)?;
 
             stats.messages_indexed += conv.messages.len();
 
@@ -396,15 +410,13 @@ mod tests {
             source_fingerprint: "fp123".to_string(),
             started_at: Some(1000),
             ended_at: Some(2000),
-            messages: vec![
-                crate::model::Message {
-                    idx: 0,
-                    role: crate::model::Role::User,
-                    content: "Hello".to_string(),
-                    timestamp: Some(1000),
-                    model: None,
-                },
-            ],
+            messages: vec![crate::model::Message {
+                idx: 0,
+                role: crate::model::Role::User,
+                content: "Hello".to_string(),
+                timestamp: Some(1000),
+                model: None,
+            }],
         };
 
         let mut stats = IndexStats::default();

@@ -3,12 +3,11 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use tantivy::{
-    schema::{Schema, STORED, STRING, TEXT, FAST, INDEXED},
-    Index, IndexReader, IndexWriter, ReloadPolicy, Term,
-    TantivyDocument as Document,
+    Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument as Document, Term,
+    schema::{FAST, INDEXED, STORED, STRING, Schema, TEXT},
 };
 
-use crate::model::{Conversation};
+use crate::model::Conversation;
 use crate::storage::ConversationRow;
 
 /// Tantivy search index
@@ -32,7 +31,8 @@ pub struct TantivyIndex {
 impl Clone for TantivyIndex {
     fn clone(&self) -> Self {
         // Create new reader for the clone
-        let reader = self.index
+        let reader = self
+            .index
             .reader_builder()
             .reload_policy(ReloadPolicy::OnCommitWithDelay)
             .try_into()
@@ -86,7 +86,7 @@ impl TantivyIndex {
 
         let index = Index::open_or_create(
             tantivy::directory::MmapDirectory::open(path)?,
-            schema.clone()
+            schema.clone(),
         )?;
 
         // Write schema hash
@@ -137,8 +137,7 @@ impl TantivyIndex {
         // Delete existing document for this conversation first
         self.remove_conversation(db_id)?;
 
-        let writer = self.writer.as_mut()
-            .context("Writer not started")?;
+        let writer = self.writer.as_mut().context("Writer not started")?;
 
         // Create new document using the new Document API
         let mut doc = Document::default();
@@ -200,7 +199,8 @@ impl TantivyIndex {
     }
 
     /// Rebuild the entire index from SQLite conversations
-    pub fn rebuild_from_sqlite(&mut self,
+    pub fn rebuild_from_sqlite(
+        &mut self,
         conversations: &[(ConversationRow, String)], // (row, full_text)
     ) -> Result<()> {
         // Clear existing index
@@ -304,15 +304,13 @@ mod tests {
             source_fingerprint: "abc123".to_string(),
             started_at: Some(1000),
             ended_at: Some(2000),
-            messages: vec![
-                crate::model::Message {
-                    idx: 0,
-                    role: crate::model::Role::User,
-                    content: "Hello world".to_string(),
-                    timestamp: Some(1000),
-                    model: None,
-                },
-            ],
+            messages: vec![crate::model::Message {
+                idx: 0,
+                role: crate::model::Role::User,
+                content: "Hello world".to_string(),
+                timestamp: Some(1000),
+                model: None,
+            }],
         }
     }
 

@@ -1,9 +1,9 @@
-use std::sync::mpsc::{channel, Sender, Receiver};
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 
-use crate::search::{SearchQuery, SearchResults};
 use crate::search::index::TantivyIndex;
+use crate::search::{SearchQuery, SearchResults};
 
 /// Request for background search
 pub struct SearchRequest {
@@ -25,20 +25,23 @@ pub struct SearchThread {
 
 impl SearchThread {
     pub fn new(index: Arc<TantivyIndex>) -> Self {
-        let (req_sender, req_receiver): (Sender<SearchRequest>, Receiver<SearchRequest>) = channel();
-        let (resp_sender, resp_receiver): (Sender<SearchResponse>, Receiver<SearchResponse>) = channel();
+        let (req_sender, req_receiver): (Sender<SearchRequest>, Receiver<SearchRequest>) =
+            channel();
+        let (resp_sender, resp_receiver): (Sender<SearchResponse>, Receiver<SearchResponse>) =
+            channel();
 
         thread::spawn(move || {
             while let Ok(request) = req_receiver.recv() {
                 // Execute search
-                let results = crate::search::query::execute(&request.query, &index).unwrap_or_else(|e| {
-                    tracing::error!("Search error: {}", e);
-                    SearchResults {
-                        hits: vec![],
-                        total_hits: 0,
-                        query_time_ms: 0,
-                    }
-                });
+                let results =
+                    crate::search::query::execute(&request.query, &index).unwrap_or_else(|e| {
+                        tracing::error!("Search error: {}", e);
+                        SearchResults {
+                            hits: vec![],
+                            total_hits: 0,
+                            query_time_ms: 0,
+                        }
+                    });
 
                 // Send response (ignore errors if receiver dropped)
                 let _ = resp_sender.send(SearchResponse {

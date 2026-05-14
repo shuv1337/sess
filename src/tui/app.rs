@@ -5,17 +5,19 @@ use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
-    backend::{Backend, CrosstermBackend},
     Terminal,
+    backend::{Backend, CrosstermBackend},
 };
 
 use crate::model::{Agent, Conversation};
-use crate::search::{SearchQuery, SearchResult, RankingMode};
+use crate::search::{RankingMode, SearchQuery, SearchResult};
 use crate::storage::Storage;
 use crate::tui::search::SearchThread;
 use crate::tui::ui;
@@ -350,7 +352,13 @@ impl App {
         }
     }
 
-    pub fn update_results(&mut self, results: Vec<SearchResult>, total: usize, time_ms: u64, generation: u64) {
+    pub fn update_results(
+        &mut self,
+        results: Vec<SearchResult>,
+        total: usize,
+        time_ms: u64,
+        generation: u64,
+    ) {
         // Only update if this is the latest search
         if generation == self.get_current_search_generation() {
             self.results = results;
@@ -390,7 +398,10 @@ pub fn run_app(storage: &Storage, tantivy: &Arc<crate::search::index::TantivyInd
     let mut app = App::new();
 
     // Initial search
-    search_thread.search(app.build_search_query(), app.get_current_search_generation());
+    search_thread.search(
+        app.build_search_query(),
+        app.get_current_search_generation(),
+    );
 
     // Run main loop
     let res = run_app_loop(&mut terminal, &mut app, &search_thread, storage);

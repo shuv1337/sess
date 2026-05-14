@@ -120,16 +120,22 @@ fn run() -> Result<()> {
             } else {
                 // Human-friendly output
                 println!("Query: {}", query);
-                println!("Found {} results in {}ms", keyword_results.total_hits, keyword_results.query_time_ms);
+                println!(
+                    "Found {} results in {}ms",
+                    keyword_results.total_hits, keyword_results.query_time_ms
+                );
                 println!();
 
                 for (i, hit) in keyword_results.hits.iter().enumerate() {
                     let title = hit.title.clone().unwrap_or_else(|| "Untitled".to_string());
-                    let date = hit.created_at.map(|ts| {
-                        chrono::DateTime::from_timestamp_millis(ts)
-                            .map(|dt| dt.format("%Y-%m-%d").to_string())
-                            .unwrap_or_default()
-                    }).unwrap_or_default();
+                    let date = hit
+                        .created_at
+                        .map(|ts| {
+                            chrono::DateTime::from_timestamp_millis(ts)
+                                .map(|dt| dt.format("%Y-%m-%d").to_string())
+                                .unwrap_or_default()
+                        })
+                        .unwrap_or_default();
 
                     println!("{}. [{}] {} - {}", i + 1, hit.agent.icon(), title, date);
                     println!("   {}", hit.source_path);
@@ -226,11 +232,7 @@ fn run() -> Result<()> {
                         "{} {} - {}",
                         status,
                         connector.agent().display_name(),
-                        if detected {
-                            "detected"
-                        } else {
-                            "not detected"
-                        }
+                        if detected { "detected" } else { "not detected" }
                     );
                 }
             }

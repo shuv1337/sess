@@ -7,7 +7,9 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use walkdir::WalkDir;
 
-use crate::connectors::{file_modified_since, flatten_json_content, parse_role, source_file, Connector};
+use crate::connectors::{
+    Connector, file_modified_since, flatten_json_content, parse_role, source_file,
+};
 use crate::model::{Agent, Conversation, Message, Role, SourceFile, source_fingerprint};
 
 pub struct ClaudeCodeConnector {
@@ -22,7 +24,9 @@ impl ClaudeCodeConnector {
     }
 
     fn projects_dir(&self) -> Option<PathBuf> {
-        self.home_dir.as_ref().map(|h| h.join(".claude").join("projects"))
+        self.home_dir
+            .as_ref()
+            .map(|h| h.join(".claude").join("projects"))
     }
 }
 
@@ -38,9 +42,7 @@ impl Connector for ClaudeCodeConnector {
     }
 
     fn detect(&self) -> bool {
-        self.projects_dir()
-            .map(|p| p.exists())
-            .unwrap_or(false)
+        self.projects_dir().map(|p| p.exists()).unwrap_or(false)
     }
 
     fn default_roots(&self) -> Vec<PathBuf> {
@@ -102,8 +104,7 @@ impl Connector for ClaudeCodeConnector {
 }
 
 fn parse_claude_session(path: &Path) -> Result<Option<Conversation>> {
-    let file = File::open(path)
-        .with_context(|| format!("Failed to open {}", path.display()))?;
+    let file = File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
     let reader = BufReader::new(file);
 
     let source_file = source_file(path)
@@ -116,18 +117,29 @@ fn parse_claude_session(path: &Path) -> Result<Option<Conversation>> {
     let mut current_model: Option<String> = None;
 
     for (line_num, line) in reader.lines().enumerate() {
-        let line = line.with_context(|| format!("Failed to read line {} from {}", line_num + 1, path.display()))?;
+        let line = line.with_context(|| {
+            format!(
+                "Failed to read line {} from {}",
+                line_num + 1,
+                path.display()
+            )
+        })?;
 
         if line.trim().is_empty() {
             continue;
         }
 
-        let value: Value = serde_json::from_str(&line)
-            .with_context(|| format!("Failed to parse JSON on line {} of {}", line_num + 1, path.display()))?;
+        let value: Value = serde_json::from_str(&line).with_context(|| {
+            format!(
+                "Failed to parse JSON on line {} of {}",
+                line_num + 1,
+                path.display()
+            )
+        })?;
 
         // Skip non-message types
         let entry_type = value.get("type").and_then(|v| v.as_str());
-        
+
         match entry_type {
             Some("file-history-snapshot") | Some("summary") | Some("files-read") => {
                 // Skip these types
@@ -150,7 +162,7 @@ fn parse_claude_session(path: &Path) -> Result<Option<Conversation>> {
                 workspace = Some(PathBuf::from(cwd));
             }
         }
-        
+
         if external_id.is_none() {
             if let Some(session_id) = value.get("sessionId").and_then(|v| v.as_str()) {
                 external_id = Some(session_id.to_string());
@@ -220,13 +232,10 @@ fn parse_claude_session(path: &Path) -> Result<Option<Conversation>> {
     messages.sort_by_key(|m| m.idx);
 
     // Derive title from first user message
-    let title = messages
-        .iter()
-        .find(|m| m.role == Role::User)
-        .map(|m| {
-            let first_line = m.content.lines().next().unwrap_or(&m.content);
-            crate::model::truncate_title(first_line, 100)
-        });
+    let title = messages.iter().find(|m| m.role == Role::User).map(|m| {
+        let first_line = m.content.lines().next().unwrap_or(&m.content);
+        crate::model::truncate_title(first_line, 100)
+    });
 
     let started_at = timestamps.iter().min().copied();
     let ended_at = timestamps.iter().max().copied();
@@ -371,7 +380,9 @@ mod tests {
         let connector = ClaudeCodeConnector {
             home_dir: Some(PathBuf::from("/nonexistent")),
         };
-        let conversations = connector.scan(&[PathBuf::from("/totally/nonexistent")], None).unwrap();
+        let conversations = connector
+            .scan(&[PathBuf::from("/totally/nonexistent")], None)
+            .unwrap();
         assert!(conversations.is_empty());
     }
 
@@ -388,7 +399,9 @@ mod tests {
 
         // Very far future timestamp should return nothing
         let future_ts = chrono::Utc::now().timestamp_millis() + 1_000_000;
-        let conversations = connector.scan(&[dir.path().to_path_buf()], Some(future_ts)).unwrap();
+        let conversations = connector
+            .scan(&[dir.path().to_path_buf()], Some(future_ts))
+            .unwrap();
         assert!(conversations.is_empty());
     }
 }
