@@ -177,6 +177,32 @@ impl TantivyIndex {
         Ok(())
     }
 
+    /// Batch-delete conversations from the index by their SQLite IDs.
+    ///
+    /// Caller is responsible for calling [`Self::commit`] afterwards so the
+    /// reader can see the change. Starts the writer if it has not been started
+    /// yet so background refresh paths can call this without separate setup.
+    pub fn delete_conversations(&mut self, ids: &[i64]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        if self.writer.is_none() {
+            self.start_writer()?;
+        }
+        let writer = self.writer.as_mut().context("Writer not started")?;
+        for id in ids {
+            let term = Term::from_field_u64(self.field_conv_db_id, *id as u64);
+            writer.delete_term(term);
+        }
+        Ok(())
+    }
+
+    /// Reload the search reader so subsequent searches see the latest commit.
+    pub fn reload_reader(&self) -> Result<()> {
+        self.reader.reload()?;
+        Ok(())
+    }
+
     pub fn commit(&mut self) -> Result<()> {
         if let Some(ref mut writer) = self.writer {
             writer.commit()?;
@@ -379,6 +405,32 @@ mod tests {
         index.remove_conversation(1).unwrap();
         index.commit().unwrap();
         assert_eq!(index.doc_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn delete_conversations_removes_multiple_docs_with_single_commit() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut index = TantivyIndex::open_or_create(temp_dir.path()).unwrap();
+        index.start_writer().unwrap();
+        for i in 1..=5 {
+            let mut conv = create_test_conversation();
+            conv.source_path = PathBuf::from(format!("/test/{}.jsonl", i));
+            index.add_conversation(&conv, i).unwrap();
+        }
+        index.commit().unwrap();
+        assert_eq!(index.doc_count().unwrap(), 5);
+
+        index.delete_conversations(&[2, 4]).unwrap();
+        index.commit().unwrap();
+        assert_eq!(index.doc_count().unwrap(), 3);
+    }
+
+    #[test]
+    fn delete_conversations_noop_on_empty_input() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut index = TantivyIndex::open_or_create(temp_dir.path()).unwrap();
+        // Note: writer not started — must still succeed.
+        index.delete_conversations(&[]).unwrap();
     }
 
     #[test]

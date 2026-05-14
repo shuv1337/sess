@@ -1,11 +1,13 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::Result;
 
 use crate::connectors::{Connector, all_connectors};
 use crate::model::{Agent, Conversation};
 use crate::search::{SemanticIndex, TantivyIndex};
+use crate::storage::sqlite::{MissingSource, StaleDeletionSummary};
 use crate::storage::{Storage, UpsertOutcome};
 
 /// Index progress information
@@ -81,10 +83,13 @@ impl Indexer {
         // Ensure writer is started for indexing
         self.tantivy.start_writer()?;
 
-        // Collect all source paths for staleness detection
-        let mut all_source_paths: HashSet<PathBuf> = HashSet::new();
-
         let connectors = all_connectors();
+        let detected_agents: HashSet<Agent> = connectors
+            .iter()
+            .filter(|c| c.detect())
+            .map(|c| c.agent())
+            .collect();
+
         for connector in &connectors {
             if !connector.detect() {
                 tracing::debug!("Agent {} not detected, skipping", connector.agent());
@@ -99,16 +104,13 @@ impl Indexer {
             stats.files_scanned += conversations.len();
 
             for conv in conversations {
-                all_source_paths.insert(conv.source_path.clone());
                 self.index_conversation(&conv, &mut stats)?;
             }
         }
 
-        // Delete stale conversations
-        let deleted = self.storage.delete_stale(&all_source_paths)?;
-        if deleted > 0 {
-            tracing::info!("Deleted {} stale conversations", deleted);
-        }
+        // Existence-based stale deletion (DB + Tantivy together).
+        let summary = self.delete_missing(&detected_agents)?;
+        Self::log_stale_summary("full", &summary);
 
         // Commit changes
         self.tantivy.commit()?;
@@ -152,10 +154,13 @@ impl Indexer {
 
         tracing::info!("Incremental index since: {:?}", since_ts);
 
-        // Collect all source paths for staleness detection
-        let mut all_source_paths: HashSet<PathBuf> = HashSet::new();
-
         let connectors = all_connectors();
+        let detected_agents: HashSet<Agent> = connectors
+            .iter()
+            .filter(|c| c.detect())
+            .map(|c| c.agent())
+            .collect();
+
         for connector in &connectors {
             if !connector.detect() {
                 continue;
@@ -172,20 +177,22 @@ impl Indexer {
                     .storage
                     .needs_reindex(&conv.source_path, &conv.source_fingerprint)?
                 {
-                    all_source_paths.insert(conv.source_path.clone());
                     continue; // Skip unchanged conversations
                 }
 
-                all_source_paths.insert(conv.source_path.clone());
                 self.index_conversation(&conv, &mut stats)?;
             }
         }
 
-        // Delete stale conversations
-        let deleted = self.storage.delete_stale(&all_source_paths)?;
-        if deleted > 0 {
-            tracing::info!("Deleted {} stale conversations", deleted);
-        }
+        // Existence-based stale deletion (DB + Tantivy together).
+        //
+        // IMPORTANT: previously we built an "alive set" from the time-filtered
+        // scan results and deleted any row not in it. Because connector scans
+        // honor `since_ts`, that meant every agent whose files were unmodified
+        // since the last scan had ALL of its rows wiped on the next
+        // incremental run. See PLAN-stale-index.md Bug A.
+        let summary = self.delete_missing(&detected_agents)?;
+        Self::log_stale_summary("incremental", &summary);
 
         // Commit changes
         self.tantivy.commit()?;
@@ -331,6 +338,138 @@ impl Indexer {
         let stats = self.storage.stats()?;
         Ok(stats.total_conversations == 0)
     }
+
+    /// Age of the last completed scan, if any.
+    ///
+    /// Returns `None` if no scan has ever been recorded. A future timestamp
+    /// (clock skew) is clamped to zero duration so callers do not treat clock
+    /// drift as freshness.
+    pub fn last_scan_age(&self) -> Result<Option<Duration>> {
+        let Some(raw) = self.storage.get_meta("last_scan_ts")? else {
+            return Ok(None);
+        };
+        let Ok(ts) = raw.parse::<i64>() else {
+            return Ok(None);
+        };
+        let now = chrono::Utc::now().timestamp_millis();
+        let diff_ms = now.saturating_sub(ts);
+        if diff_ms < 0 {
+            tracing::warn!("last_scan_ts is in the future; clamping age to zero");
+            return Ok(Some(Duration::ZERO));
+        }
+        Ok(Some(Duration::from_millis(diff_ms as u64)))
+    }
+
+    /// Whether the index should be refreshed under `max_age` policy.
+    pub fn should_refresh(&self, max_age: Duration) -> Result<bool> {
+        match self.last_scan_age()? {
+            None => Ok(true),
+            Some(age) => Ok(age > max_age),
+        }
+    }
+
+    /// Read-only dry-run: classify what an incremental index *would* do without
+    /// touching SQLite or Tantivy.
+    pub fn incremental_index_dry_run(&mut self) -> Result<IndexDryRunReport> {
+        let mut report = IndexDryRunReport::default();
+
+        let since_ts = self
+            .storage
+            .get_meta("last_scan_ts")?
+            .and_then(|s| s.parse().ok());
+
+        let connectors = all_connectors();
+        let detected_agents: HashSet<Agent> = connectors
+            .iter()
+            .filter(|c| c.detect())
+            .map(|c| c.agent())
+            .collect();
+
+        for connector in &connectors {
+            if !connector.detect() {
+                continue;
+            }
+            let roots = connector.default_roots();
+            let conversations = connector.scan(&roots, since_ts)?;
+            let agent = connector.agent();
+            *report.would_scan_by_agent.entry(agent).or_insert(0) += conversations.len();
+            for conv in conversations {
+                let exists_in_db = self
+                    .storage
+                    .needs_reindex(&conv.source_path, &conv.source_fingerprint)?;
+                // needs_reindex returns true for both "new" and "changed" rows.
+                // Distinguish via a fingerprint lookup.
+                let already_present = self.storage.has_source_path(&conv.source_path)?;
+                if !exists_in_db {
+                    // already up-to-date
+                    continue;
+                }
+                if already_present {
+                    report.would_update += 1;
+                } else {
+                    report.would_insert += 1;
+                }
+            }
+        }
+
+        // Stale deletion preview (read-only).
+        let mut would_delete = Vec::new();
+        let mut uncertain = Vec::new();
+        let rows = self.storage.list_all_source_rows()?;
+        for (id, agent, path) in rows {
+            if !detected_agents.contains(&agent) {
+                continue;
+            }
+            match path.try_exists() {
+                Ok(true) => {}
+                Ok(false) => would_delete.push(MissingSource {
+                    id,
+                    agent,
+                    source_path: path,
+                }),
+                Err(e) => uncertain.push((id, path, e.to_string())),
+            }
+        }
+        report.would_delete = would_delete;
+        report.uncertain_paths = uncertain;
+
+        Ok(report)
+    }
+
+    fn delete_missing(&mut self, detected_agents: &HashSet<Agent>) -> Result<StaleDeletionSummary> {
+        let summary = self.storage.delete_missing_sources(detected_agents)?;
+        if !summary.deleted_ids.is_empty() {
+            self.tantivy.delete_conversations(&summary.deleted_ids)?;
+        }
+        Ok(summary)
+    }
+
+    fn log_stale_summary(kind: &str, summary: &StaleDeletionSummary) {
+        if !summary.deleted_ids.is_empty() {
+            tracing::info!(
+                "{} index: deleted {} stale conversations (DB + Tantivy)",
+                kind,
+                summary.deleted_ids.len()
+            );
+        }
+        if !summary.uncertain_paths.is_empty() {
+            tracing::warn!(
+                "{} index: kept {} rows with uncertain source paths (see warnings above)",
+                kind,
+                summary.uncertain_paths.len()
+            );
+        }
+    }
+}
+
+/// Dry-run preview for `sess index --dry-run`.
+#[derive(Debug, Default)]
+pub struct IndexDryRunReport {
+    pub would_scan_by_agent: std::collections::HashMap<Agent, usize>,
+    pub would_insert: usize,
+    pub would_update: usize,
+    pub would_delete: Vec<MissingSource>,
+    pub uncertain_paths: Vec<(i64, PathBuf, String)>,
 }
 
 #[cfg(test)]

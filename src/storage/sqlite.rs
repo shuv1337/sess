@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -6,6 +6,36 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, Transaction, types::Value as SqliteValue};
 
 use crate::model::{Agent, Conversation, Message, Role, SourceFile};
+
+/// A DB row whose backing source file is missing on disk.
+#[derive(Debug, Clone)]
+pub struct MissingSource {
+    pub id: i64,
+    pub agent: Agent,
+    pub source_path: PathBuf,
+}
+
+/// Outcome of a stale-deletion sweep.
+///
+/// `deleted_*` are the rows that were actually removed from SQLite. `uncertain_paths`
+/// are rows where the existence check returned an error (permission denied,
+/// transient mount errors, etc.) — those rows are intentionally kept.
+#[derive(Debug, Default, Clone)]
+pub struct StaleDeletionSummary {
+    pub deleted_ids: Vec<i64>,
+    pub deleted_paths: Vec<PathBuf>,
+    pub uncertain_paths: Vec<(i64, PathBuf, String)>,
+}
+
+fn agent_from_slug(slug: &str) -> Agent {
+    match slug {
+        "claude_code" => Agent::ClaudeCode,
+        "codex" => Agent::Codex,
+        "opencode" => Agent::OpenCode,
+        "pi_agent" => Agent::PiAgent,
+        _ => Agent::ClaudeCode,
+    }
+}
 
 /// Migration definition
 pub struct Migration {
@@ -124,6 +154,35 @@ impl Storage {
         }
 
         Ok(())
+    }
+
+    /// True if a row with this source_path already exists.
+    pub fn has_source_path(&self, source_path: &Path) -> Result<bool> {
+        let existing: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM conversations WHERE source_path = ?",
+                [source_path.to_string_lossy().as_ref()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(existing.is_some())
+    }
+
+    /// All `(id, agent, source_path)` rows. Used by dry-run preview.
+    pub fn list_all_source_rows(&self) -> Result<Vec<(i64, Agent, PathBuf)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, agent, source_path FROM conversations")?;
+        let rows = stmt
+            .query_map([], |row| {
+                let id: i64 = row.get(0)?;
+                let agent_slug: String = row.get(1)?;
+                let path: String = row.get(2)?;
+                Ok((id, agent_from_slug(&agent_slug), PathBuf::from(path)))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Check if a conversation needs reindexing
@@ -388,31 +447,117 @@ impl Storage {
         Ok(results)
     }
 
-    /// Delete stale conversations (not in the given set)
-    pub fn delete_stale(
-        &mut self,
-        valid_source_paths: &std::collections::HashSet<PathBuf>,
-    ) -> Result<usize> {
-        let tx = self.conn.transaction()?;
-
-        // Get all source paths
-        let mut stmt = tx.prepare("SELECT id, source_path FROM conversations")?;
-        let rows: Vec<(i64, String)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+    /// Find DB rows whose backing source file no longer exists on disk.
+    ///
+    /// Only inspects rows for agents in `detected_agents`. Rows whose agent is
+    /// not currently detected (env var/root temporarily disappeared) are skipped
+    /// to avoid wiping the entire agent's history.
+    ///
+    /// Existence is checked via [`Path::try_exists`], which is tri-state:
+    /// - `Ok(true)` -> keep
+    /// - `Ok(false)` -> include in result (deletion candidate)
+    /// - `Err(_)` -> caller's responsibility; this function only returns confirmed misses.
+    ///   Use [`Self::delete_missing_sources`] to also collect uncertain rows.
+    pub fn find_missing_sources(
+        &self,
+        detected_agents: &HashSet<Agent>,
+    ) -> Result<Vec<MissingSource>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, agent, source_path FROM conversations")?;
+        let rows: Vec<(i64, String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .collect::<Result<Vec<_>, _>>()?;
         drop(stmt);
 
-        let mut deleted = 0;
-        for (id, path) in rows {
-            if !valid_source_paths.contains(Path::new(&path)) {
-                tx.execute("DELETE FROM conversations WHERE id = ?", [id])?;
-                deleted += 1;
+        let mut out = Vec::new();
+        for (id, agent_slug, path) in rows {
+            let agent = agent_from_slug(&agent_slug);
+            if !detected_agents.contains(&agent) {
+                continue;
+            }
+            let p = PathBuf::from(&path);
+            match p.try_exists() {
+                Ok(true) => {}
+                Ok(false) => out.push(MissingSource {
+                    id,
+                    agent,
+                    source_path: p,
+                }),
+                Err(_) => {} // uncertain -> keep, surfaced separately by delete_missing_sources
+            }
+        }
+        Ok(out)
+    }
+
+    /// Delete DB rows whose backing source file is confirmed missing on disk.
+    ///
+    /// Fail-safe semantics:
+    /// - Rows for agents not in `detected_agents` are always kept.
+    /// - Rows whose existence check errors are kept and reported in
+    ///   `uncertain_paths` with the OS error message.
+    /// - Only rows whose `try_exists()` returns `Ok(false)` are deleted.
+    ///
+    /// Returns the IDs and paths deleted plus the uncertain rows. The caller
+    /// is responsible for issuing the corresponding Tantivy deletions so the
+    /// two stores stay consistent.
+    pub fn delete_missing_sources(
+        &mut self,
+        detected_agents: &HashSet<Agent>,
+    ) -> Result<StaleDeletionSummary> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, agent, source_path FROM conversations")?;
+        let rows: Vec<(i64, String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        let mut to_delete: Vec<(i64, PathBuf)> = Vec::new();
+        let mut uncertain: Vec<(i64, PathBuf, String)> = Vec::new();
+
+        for (id, agent_slug, path) in rows {
+            let agent = agent_from_slug(&agent_slug);
+            if !detected_agents.contains(&agent) {
+                continue;
+            }
+            let p = PathBuf::from(&path);
+            match p.try_exists() {
+                Ok(true) => {}
+                Ok(false) => to_delete.push((id, p)),
+                Err(e) => uncertain.push((id, p, e.to_string())),
             }
         }
 
+        let mut summary = StaleDeletionSummary {
+            uncertain_paths: uncertain,
+            ..Default::default()
+        };
+
+        if to_delete.is_empty() {
+            return Ok(summary);
+        }
+
+        let tx = self.conn.transaction()?;
+        for (id, path) in &to_delete {
+            tx.execute("DELETE FROM conversations WHERE id = ?", [*id])?;
+            summary.deleted_ids.push(*id);
+            summary.deleted_paths.push(path.clone());
+        }
         tx.commit()?;
 
-        Ok(deleted)
+        if !summary.uncertain_paths.is_empty() {
+            for (id, p, err) in &summary.uncertain_paths {
+                tracing::warn!(
+                    "Could not verify existence of source for conversation {} ({}): {} — keeping row",
+                    id,
+                    p.display(),
+                    err
+                );
+            }
+        }
+
+        Ok(summary)
     }
 
     /// Get storage statistics
@@ -900,43 +1045,118 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_stale() {
-        let temp_file = NamedTempFile::new().unwrap();
-        let mut storage = Storage::new(temp_file.path()).unwrap();
+    fn delete_missing_sources_keeps_existing_files() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_file = NamedTempFile::new().unwrap();
+        let mut storage = Storage::new(db_file.path()).unwrap();
 
-        let mut conv1 = create_test_conversation();
-        storage.upsert_conversation(&conv1).unwrap();
+        // Create 3 real files on disk
+        let p1 = tmp.path().join("s1.jsonl");
+        let p2 = tmp.path().join("s2.jsonl");
+        let p3 = tmp.path().join("s3.jsonl");
+        for p in [&p1, &p2, &p3] {
+            fs::write(p, "x").unwrap();
+        }
 
-        let mut conv2 = create_test_conversation();
-        conv2.source_path = PathBuf::from("/test/session2.jsonl");
-        conv2.source_fingerprint = "def456".to_string();
-        storage.upsert_conversation(&conv2).unwrap();
+        for (i, p) in [&p1, &p2, &p3].iter().enumerate() {
+            let mut conv = create_test_conversation();
+            conv.source_path = (*p).clone();
+            conv.source_fingerprint = format!("fp{}", i);
+            conv.agent = Agent::PiAgent;
+            storage.upsert_conversation(&conv).unwrap();
+        }
 
-        // Only keep conv1
-        let mut valid = std::collections::HashSet::new();
-        valid.insert(PathBuf::from("/test/session.jsonl"));
+        // Delete file #2 from disk
+        fs::remove_file(&p2).unwrap();
 
-        let deleted = storage.delete_stale(&valid).unwrap();
-        assert_eq!(deleted, 1);
+        let mut detected = HashSet::new();
+        detected.insert(Agent::PiAgent);
+
+        let summary = storage.delete_missing_sources(&detected).unwrap();
+        assert_eq!(summary.deleted_ids.len(), 1);
+        assert_eq!(summary.deleted_paths, vec![p2]);
+        assert!(summary.uncertain_paths.is_empty());
+
+        let stats = storage.stats().unwrap();
+        assert_eq!(stats.total_conversations, 2);
+    }
+
+    #[test]
+    fn delete_missing_sources_ignores_undetected_agents() {
+        let db_file = NamedTempFile::new().unwrap();
+        let mut storage = Storage::new(db_file.path()).unwrap();
+
+        // Two rows for two different agents, both pointing at paths that do not exist.
+        let mut a = create_test_conversation();
+        a.agent = Agent::PiAgent;
+        a.source_path = PathBuf::from("/definitely/missing/pi.jsonl");
+        a.source_fingerprint = "fp-pi".to_string();
+        storage.upsert_conversation(&a).unwrap();
+
+        let mut b = create_test_conversation();
+        b.agent = Agent::OpenCode;
+        b.source_path = PathBuf::from("/definitely/missing/oc.jsonl");
+        b.source_fingerprint = "fp-oc".to_string();
+        storage.upsert_conversation(&b).unwrap();
+
+        // Only PiAgent is currently detected -> OpenCode row must survive.
+        let mut detected = HashSet::new();
+        detected.insert(Agent::PiAgent);
+
+        let summary = storage.delete_missing_sources(&detected).unwrap();
+        assert_eq!(summary.deleted_ids.len(), 1);
 
         let stats = storage.stats().unwrap();
         assert_eq!(stats.total_conversations, 1);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn test_delete_stale_none() {
-        let temp_file = NamedTempFile::new().unwrap();
-        let mut storage = Storage::new(temp_file.path()).unwrap();
+    fn delete_missing_sources_keeps_rows_on_metadata_error() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
 
-        let conv = create_test_conversation();
+        // Skip when running as root — root bypasses directory permissions.
+        if std::env::var("USER").as_deref() == Ok("root") {
+            return;
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let locked_dir = tmp.path().join("locked");
+        fs::create_dir(&locked_dir).unwrap();
+        let hidden = locked_dir.join("s.jsonl");
+        fs::write(&hidden, "x").unwrap();
+
+        let db_file = NamedTempFile::new().unwrap();
+        let mut storage = Storage::new(db_file.path()).unwrap();
+
+        let mut conv = create_test_conversation();
+        conv.source_path = hidden.clone();
+        conv.agent = Agent::PiAgent;
         storage.upsert_conversation(&conv).unwrap();
 
-        // Keep everything
-        let mut valid = std::collections::HashSet::new();
-        valid.insert(conv.source_path.clone());
+        // Remove all permissions on the parent so try_exists() returns Err.
+        fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o000)).unwrap();
 
-        let deleted = storage.delete_stale(&valid).unwrap();
-        assert_eq!(deleted, 0);
+        let mut detected = HashSet::new();
+        detected.insert(Agent::PiAgent);
+
+        let result = storage.delete_missing_sources(&detected);
+
+        // Restore perms before any assertion so TempDir can clean up.
+        let _ = fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o755));
+
+        let summary = result.unwrap();
+        assert!(
+            summary.deleted_ids.is_empty(),
+            "row must be preserved on metadata error"
+        );
+        assert_eq!(summary.uncertain_paths.len(), 1);
+        assert_eq!(summary.uncertain_paths[0].0, 1);
+
+        let stats = storage.stats().unwrap();
+        assert_eq!(stats.total_conversations, 1);
     }
 
     #[test]
