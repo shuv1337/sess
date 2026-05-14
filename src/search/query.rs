@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use tantivy::{
-    Term,
+    Order, Term,
     collector::{Count, TopDocs},
     query::{AllQuery, BooleanQuery, Occur, RangeQuery, TermQuery},
     schema::{IndexRecordOption, Value as TantivyValue},
@@ -165,13 +165,53 @@ pub fn execute(query: &SearchQuery, index: &TantivyIndex) -> Result<SearchResult
 
     // Execute search
     let total_hits = searcher.search(&final_query, &Count)?;
-    let collector = TopDocs::with_limit(query.limit + query.offset);
-    let top_docs = searcher.search(&final_query, &collector)?;
+
+    // When the user has no free-text query, BM25 scores carry no useful signal
+    // (AllQuery / pure filter queries return uniform scores), so TopDocs picks
+    // an arbitrary subset by internal docid. For "browse" cases (empty query,
+    // or Newest/Oldest ranking) sort at the collector level using the
+    // `created_at` fast field so we get the globally newest/oldest docs, not
+    // the newest within an arbitrary 50-doc window.
+    let no_text_query = query.text.trim().is_empty();
+    let sort_by_date = matches!(query.ranking, RankingMode::Newest | RankingMode::Oldest)
+        || (no_text_query
+            && matches!(
+                query.ranking,
+                RankingMode::RecentHeavy | RankingMode::Balanced
+            ));
+    let date_order = if matches!(query.ranking, RankingMode::Oldest) {
+        Order::Asc
+    } else {
+        Order::Desc
+    };
+
+    let mut date_sorted_docs: Vec<(i64, tantivy::DocAddress)> = Vec::new();
+    let mut score_sorted_docs: Vec<(f32, tantivy::DocAddress)> = Vec::new();
+
+    if sort_by_date {
+        let collector = TopDocs::with_limit(query.limit + query.offset)
+            .order_by_fast_field::<i64>("created_at", date_order.clone());
+        date_sorted_docs = searcher.search(&final_query, &collector)?;
+    } else {
+        let collector = TopDocs::with_limit(query.limit + query.offset);
+        score_sorted_docs = searcher.search(&final_query, &collector)?;
+    }
 
     let mut hits = Vec::new();
 
-    for (_score, doc_address) in top_docs.iter().skip(query.offset) {
-        let doc: tantivy::TantivyDocument = searcher.doc(*doc_address)?;
+    // Unified iteration over the chosen collector's output.
+    let doc_iter: Box<dyn Iterator<Item = (f32, tantivy::DocAddress)>> = if sort_by_date {
+        Box::new(
+            date_sorted_docs
+                .into_iter()
+                .map(|(_ts, addr)| (0.0_f32, addr)),
+        )
+    } else {
+        Box::new(score_sorted_docs.into_iter())
+    };
+
+    for (score, doc_address) in doc_iter.skip(query.offset) {
+        let doc: tantivy::TantivyDocument = searcher.doc(doc_address)?;
 
         let conv_id: i64 = doc
             .get_first(field_conv_db_id)
@@ -213,7 +253,7 @@ pub fn execute(query: &SearchQuery, index: &TantivyIndex) -> Result<SearchResult
         let created_at = doc.get_first(field_created_at).and_then(|v| v.as_i64());
 
         // Calculate blended score
-        let bm25_score = *_score;
+        let bm25_score = score;
         let recency = calculate_recency_score(created_at.unwrap_or(0));
         let blended_score = query.ranking.blend_scores(bm25_score, recency);
 
@@ -233,13 +273,16 @@ pub fn execute(query: &SearchQuery, index: &TantivyIndex) -> Result<SearchResult
         });
     }
 
-    // Sort by blended score if needed
-    if query.ranking != RankingMode::Newest && query.ranking != RankingMode::Oldest {
-        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
-    } else if query.ranking == RankingMode::Newest {
-        hits.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    // Re-sort post-hoc. If we already collected in date order, this is a no-op
+    // beyond confirming order. For score-based modes, sort by the blended score.
+    if sort_by_date {
+        if matches!(date_order, Order::Desc) {
+            hits.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        } else {
+            hits.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        }
     } else {
-        hits.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
     }
 
     let query_time_ms = start.elapsed().as_millis() as u64;
@@ -782,6 +825,53 @@ mod tests {
         let results = execute(&query, &index).unwrap();
         assert!(results.hits.is_empty());
         assert_eq!(results.total_hits, 0);
+    }
+
+    #[test]
+    fn test_execute_empty_query_returns_newest_first() {
+        // Regression: default "browse" view (no text query) used to return an
+        // arbitrary 50-doc window because TopDocs ranked by uniform BM25 score.
+        // It must now sort by `created_at` descending globally.
+        let temp_dir = TempDir::new().unwrap();
+        let mut index = TantivyIndex::open_or_create(temp_dir.path()).unwrap();
+        index.start_writer().unwrap();
+
+        // Insert 100 conversations with monotonically increasing timestamps.
+        // The newest should be db_id = 100.
+        for i in 1..=100i64 {
+            let conv = crate::model::Conversation {
+                agent: Agent::ClaudeCode,
+                external_id: None,
+                title: Some(format!("Conv {}", i)),
+                workspace: None,
+                source_path: PathBuf::from(format!("/test/c{}.jsonl", i)),
+                source_files: vec![],
+                source_fingerprint: format!("fp{}", i),
+                started_at: Some(1_700_000_000_000 + i * 1000),
+                ended_at: None,
+                messages: vec![crate::model::Message {
+                    idx: 0,
+                    role: crate::model::Role::User,
+                    content: format!("body {}", i),
+                    timestamp: None,
+                    model: None,
+                }],
+            };
+            index.add_conversation(&conv, i).unwrap();
+        }
+        index.commit().unwrap();
+
+        // Default ranking is RecentHeavy; empty text query should still
+        // return the newest docs globally, not an arbitrary 50.
+        let query = SearchQuery {
+            limit: 5,
+            ..Default::default()
+        };
+        let results = execute(&query, &index).unwrap();
+        assert_eq!(results.total_hits, 100);
+        assert_eq!(results.hits.len(), 5);
+        let ids: Vec<i64> = results.hits.iter().map(|h| h.conversation_id).collect();
+        assert_eq!(ids, vec![100, 99, 98, 97, 96]);
     }
 
     #[test]
