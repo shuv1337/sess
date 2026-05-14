@@ -1,9 +1,18 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use crate::search::RankingMode;
+
+/// Default freshness threshold for auto-refresh.
+pub const DEFAULT_MAX_AGE: Duration = Duration::from_secs(15 * 60);
+
+/// Parse `--max-age` values using humantime (e.g. "5m", "1h", "2h30m").
+pub fn parse_max_age(s: &str) -> Result<Duration, String> {
+    humantime::parse_duration(s).map_err(|e| format!("invalid duration '{}': {}", s, e))
+}
 
 /// Session search for coding agents
 #[derive(Parser, Debug)]
@@ -25,6 +34,18 @@ pub struct Cli {
     /// Disable semantic search
     #[arg(long, global = true)]
     pub no_semantic: bool,
+
+    /// Suppress age-based auto-refresh on `search` and TUI launch.
+    ///
+    /// Explicit `sess index` is unaffected. Implied by `--no-auto-index`.
+    #[arg(long, global = true)]
+    pub no_refresh: bool,
+
+    /// Max acceptable index staleness before auto-refresh kicks in.
+    ///
+    /// Examples: `5m`, `1h`, `2h30m`. Default: 15m.
+    #[arg(long, global = true, value_name = "DURATION", value_parser = parse_max_age)]
+    pub max_age: Option<Duration>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -84,6 +105,10 @@ pub enum Commands {
         /// Rebuild from SQLite (no rescan)
         #[arg(long)]
         rebuild: bool,
+
+        /// Show what would change without writing to SQLite or Tantivy.
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Show index statistics
@@ -269,6 +294,61 @@ impl StatsOutput {
                     .map(|dt| dt.to_rfc3339())
                     .unwrap_or_default()
             }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn max_age_parses_valid_durations() {
+        assert_eq!(parse_max_age("5m"), Ok(Duration::from_secs(300)));
+        assert_eq!(parse_max_age("1h"), Ok(Duration::from_secs(3600)));
+        assert_eq!(parse_max_age("2h30m"), Ok(Duration::from_secs(9000)));
+        assert_eq!(parse_max_age("0s"), Ok(Duration::ZERO));
+    }
+
+    #[test]
+    fn max_age_rejects_garbage() {
+        assert!(parse_max_age("forever").is_err());
+        assert!(parse_max_age("").is_err());
+        assert!(parse_max_age("5banana").is_err());
+    }
+
+    #[test]
+    fn cli_parses_no_refresh_and_max_age() {
+        let cli = Cli::try_parse_from(["sess", "--no-refresh", "--max-age", "1h", "stats"])
+            .expect("parse");
+        assert!(cli.no_refresh);
+        assert_eq!(cli.max_age, Some(Duration::from_secs(3600)));
+        assert!(!cli.no_auto_index);
+    }
+
+    #[test]
+    fn cli_parses_no_auto_index_alone() {
+        let cli = Cli::try_parse_from(["sess", "--no-auto-index", "stats"]).expect("parse");
+        assert!(cli.no_auto_index);
+        assert!(!cli.no_refresh);
+        assert_eq!(cli.max_age, None);
+    }
+
+    #[test]
+    fn cli_parses_index_dry_run() {
+        let cli = Cli::try_parse_from(["sess", "index", "--dry-run"]).expect("parse");
+        match cli.command {
+            Some(Commands::Index {
+                dry_run,
+                full,
+                rebuild,
+            }) => {
+                assert!(dry_run);
+                assert!(!full);
+                assert!(!rebuild);
+            }
+            _ => panic!("expected Index"),
         }
     }
 }

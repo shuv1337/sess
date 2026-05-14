@@ -19,6 +19,7 @@ use ratatui::{
 use crate::model::{Agent, Conversation};
 use crate::search::{RankingMode, SearchQuery, SearchResult};
 use crate::storage::Storage;
+use crate::tui::refresh::{RefreshConfig, RefreshEvent, RefreshThread};
 use crate::tui::search::SearchThread;
 use crate::tui::ui;
 
@@ -79,6 +80,8 @@ pub struct App {
     pub search_generation: Arc<AtomicU64>,
     pub focus: Focus,
     pub show_help: bool,
+    pub indexing: bool,
+    pub last_index_status: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +110,43 @@ impl App {
             search_generation: Arc::new(AtomicU64::new(0)),
             focus: Focus::Search,
             show_help: false,
+            indexing: false,
+            last_index_status: None,
+        }
+    }
+
+    /// Apply a refresh-thread event to TUI state. Returns true if the search
+    /// generation should be bumped (i.e. fresh data is available).
+    pub fn on_refresh_event(&mut self, ev: RefreshEvent) -> bool {
+        match ev {
+            RefreshEvent::Started => {
+                self.indexing = true;
+                self.last_index_status = Some("↻ indexing…".into());
+                false
+            }
+            RefreshEvent::Finished { stats, .. } => {
+                self.indexing = false;
+                self.last_index_status = Some(format!(
+                    "index fresh ({}+{}, {}ms)",
+                    stats.conversations_inserted, stats.conversations_updated, stats.time_ms
+                ));
+                true
+            }
+            RefreshEvent::SkippedFresh => {
+                self.indexing = false;
+                self.last_index_status = Some("index fresh".into());
+                false
+            }
+            RefreshEvent::BusySkipped => {
+                self.indexing = false;
+                self.last_index_status = Some("index busy; skipped".into());
+                false
+            }
+            RefreshEvent::Failed(msg) => {
+                self.indexing = false;
+                self.last_index_status = Some(format!("index failed: {}", msg));
+                false
+            }
         }
     }
 
@@ -278,7 +318,7 @@ impl App {
         }
     }
 
-    fn trigger_search(&mut self) {
+    pub fn trigger_search(&mut self) {
         // Will be handled by the search thread
         self.search_generation.fetch_add(1, Ordering::SeqCst);
     }
@@ -383,7 +423,11 @@ impl App {
 }
 
 /// Run the TUI application
-pub fn run_app(storage: &Storage, tantivy: &Arc<crate::search::index::TantivyIndex>) -> Result<()> {
+pub fn run_app(
+    storage: &Storage,
+    tantivy: &Arc<crate::search::index::TantivyIndex>,
+    refresh_cfg: RefreshConfig,
+) -> Result<()> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -393,6 +437,9 @@ pub fn run_app(storage: &Storage, tantivy: &Arc<crate::search::index::TantivyInd
 
     // Create search thread
     let search_thread = SearchThread::new(tantivy.clone());
+
+    // Spawn background refresh thread.
+    let refresh = RefreshThread::spawn(refresh_cfg);
 
     // Create app
     let mut app = App::new();
@@ -404,7 +451,14 @@ pub fn run_app(storage: &Storage, tantivy: &Arc<crate::search::index::TantivyInd
     );
 
     // Run main loop
-    let res = run_app_loop(&mut terminal, &mut app, &search_thread, storage);
+    let res = run_app_loop(
+        &mut terminal,
+        &mut app,
+        &search_thread,
+        storage,
+        &refresh,
+        tantivy.as_ref(),
+    );
 
     // Restore terminal
     disable_raw_mode()?;
@@ -423,6 +477,8 @@ fn run_app_loop<B: Backend>(
     app: &mut App,
     search_thread: &SearchThread,
     storage: &Storage,
+    refresh: &RefreshThread,
+    tantivy: &crate::search::index::TantivyIndex,
 ) -> Result<()> {
     let mut last_search_gen = 0u64;
 
@@ -432,6 +488,18 @@ fn run_app_loop<B: Backend>(
 
         // Draw UI
         terminal.draw(|f| ui::draw(f, app, storage))?;
+
+        // Drain refresh events.
+        while let Some(ev) = refresh.try_recv() {
+            let should_refresh_search = app.on_refresh_event(ev);
+            if should_refresh_search {
+                // Reload Tantivy reader so the next search sees committed docs.
+                if let Err(e) = tantivy.reload_reader() {
+                    app.status = format!("reload_reader failed: {}", e);
+                }
+                app.trigger_search();
+            }
+        }
 
         // Check for new search results
         if let Some(response) = search_thread.try_recv() {
@@ -572,5 +640,45 @@ mod tests {
         let mut app = App::new();
         let should_continue = app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(!should_continue);
+    }
+
+    #[test]
+    fn refresh_finished_bumps_search_generation_and_updates_status() {
+        let mut app = App::new();
+        let before = app.get_current_search_generation();
+        let stats = crate::indexer::IndexStats {
+            conversations_inserted: 3,
+            conversations_updated: 1,
+            time_ms: 42,
+            ..Default::default()
+        };
+        let bump = app.on_refresh_event(RefreshEvent::Finished {
+            stats,
+            deleted: 0,
+            uncertain: 0,
+        });
+        assert!(bump, "Finished must signal a search re-trigger");
+        // Simulate the loop's own trigger_search() call.
+        app.trigger_search();
+        assert!(app.get_current_search_generation() > before);
+        assert!(app.last_index_status.as_deref().unwrap().contains("fresh"));
+        assert!(!app.indexing);
+    }
+
+    #[test]
+    fn refresh_skipped_fresh_marks_status_without_bumping_search() {
+        let mut app = App::new();
+        let before = app.get_current_search_generation();
+        let bump = app.on_refresh_event(RefreshEvent::SkippedFresh);
+        assert!(!bump);
+        assert_eq!(app.get_current_search_generation(), before);
+        assert_eq!(app.last_index_status.as_deref(), Some("index fresh"));
+    }
+
+    #[test]
+    fn refresh_failed_records_error_status() {
+        let mut app = App::new();
+        app.on_refresh_event(RefreshEvent::Failed("boom".into()));
+        assert!(app.last_index_status.as_deref().unwrap().contains("boom"));
     }
 }

@@ -1,0 +1,18 @@
+[Unit]
+Description=sess incremental index refresh
+Documentation=https://github.com/shuv1337/sess
+# Don't try to run if the network/home dir isn't ready yet
+After=default.target
+
+[Service]
+Type=oneshot
+# Default to NO semantic embeddings so the timer never silently
+# downloads / initializes fastembed in the background. Users who want
+# semantic embeddings should override this unit with:
+#   systemctl --user edit sess-index.service
+# and set ExecStart=%h/.cargo/bin/sess index
+ExecStart=%h/.cargo/bin/sess --no-semantic index
+Nice=10
+IOSchedulingClass=idle
+# Soft-fail: a stale-index pass is best-effort. Don't keep retrying on failure.
+SuccessExitStatus=0 1

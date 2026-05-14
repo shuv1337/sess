@@ -102,6 +102,7 @@ impl Storage {
              PRAGMA synchronous = NORMAL;
              PRAGMA foreign_keys = ON;
              PRAGMA cache_size = -64000;  -- 64MB
+             PRAGMA busy_timeout = 5000;  -- 5s, lets background refresh wait
             ",
         )
         .context("Failed to set database pragmas")?;

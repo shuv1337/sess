@@ -210,27 +210,44 @@ Coordinates connectors, storage upsert decisions, Tantivy updates, and embedding
 
 ## 7) Known Limitations (Important)
 
-1. **Incremental stale-deletion semantics are risky**
-   - Current incremental flow can treat conversations not seen in this scan as stale.
-   - Practical guidance today: use `sess index --full` when safety matters.
-
-2. **Hybrid fusion excludes semantic-only hits**
+1. **Hybrid fusion excludes semantic-only hits**
    - RRF currently builds final result payloads from keyword-side `result_map`.
    - Pure semantic candidates without keyword presence can be dropped.
 
-3. **TUI path is keyword-only today**
+2. **TUI path is keyword-only today**
    - TUI search thread uses query execution without semantic merge path.
 
-4. **Incremental embedding refresh trigger is narrow**
+3. **Incremental embedding refresh trigger is narrow**
    - Incremental `index_embeddings()` call is gated by `conversations_updated > 0`.
    - Insert-only incremental runs may skip embedding generation.
 
-5. **`source_files` reconstruction is minimal when reading from DB**
+4. **`source_files` reconstruction is minimal when reading from DB**
    - `get_conversation()` reconstructs simplified source metadata.
 
-6. **Engineering polish debt**
+5. **Engineering polish debt**
    - Many compiler warnings currently exist.
    - No repository CI pipeline file present yet.
+
+---
+
+## 7a) Operational Guarantees (stale deletion + refresh)
+
+- A successful stale-deletion sweep removes the row from **both** SQLite and
+  the Tantivy index in the same indexer call; they cannot drift in the
+  happy path.
+- Rows whose agent is **not currently detected** (env var or root
+  temporarily disappeared) are **never** auto-deleted.
+- Filesystem uncertainty (`Path::try_exists()` returning `Err`) **keeps**
+  the row and emits a warning. Confirmed `Ok(false)` is required for
+  deletion.
+- Auto-refresh is opt-out:
+  - `--no-auto-index` suppresses *all* automatic indexing (initial + age).
+  - `--no-refresh` suppresses only age-based refresh; initial run on empty
+    DB still happens.
+  - `--max-age <DURATION>` overrides the 15-minute default.
+- The TUI runs a background refresh thread every 5 minutes by default;
+  refreshes never overlap and back off on SQLite/Tantivy lock contention
+  (`BusySkipped` event).
 
 ---
 
@@ -245,8 +262,7 @@ Coordinates connectors, storage upsert decisions, Tantivy updates, and embedding
 
 ## 9) Suggested Hardening Priorities
 
-1. Fix incremental stale-deletion semantics
-2. Include semantic-only rows in hybrid result materialization
+1. Include semantic-only rows in hybrid result materialization
 3. Integrate semantic mode into TUI search flow
 4. Resolve warnings (`fmt`, `clippy`, dead code cleanup)
 5. Add CI checks (format + clippy + tests)

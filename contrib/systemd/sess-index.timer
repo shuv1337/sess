@@ -1,0 +1,14 @@
+[Unit]
+Description=Periodic sess incremental index refresh
+Documentation=https://github.com/shuv1337/sess
+
+[Timer]
+# Run 2 minutes after login, then every 15 minutes.
+OnStartupSec=2min
+OnUnitActiveSec=15min
+AccuracySec=1min
+Persistent=true
+Unit=sess-index.service
+
+[Install]
+WantedBy=timers.target

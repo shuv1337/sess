@@ -101,6 +101,32 @@ You can override with:
 sess --data-dir /custom/path ...
 ```
 
+## Keeping the index fresh
+
+`sess search` and the TUI auto-refresh a stale index (default threshold 15
+minutes). Tune or disable via global flags:
+
+```bash
+sess --max-age 1h search foo
+sess --no-refresh search foo   # use whatever's on disk
+sess --no-auto-index search foo  # don't index automatically at all
+```
+
+For users who never keep the TUI open, an optional systemd-user timer is
+shipped under `contrib/systemd/`:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp contrib/systemd/sess-index.{service,timer} ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now sess-index.timer
+```
+
+The service defaults to `sess --no-semantic index` so background runs
+never silently download or initialize the embedding model. See
+[`contrib/systemd/README.md`](./contrib/systemd/README.md) for the
+semantic override.
+
 ## Documentation
 
 - Architecture and deep project assessment: [`ARCHITECTURE.md`](./ARCHITECTURE.md)

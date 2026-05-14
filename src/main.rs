@@ -12,8 +12,39 @@ mod search;
 mod storage;
 mod tui;
 
-use cli::{AgentInfoOutput, Cli, Commands, SearchOutput, StatsOutput};
+use cli::{AgentInfoOutput, Cli, Commands, DEFAULT_MAX_AGE, SearchOutput, StatsOutput};
 use indexer::Indexer;
+
+fn effective_max_age(flags: &GlobalFlags) -> std::time::Duration {
+    flags.max_age.unwrap_or(DEFAULT_MAX_AGE)
+}
+
+/// Run an auto-refresh if the index is stale.
+///
+/// `--no-auto-index` suppresses both initial and freshness refresh.
+/// `--no-refresh` suppresses only age-based refresh; initial (empty DB) still runs.
+fn maybe_auto_refresh(flags: &GlobalFlags, indexer: &mut Indexer) -> Result<()> {
+    if flags.no_auto_index {
+        return Ok(());
+    }
+    if indexer.needs_initial_index()? {
+        eprintln!("No existing index found. Running initial index...");
+        indexer.full_index()?;
+        return Ok(());
+    }
+    if flags.no_refresh {
+        return Ok(());
+    }
+    let max_age = effective_max_age(flags);
+    if indexer.should_refresh(max_age)? {
+        eprintln!(
+            "Index is stale (>{:?}); running incremental refresh...",
+            max_age
+        );
+        indexer.incremental_index()?;
+    }
+    Ok(())
+}
 
 fn main() {
     // Initialize tracing
@@ -27,8 +58,28 @@ fn main() {
     }
 }
 
+/// Subset of CLI flags shared across subcommand arms after destructuring.
+struct GlobalFlags {
+    no_auto_index: bool,
+    no_refresh: bool,
+    no_semantic: bool,
+    max_age: Option<std::time::Duration>,
+}
+
+impl GlobalFlags {
+    fn from_cli(cli: &Cli) -> Self {
+        Self {
+            no_auto_index: cli.no_auto_index,
+            no_refresh: cli.no_refresh,
+            no_semantic: cli.no_semantic,
+            max_age: cli.max_age,
+        }
+    }
+}
+
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    let flags = GlobalFlags::from_cli(&cli);
 
     // Determine data directory
     let data_dir = cli
@@ -42,20 +93,23 @@ fn run() -> Result<()> {
     match cli.command {
         None => {
             // Default: launch TUI
-            let mut indexer = Indexer::new(&data_dir, !cli.no_semantic)?;
+            let mut indexer = Indexer::new(&data_dir, !flags.no_semantic)?;
 
-            // Auto-index if needed and not disabled
-            if !cli.no_auto_index && indexer.needs_initial_index()? {
-                println!("No existing index found. Running initial index...");
-                indexer.full_index()?;
-            }
+            maybe_auto_refresh(&flags, &mut indexer)?;
 
             // Get references for TUI
             let tantivy = Arc::new(indexer.tantivy().clone());
+            let refresh_cfg = tui::RefreshConfig {
+                data_dir: data_dir.clone(),
+                enable_semantic: !flags.no_semantic,
+                max_age: effective_max_age(&flags),
+                interval: std::time::Duration::from_secs(5 * 60),
+                enabled: !flags.no_auto_index && !flags.no_refresh,
+            };
             let storage = indexer.storage();
 
             // Run TUI
-            tui::run_app(storage, &tantivy)?;
+            tui::run_app(storage, &tantivy, refresh_cfg)?;
         }
         Some(Commands::Search {
             query,
@@ -70,13 +124,9 @@ fn run() -> Result<()> {
             rrf_k,
             json,
         }) => {
-            let mut indexer = Indexer::new(&data_dir, !cli.no_semantic && semantic)?;
+            let mut indexer = Indexer::new(&data_dir, !flags.no_semantic && semantic)?;
 
-            // Auto-index if needed and not disabled
-            if !cli.no_auto_index && indexer.needs_initial_index()? {
-                eprintln!("No existing index found. Running initial index...");
-                indexer.full_index()?;
-            }
+            maybe_auto_refresh(&flags, &mut indexer)?;
 
             // Build search query
             let mut search_query = search::SearchQuery {
@@ -151,8 +201,43 @@ fn run() -> Result<()> {
                 }
             }
         }
-        Some(Commands::Index { full, rebuild }) => {
-            let mut indexer = Indexer::new(&data_dir, !cli.no_semantic)?;
+        Some(Commands::Index {
+            full,
+            rebuild,
+            dry_run,
+        }) => {
+            let mut indexer = Indexer::new(&data_dir, !flags.no_semantic)?;
+
+            if dry_run {
+                println!("Running dry-run incremental index (no writes)...");
+                let report = indexer.incremental_index_dry_run()?;
+                let total_scanned: usize = report.would_scan_by_agent.values().sum();
+                println!("Would scan: {} files", total_scanned);
+                for (agent, count) in &report.would_scan_by_agent {
+                    println!("  {}: {}", agent.display_name(), count);
+                }
+                println!("Would insert: {}", report.would_insert);
+                println!("Would update: {}", report.would_update);
+                println!("Would delete: {}", report.would_delete.len());
+                for m in &report.would_delete {
+                    println!(
+                        "  - [{}] id={} {}",
+                        m.agent.slug(),
+                        m.id,
+                        m.source_path.display()
+                    );
+                }
+                if !report.uncertain_paths.is_empty() {
+                    println!(
+                        "Uncertain (kept): {} rows could not be verified",
+                        report.uncertain_paths.len()
+                    );
+                    for (id, p, e) in &report.uncertain_paths {
+                        println!("  ? id={} {} ({})", id, p.display(), e);
+                    }
+                }
+                return Ok(());
+            }
 
             let stats = if rebuild {
                 println!("Rebuilding index from SQLite...");
@@ -175,6 +260,7 @@ fn run() -> Result<()> {
             );
         }
         Some(Commands::Stats { json }) => {
+            let _ = &flags;
             let indexer = Indexer::new(&data_dir, false)?;
             let stats = indexer.storage().stats()?;
 

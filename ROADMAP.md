@@ -4,9 +4,10 @@ This roadmap reflects the current implementation state and the highest-impact ne
 
 ## P0 — Correctness & Data Safety
 
-1. **Fix incremental stale deletion semantics**
-   - Ensure incremental scans do not delete conversations that were simply not rescanned.
-   - Add targeted tests for mixed old/new file sets.
+1. ~~**Fix incremental stale deletion semantics**~~ — done in
+   `fix/incremental-staleness-and-freshness`. Stale detection is now
+   existence-based and fail-safe; SQLite + Tantivy delete together.
+   See `PLAN-stale-index.md` and `ARCHITECTURE.md §6.2/7a`.
 
 2. **Preserve semantic-only hybrid hits**
    - In RRF merge, materialize result rows for candidates found only by semantic retrieval.
