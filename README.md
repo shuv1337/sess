@@ -40,6 +40,12 @@ cargo build --release
 ./target/release/sess
 ```
 
+## Screenshots
+
+![sess TUI search](docs/images/tui-search.png)
+
+![sess search workflow](docs/images/search-workflow.gif)
+
 ## CLI Commands
 
 ```bash
