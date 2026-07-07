@@ -582,7 +582,7 @@ fn draw_help(f: &mut Frame, _app: &App) {
     ]));
     help_lines.push(Line::from(vec![
         Span::styled("  PgUp/Dn    ", Style::default().fg(C_ACCENT)),
-        Span::raw("Scroll detail faster"),
+        Span::raw("Page results / scroll detail faster"),
     ]));
     help_lines.push(Line::from(""));
 

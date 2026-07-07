@@ -23,6 +23,8 @@ use crate::tui::refresh::{RefreshConfig, RefreshEvent, RefreshThread};
 use crate::tui::search::SearchThread;
 use crate::tui::ui;
 
+const PAGE_SCROLL_LINES: usize = 10;
+
 /// Time filter for TUI
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimeFilter {
@@ -272,6 +274,14 @@ impl App {
                     self.selected += 1;
                 }
             }
+            KeyCode::PageUp => {
+                self.selected = self.selected.saturating_sub(PAGE_SCROLL_LINES);
+            }
+            KeyCode::PageDown => {
+                if !self.results.is_empty() {
+                    self.selected = (self.selected + PAGE_SCROLL_LINES).min(self.results.len() - 1);
+                }
+            }
             KeyCode::Enter => {
                 self.focus = Focus::Detail;
                 self.detail_scroll = 0;
@@ -305,11 +315,14 @@ impl App {
                     self.detail_scroll -= 1;
                 }
             }
-            KeyCode::Down | KeyCode::PageDown => {
+            KeyCode::Down => {
                 self.detail_scroll += 1;
             }
             KeyCode::PageUp => {
-                self.detail_scroll = self.detail_scroll.saturating_sub(10);
+                self.detail_scroll = self.detail_scroll.saturating_sub(PAGE_SCROLL_LINES);
+            }
+            KeyCode::PageDown => {
+                self.detail_scroll += PAGE_SCROLL_LINES;
             }
             KeyCode::Left | KeyCode::Esc | KeyCode::Tab => {
                 self.focus = Focus::Results;
@@ -640,6 +653,57 @@ mod tests {
         let mut app = App::new();
         let should_continue = app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(!should_continue);
+    }
+
+    #[test]
+    fn page_down_jumps_through_results_history() {
+        let mut app = App::new();
+        app.focus = Focus::Results;
+        app.results = (0..25).map(sample_result).collect();
+
+        app.on_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.selected, PAGE_SCROLL_LINES);
+
+        app.on_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.selected, PAGE_SCROLL_LINES * 2);
+
+        app.on_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.selected, app.results.len() - 1);
+    }
+
+    #[test]
+    fn page_up_jumps_through_results_history() {
+        let mut app = App::new();
+        app.focus = Focus::Results;
+        app.results = (0..25).map(sample_result).collect();
+        app.selected = 24;
+
+        app.on_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(app.selected, 14);
+
+        app.on_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(app.selected, 4);
+
+        app.on_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn detail_page_keys_scroll_by_page_step() {
+        let mut app = App::new();
+        app.focus = Focus::Detail;
+
+        app.on_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.detail_scroll, PAGE_SCROLL_LINES);
+
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.detail_scroll, PAGE_SCROLL_LINES + 1);
+
+        app.on_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(app.detail_scroll, 1);
+
+        app.on_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(app.detail_scroll, 0);
     }
 
     #[test]

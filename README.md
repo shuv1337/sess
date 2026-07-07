@@ -85,6 +85,7 @@ sess view /path/to/session.jsonl --json
 - Type in search bar — live query
 - `Tab` — switch focus
 - `Enter` — open detail pane
+- `PgUp` / `PgDn` — page through results or scroll detail faster
 - `F3` — cycle agent filter
 - `F5` — cycle time filter
 - `F12` — cycle ranking mode
