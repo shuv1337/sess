@@ -119,8 +119,21 @@ sess --no-refresh search foo   # use whatever's on disk
 sess --no-auto-index search foo  # don't index automatically at all
 ```
 
-For users who never keep the TUI open, an optional systemd-user timer is
-shipped under `contrib/systemd/`:
+For users who never keep the TUI open, optional background refresh is
+shipped in two forms:
+
+**oxmgr** (preferred if you already supervise services with oxmgr):
+
+```bash
+# see contrib/oxmgr/README.md for the oxfile.toml snippet
+oxmgr apply ~/.config/oxmgr/oxfile.toml
+oxmgr logs sess-index -f
+```
+
+The oxmgr loop runs `sess index` (semantic embeddings **on**) every 15
+minutes by default.
+
+**systemd-user timer**:
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -129,10 +142,11 @@ systemctl --user daemon-reload
 systemctl --user enable --now sess-index.timer
 ```
 
-The service defaults to `sess --no-semantic index` so background runs
-never silently download or initialize the embedding model. See
+The systemd service defaults to `sess --no-semantic index` so background
+runs never silently download or initialize the embedding model. See
 [`contrib/systemd/README.md`](./contrib/systemd/README.md) for the
-semantic override.
+semantic override, or [`contrib/oxmgr/README.md`](./contrib/oxmgr/README.md)
+for the oxmgr unit.
 
 ## Documentation
 
