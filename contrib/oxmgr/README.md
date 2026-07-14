@@ -15,6 +15,7 @@ to supervise.
 ```toml
 [[apps]]
 name = "sess-index"
+# Replace /home/you/repos/sess with the path to your clone.
 command = "/home/you/repos/sess/contrib/oxmgr/sess-index-loop.sh"
 cwd = "/home/you"
 restart_policy = "always"

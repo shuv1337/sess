@@ -3,6 +3,12 @@ name = "session-search"
 version = "0.1.1"
 edition = "2024"
 default-run = "sess"
+description = "Local-first search for coding-agent transcripts"
+license = "MIT"
+repository = "https://github.com/shuv1337/sess"
+readme = "README.md"
+keywords = ["cli", "search", "transcripts", "tui"]
+categories = ["command-line-utilities"]
 
 [[bin]]
 name = "sess"

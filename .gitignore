@@ -3,5 +3,4 @@
 *.db-*
 data/
 .DS_Store
-Cargo.lock
 .fastembed_cache/

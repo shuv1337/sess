@@ -93,7 +93,12 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md) for contribution guidance and
 [ARCHITECTURE.md](./ARCHITECTURE.md) for the storage, indexing, and connector
 layout. The prioritized project direction is in [ROADMAP.md](./ROADMAP.md).
 
-## Security note
+## Security
 
 Session transcripts may contain sensitive prompts, source code, or secrets.
-Treat the local SQLite database and Tantivy index as sensitive data.
+Treat the local SQLite database, Tantivy index, and optional embedding data as
+sensitive. See [SECURITY.md](./SECURITY.md) for private vulnerability reporting.
+
+## License
+
+MIT — see [LICENSE](./LICENSE).

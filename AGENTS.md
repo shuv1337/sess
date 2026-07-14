@@ -22,7 +22,7 @@ cargo clippy --all-targets --all-features
 cargo fmt -- --check
 ```
 
-The repository has pre-existing warnings and formatting drift outside files being changed; do not mix unrelated cleanup into focused changes. Current baseline caveats: all-target Clippy is blocked by `clippy::absurd_extreme_comparisons` in the `src/model.rs` color test, and whole-repo `cargo fmt -- --check` reports existing drift in `src/tui/ui.rs`.
+The repository currently emits pre-existing compiler and Clippy warnings; do not mix unrelated warning cleanup into focused changes. Formatting checks and all-target Clippy complete successfully despite those warnings.
 
 ## Operations
 

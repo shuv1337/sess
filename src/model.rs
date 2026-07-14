@@ -373,15 +373,20 @@ mod tests {
             }
         }
 
-        // Color codes are valid RGB tuples
-        for agent in [
+        // Each agent also has a distinct RGB color.
+        let colors: Vec<(u8, u8, u8)> = [
             Agent::ClaudeCode,
             Agent::Codex,
             Agent::OpenCode,
             Agent::PiAgent,
-        ] {
-            let (r, g, b) = agent.color_code();
-            assert!(r <= 255 && g <= 255 && b <= 255);
+        ]
+        .iter()
+        .map(Agent::color_code)
+        .collect();
+        for i in 0..colors.len() {
+            for j in (i + 1)..colors.len() {
+                assert_ne!(colors[i], colors[j]);
+            }
         }
     }
 

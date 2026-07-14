@@ -76,7 +76,9 @@ pub fn draw(f: &mut Frame, app: &App, _storage: &Storage) {
 fn draw_search_bar(f: &mut Frame, app: &App, area: Rect) {
     let is_focused = app.focus == Focus::Search;
     let border_style = if is_focused {
-        Style::default().fg(C_BORDER_ACTIVE).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(C_BORDER_ACTIVE)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(C_BORDER_INACTIVE)
     };
@@ -280,7 +282,9 @@ fn draw_detail_pane(f: &mut Frame, app: &App, area: Rect) {
             Span::styled("Agent:  ", Style::default().fg(C_LABEL)),
             Span::styled(
                 format!("{} {}", result.agent.icon(), result.agent.display_name()),
-                Style::default().fg(agent_color).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(agent_color)
+                    .add_modifier(Modifier::BOLD),
             ),
         ])]);
 
@@ -316,7 +320,10 @@ fn draw_detail_pane(f: &mut Frame, app: &App, area: Rect) {
 
         text.extend(vec![Line::from(vec![
             Span::styled("Score:  ", Style::default().fg(C_LABEL)),
-            Span::styled(format!("{:.3}", result.score), Style::default().fg(C_ACCENT)),
+            Span::styled(
+                format!("{:.3}", result.score),
+                Style::default().fg(C_ACCENT),
+            ),
         ])]);
 
         // Separator line
@@ -330,9 +337,7 @@ fn draw_detail_pane(f: &mut Frame, app: &App, area: Rect) {
             text.extend(vec![Line::from(vec![
                 Span::styled(
                     format!("Messages ({})  ", conv.messages.len()),
-                    Style::default()
-                        .fg(C_LABEL)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(C_LABEL).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!("· scroll: {}", app.detail_scroll + 1),
@@ -350,9 +355,7 @@ fn draw_detail_pane(f: &mut Frame, app: &App, area: Rect) {
                     Span::styled("│ ", Style::default().fg(role_col)),
                     Span::styled(
                         role_label,
-                        Style::default()
-                            .fg(role_col)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(role_col).add_modifier(Modifier::BOLD),
                     ),
                 ];
 
@@ -380,7 +383,10 @@ fn draw_detail_pane(f: &mut Frame, app: &App, area: Rect) {
                 if message.content.is_empty() {
                     text.extend(vec![Line::from(vec![
                         Span::styled("│ ", Style::default().fg(role_col)),
-                        Span::styled("(empty)", Style::default().fg(C_DIM).add_modifier(Modifier::ITALIC)),
+                        Span::styled(
+                            "(empty)",
+                            Style::default().fg(C_DIM).add_modifier(Modifier::ITALIC),
+                        ),
                     ])]);
                 } else {
                     for line in message.content.lines() {
@@ -404,17 +410,16 @@ fn draw_detail_pane(f: &mut Frame, app: &App, area: Rect) {
         } else {
             // Loading state
             let spinner = loading_spinner(app.selected);
-            text.extend(vec![Line::from(vec![
-                Span::styled("Preview:  ", Style::default().fg(C_LABEL).add_modifier(Modifier::BOLD)),
-            ])]);
+            text.extend(vec![Line::from(vec![Span::styled(
+                "Preview:  ",
+                Style::default().fg(C_LABEL).add_modifier(Modifier::BOLD),
+            )])]);
             text.extend(vec![Line::from(result.preview.clone())]);
             text.extend(vec![Line::from("")]);
-            text.extend(vec![Line::from(vec![
-                Span::styled(
-                    format!("{} Loading full conversation…", spinner),
-                    Style::default().fg(C_DIM).add_modifier(Modifier::ITALIC),
-                ),
-            ])]);
+            text.extend(vec![Line::from(vec![Span::styled(
+                format!("{} Loading full conversation…", spinner),
+                Style::default().fg(C_DIM).add_modifier(Modifier::ITALIC),
+            )])]);
         }
 
         let paragraph = Paragraph::new(text)
@@ -424,9 +429,7 @@ fn draw_detail_pane(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(paragraph, inner);
     } else {
         // Empty state
-        let empty_text = Text::from(vec![
-            Line::from("")
-        ]);
+        let empty_text = Text::from(vec![Line::from("")]);
         let placeholder = Paragraph::new(empty_text)
             .alignment(Alignment::Center)
             .block(
@@ -470,7 +473,10 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
 
     // Compose status text (center)
     let status_text = if app.indexing {
-        format!(" {} ", app.last_index_status.as_deref().unwrap_or("indexing…"))
+        format!(
+            " {} ",
+            app.last_index_status.as_deref().unwrap_or("indexing…")
+        )
     } else {
         format!(" {} ", app.status)
     };
@@ -515,12 +521,19 @@ fn draw_help(f: &mut Frame, _app: &App) {
         .title(" Keyboard Shortcuts ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(C_BORDER_ACTIVE))
-        .title_style(Style::default().fg(C_BORDER_ACTIVE).add_modifier(Modifier::BOLD));
+        .title_style(
+            Style::default()
+                .fg(C_BORDER_ACTIVE)
+                .add_modifier(Modifier::BOLD),
+        );
 
     let mut help_lines = vec![
-        Line::from(vec![
-            Span::styled("General", Style::default().fg(C_LABEL).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)),
-        ]),
+        Line::from(vec![Span::styled(
+            "General",
+            Style::default()
+                .fg(C_LABEL)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        )]),
         Line::from(vec![
             Span::styled("  ?          ", Style::default().fg(C_ACCENT)),
             Span::raw("Toggle this help"),
@@ -532,9 +545,12 @@ fn draw_help(f: &mut Frame, _app: &App) {
         Line::from(""),
     ];
 
-    help_lines.push(Line::from(vec![
-        Span::styled("Search", Style::default().fg(C_LABEL).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)),
-    ]));
+    help_lines.push(Line::from(vec![Span::styled(
+        "Search",
+        Style::default()
+            .fg(C_LABEL)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+    )]));
     help_lines.push(Line::from(vec![
         Span::styled("  Type       ", Style::default().fg(C_ACCENT)),
         Span::raw("Search query (instant)"),
@@ -561,9 +577,12 @@ fn draw_help(f: &mut Frame, _app: &App) {
     ]));
     help_lines.push(Line::from(""));
 
-    help_lines.push(Line::from(vec![
-        Span::styled("Navigation", Style::default().fg(C_LABEL).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)),
-    ]));
+    help_lines.push(Line::from(vec![Span::styled(
+        "Navigation",
+        Style::default()
+            .fg(C_LABEL)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+    )]));
     help_lines.push(Line::from(vec![
         Span::styled("  ↑ / ↓      ", Style::default().fg(C_ACCENT)),
         Span::raw("Navigate results / scroll"),
@@ -586,9 +605,12 @@ fn draw_help(f: &mut Frame, _app: &App) {
     ]));
     help_lines.push(Line::from(""));
 
-    help_lines.push(Line::from(vec![
-        Span::styled("Filters", Style::default().fg(C_LABEL).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)),
-    ]));
+    help_lines.push(Line::from(vec![Span::styled(
+        "Filters",
+        Style::default()
+            .fg(C_LABEL)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+    )]));
     help_lines.push(Line::from(vec![
         Span::styled("  Agent:  ", Style::default().fg(C_META)),
         Span::raw("Claude Code ●  Codex ◆  OpenCode ■  Pi Agent ▲"),
@@ -604,9 +626,7 @@ fn draw_help(f: &mut Frame, _app: &App) {
 
     let text = Text::from(help_lines);
 
-    let paragraph = Paragraph::new(text)
-        .block(block)
-        .wrap(Wrap { trim: false });
+    let paragraph = Paragraph::new(text).block(block).wrap(Wrap { trim: false });
 
     f.render_widget(paragraph, popup_area);
 }

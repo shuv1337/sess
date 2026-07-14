@@ -15,7 +15,7 @@ struct SeededData {
 }
 
 struct SeededIds {
-    pi_voice-app_recent: i64,
+    pi_voice_app_recent: i64,
     codex_voice_old: i64,
     claude_nonvoice: i64,
 }
@@ -69,7 +69,7 @@ fn seed_data() -> SeededData {
     let now = chrono::Utc::now().timestamp_millis();
     let ten_days_ago = now - (10 * 24 * 60 * 60 * 1000);
 
-    let conv_pi_voice-app_recent = make_conversation(
+    let conv_pi_voice_app_recent = make_conversation(
         Agent::PiAgent,
         "/home/user/repos/voice-app",
         "/tmp/sess/pi-voice-app.jsonl",
@@ -97,10 +97,10 @@ fn seed_data() -> SeededData {
     );
 
     let up1 = storage
-        .upsert_conversation(&conv_pi_voice-app_recent)
+        .upsert_conversation(&conv_pi_voice_app_recent)
         .expect("upsert 1");
     tantivy
-        .add_conversation(&conv_pi_voice-app_recent, up1.conversation_id)
+        .add_conversation(&conv_pi_voice_app_recent, up1.conversation_id)
         .expect("index 1");
 
     let up2 = storage
@@ -126,7 +126,7 @@ fn seed_data() -> SeededData {
         _tmp: tmp,
         data_dir,
         ids: SeededIds {
-            pi_voice-app_recent: up1.conversation_id,
+            pi_voice_app_recent: up1.conversation_id,
             codex_voice_old: up2.conversation_id,
             claude_nonvoice: up3.conversation_id,
         },
@@ -150,7 +150,7 @@ fn run_search(data_dir: &Path, args: &[&str]) -> Value {
 }
 
 #[test]
-fn cli_voice_search_returns_voice-app_hits() {
+fn cli_voice_search_returns_voice_app_hits() {
     let seeded = seed_data();
     let json = run_search(&seeded.data_dir, &["voice", "--json", "--limit", "20"]);
 
@@ -160,13 +160,13 @@ fn cli_voice_search_returns_voice-app_hits() {
     let hits = json["hits"].as_array().expect("hits array");
     assert!(!hits.is_empty());
 
-    let has_voice-app = hits.iter().any(|h| {
+    let has_voice_app = hits.iter().any(|h| {
         h["workspace"]
             .as_str()
             .map(|w| w == "/home/user/repos/voice-app")
             .unwrap_or(false)
     });
-    assert!(has_voice-app, "expected at least one voice-app hit");
+    assert!(has_voice_app, "expected at least one voice-app hit");
 }
 
 #[test]
@@ -191,7 +191,7 @@ fn cli_workspace_filter_is_strict() {
     assert_eq!(hits[0]["workspace"], "/home/user/repos/voice-app");
     assert_eq!(
         hits[0]["id"].as_i64().unwrap(),
-        seeded.ids.pi_voice-app_recent
+        seeded.ids.pi_voice_app_recent
     );
 }
 
@@ -210,7 +210,7 @@ fn cli_agent_filter_returns_only_requested_agent() {
     assert_eq!(hits[0]["agent"], "pi_agent");
     assert_eq!(
         hits[0]["id"].as_i64().unwrap(),
-        seeded.ids.pi_voice-app_recent
+        seeded.ids.pi_voice_app_recent
     );
 }
 
@@ -243,7 +243,7 @@ fn cli_search_pagination_contract() {
 fn cli_since_filter_applies_to_total_and_hits() {
     let seeded = seed_data();
 
-    // Only the recent pi/voice-app conversation is from today
+    // Only the recent Pi voice-app conversation is from today.
     let json = run_search(
         &seeded.data_dir,
         &["voice", "--since", "today", "--json", "--limit", "20"],
@@ -254,7 +254,7 @@ fn cli_since_filter_applies_to_total_and_hits() {
     assert_eq!(hits.len(), 1);
     assert_eq!(
         hits[0]["id"].as_i64().unwrap(),
-        seeded.ids.pi_voice-app_recent
+        seeded.ids.pi_voice_app_recent
     );
 }
 
