@@ -10,7 +10,9 @@ use walkdir::WalkDir;
 use crate::connectors::{
     Connector, file_modified_since, flatten_json_content, parse_role, source_file,
 };
-use crate::model::{Agent, Conversation, Message, Role, SourceFile, source_fingerprint};
+use crate::model::{Agent, Conversation, Message, Role, parse_timestamp, source_fingerprint};
+
+const CODEX_PARSER_REVISION: &str = "2";
 
 pub struct CodexConnector {
     home_dir: Option<PathBuf>,
@@ -23,12 +25,18 @@ impl CodexConnector {
         }
     }
 
-    fn sessions_dir(&self) -> Option<PathBuf> {
-        // Check CODEX_HOME env var first
-        if let Ok(codex_home) = std::env::var("CODEX_HOME") {
-            return Some(PathBuf::from(codex_home).join("sessions"));
-        }
-        self.home_dir.as_ref().map(|h| h.join(".codex"))
+    fn codex_home(&self) -> Option<PathBuf> {
+        std::env::var_os("CODEX_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| self.home_dir.as_ref().map(|home| home.join(".codex")))
+    }
+
+    fn session_roots(&self) -> Vec<PathBuf> {
+        self.codex_home()
+            .into_iter()
+            .flat_map(|home| [home.join("sessions"), home.join("archived_sessions")])
+            .collect()
     }
 }
 
@@ -44,22 +52,34 @@ impl Connector for CodexConnector {
     }
 
     fn detect(&self) -> bool {
-        self.sessions_dir().map(|p| p.exists()).unwrap_or(false)
+        self.session_roots().iter().any(|path| path.is_dir())
     }
 
     fn default_roots(&self) -> Vec<PathBuf> {
-        self.sessions_dir().into_iter().collect()
+        self.session_roots()
     }
 
     fn scan(&self, roots: &[PathBuf], since_ts: Option<i64>) -> Result<Vec<Conversation>> {
         let mut conversations = Vec::new();
 
         for root in roots {
-            if !root.exists() {
+            if !root.is_dir() {
                 continue;
             }
 
-            // Find both JSONL and JSON files
+            let mut files_discovered = 0usize;
+            let mut files_parsed = 0usize;
+            let mut parse_errors = 0usize;
+
+            tracing::debug!(
+                agent = Agent::Codex.slug(),
+                root = %root.display(),
+                since_ts,
+                "Starting Codex session scan"
+            );
+
+            // Codex CLI stores active and archived rollouts as JSONL (with
+            // legacy JSON files supported for compatibility).
             for entry in WalkDir::new(root)
                 .follow_links(true)
                 .into_iter()
@@ -73,6 +93,7 @@ impl Connector for CodexConnector {
                         && (name.ends_with(".jsonl") || name.ends_with(".json"))
                 })
             {
+                files_discovered += 1;
                 let path = entry.path();
 
                 // Check if file was modified since the given timestamp
@@ -82,16 +103,23 @@ impl Connector for CodexConnector {
 
                 match parse_codex_session(path) {
                     Ok(Some(conv)) => {
+                        files_parsed += 1;
                         conversations.push(conv);
                     }
                     Ok(None) => {
                         // Empty or no messages, skip
                     }
                     Err(e) => {
+                        parse_errors += 1;
                         let action = self.on_parse_error(path, &e);
                         match action {
                             crate::connectors::ErrorAction::Skip => {
-                                tracing::warn!("Failed to parse {}: {}", path.display(), e);
+                                tracing::warn!(
+                                    agent = Agent::Codex.slug(),
+                                    source_path = %path.display(),
+                                    error = %e,
+                                    "Failed to parse Codex session"
+                                );
                             }
                             crate::connectors::ErrorAction::Fail => {
                                 return Err(e);
@@ -104,9 +132,22 @@ impl Connector for CodexConnector {
                     }
                 }
             }
+
+            tracing::debug!(
+                agent = Agent::Codex.slug(),
+                root = %root.display(),
+                files_discovered,
+                files_parsed,
+                parse_errors,
+                "Completed Codex session scan"
+            );
         }
 
         Ok(conversations)
+    }
+
+    fn parser_revision(&self) -> Option<&'static str> {
+        Some(CODEX_PARSER_REVISION)
     }
 }
 
@@ -128,7 +169,11 @@ fn parse_codex_jsonl(path: &Path) -> Result<Option<Conversation>> {
         .with_context(|| format!("Failed to get source file info for {}", path.display()))?;
 
     let mut messages: Vec<Message> = Vec::new();
+    let mut external_id: Option<String> = None;
     let mut workspace: Option<PathBuf> = None;
+    let mut current_model: Option<String> = None;
+    let mut session_title: Option<String> = None;
+    let mut user_title_candidates: Vec<String> = Vec::new();
     let mut timestamps: Vec<i64> = Vec::new();
 
     for (line_num, line) in reader.lines().enumerate() {
@@ -156,55 +201,60 @@ fn parse_codex_jsonl(path: &Path) -> Result<Option<Conversation>> {
 
         match entry_type {
             Some("session_meta") => {
-                // Extract workspace from session metadata
-                if let Some(cwd) = value
-                    .get("payload")
-                    .and_then(|p| p.get("cwd"))
-                    .and_then(|v| v.as_str())
-                {
-                    workspace = Some(PathBuf::from(cwd));
+                if let Some(payload) = value.get("payload") {
+                    if external_id.is_none() {
+                        external_id = payload
+                            .get("id")
+                            .or_else(|| payload.get("session_id"))
+                            .and_then(|v| v.as_str())
+                            .map(str::to_owned);
+                    }
+                    if let Some(cwd) = payload.get("cwd").and_then(|v| v.as_str()) {
+                        workspace = Some(PathBuf::from(cwd));
+                    }
+                    if session_title.is_none() {
+                        session_title = subagent_session_title(payload);
+                    }
                 }
             }
+            Some("turn_context") => {
+                current_model = value
+                    .get("payload")
+                    .and_then(|payload| payload.get("model"))
+                    .and_then(|model| model.as_str())
+                    .map(str::to_owned)
+                    .or(current_model);
+            }
             Some("response_item") => {
-                // Extract message from response_item
                 if let Some(payload) = value.get("payload") {
-                    let role = payload
+                    // Modern rollouts distinguish messages from reasoning and
+                    // tool-call response items. Older rollouts omitted `type`.
+                    let payload_type = payload.get("type").and_then(|v| v.as_str());
+                    if !matches!(payload_type, None | Some("message")) {
+                        continue;
+                    }
+
+                    let content = payload
+                        .get("content")
+                        .map(flatten_json_content)
+                        .unwrap_or_default();
+
+                    let Some(role) = payload
                         .get("role")
                         .and_then(|v| v.as_str())
-                        .and_then(parse_role)
-                        .unwrap_or(Role::User);
-
-                    let content = if let Some(content) = payload.get("content") {
-                        flatten_json_content(content)
-                    } else {
-                        String::new()
+                        .and_then(|role| parse_codex_role(role, &content))
+                    else {
+                        continue;
                     };
 
-                    if !content.trim().is_empty() {
-                        // Try to get timestamp from the payload or outer value
-                        let timestamp = value
-                            .get("timestamp")
-                            .and_then(|v| v.as_f64())
-                            .map(|ts| (ts * 1000.0) as i64)
-                            .or_else(|| {
-                                payload
-                                    .get("timestamp")
-                                    .and_then(|v| v.as_f64())
-                                    .map(|ts| (ts * 1000.0) as i64)
-                            });
-
-                        if let Some(ts) = timestamp {
-                            timestamps.push(ts);
-                        }
-
-                        messages.push(Message {
-                            idx: messages.len(),
-                            role,
-                            content,
-                            timestamp,
-                            model: None,
-                        });
-                    }
+                    push_message(
+                        &mut messages,
+                        &mut timestamps,
+                        role,
+                        content,
+                        entry_timestamp(&value, payload),
+                        current_model.clone(),
+                    );
                 }
             }
             Some("event_msg") => {
@@ -215,42 +265,49 @@ fn parse_codex_jsonl(path: &Path) -> Result<Option<Conversation>> {
                     match event_type {
                         Some("user_message") => {
                             if let Some(message) = payload.get("message").and_then(|v| v.as_str()) {
-                                let timestamp = value
-                                    .get("timestamp")
-                                    .and_then(|v| v.as_f64())
-                                    .map(|ts| (ts * 1000.0) as i64);
-
-                                if let Some(ts) = timestamp {
-                                    timestamps.push(ts);
+                                let role = if is_codex_context_message(message) {
+                                    Role::System
+                                } else {
+                                    Role::User
+                                };
+                                if role == Role::User
+                                    && user_title_candidates.is_empty()
+                                    && !message.trim().is_empty()
+                                {
+                                    user_title_candidates.push(message.trim().to_string());
                                 }
-
-                                messages.push(Message {
-                                    idx: messages.len(),
-                                    role: Role::User,
-                                    content: message.to_string(),
-                                    timestamp,
-                                    model: None,
-                                });
+                                push_message(
+                                    &mut messages,
+                                    &mut timestamps,
+                                    role,
+                                    message.to_string(),
+                                    entry_timestamp(&value, payload),
+                                    current_model.clone(),
+                                );
+                            }
+                        }
+                        Some("agent_message") => {
+                            if let Some(message) = payload.get("message").and_then(|v| v.as_str()) {
+                                push_message(
+                                    &mut messages,
+                                    &mut timestamps,
+                                    Role::Assistant,
+                                    message.to_string(),
+                                    entry_timestamp(&value, payload),
+                                    current_model.clone(),
+                                );
                             }
                         }
                         Some("agent_reasoning") => {
                             if let Some(text) = payload.get("text").and_then(|v| v.as_str()) {
-                                let timestamp = value
-                                    .get("timestamp")
-                                    .and_then(|v| v.as_f64())
-                                    .map(|ts| (ts * 1000.0) as i64);
-
-                                if let Some(ts) = timestamp {
-                                    timestamps.push(ts);
-                                }
-
-                                messages.push(Message {
-                                    idx: messages.len(),
-                                    role: Role::Assistant,
-                                    content: text.to_string(),
-                                    timestamp,
-                                    model: None,
-                                });
+                                push_message(
+                                    &mut messages,
+                                    &mut timestamps,
+                                    Role::Assistant,
+                                    text.to_string(),
+                                    entry_timestamp(&value, payload),
+                                    current_model.clone(),
+                                );
                             }
                         }
                         _ => {
@@ -269,20 +326,35 @@ fn parse_codex_jsonl(path: &Path) -> Result<Option<Conversation>> {
         return Ok(None);
     }
 
-    let title = messages.iter().find(|m| m.role == Role::User).map(|m| {
-        let first_line = m.content.lines().next().unwrap_or(&m.content);
-        crate::model::truncate_title(first_line, 100)
-    });
+    let title = user_title_candidates
+        .first()
+        .map(String::as_str)
+        .or_else(|| {
+            messages
+                .iter()
+                .find(|message| {
+                    message.role == Role::User && !is_codex_context_message(&message.content)
+                })
+                .map(|message| message.content.as_str())
+        })
+        .map(|content| {
+            let first_line = content.lines().next().unwrap_or(content);
+            crate::model::truncate_title(first_line, 100)
+        })
+        .or(session_title);
 
     let started_at = timestamps.iter().min().copied();
     let ended_at = timestamps.iter().max().copied();
 
     let source_files = vec![source_file];
-    let fingerprint = source_fingerprint(&source_files);
+    let fingerprint = format!(
+        "codex-v{CODEX_PARSER_REVISION}:{}",
+        source_fingerprint(&source_files)
+    );
 
     Ok(Some(Conversation {
         agent: Agent::Codex,
-        external_id: None,
+        external_id,
         title,
         workspace,
         source_path: path.to_path_buf(),
@@ -292,6 +364,85 @@ fn parse_codex_jsonl(path: &Path) -> Result<Option<Conversation>> {
         ended_at,
         messages,
     }))
+}
+
+fn parse_codex_role(role: &str, content: &str) -> Option<Role> {
+    match role.to_ascii_lowercase().as_str() {
+        "developer" => Some(Role::System),
+        "user" if content.trim_start().starts_with("<user_shell_command>") => Some(Role::Tool),
+        "user" if is_codex_context_message(content) => Some(Role::System),
+        other => parse_role(other),
+    }
+}
+
+fn is_codex_context_message(content: &str) -> bool {
+    let content = content.trim_start();
+    [
+        "# AGENTS.md instructions",
+        "## Referenced ChatGPT conversation:",
+        "<collaboration_mode>",
+        "<environment_context>",
+        "<model_switch>",
+        "<multi_agent_mode>",
+        "<permissions instructions>",
+        "<recommended_plugins>",
+        "<skill>",
+    ]
+    .iter()
+    .any(|prefix| content.starts_with(prefix))
+}
+
+fn subagent_session_title(payload: &Value) -> Option<String> {
+    let spawn = payload.pointer("/source/subagent/thread_spawn")?;
+    let label = spawn
+        .get("agent_path")
+        .and_then(Value::as_str)
+        .and_then(|path| Path::new(path).file_name())
+        .and_then(|name| name.to_str())
+        .or_else(|| spawn.get("agent_nickname").and_then(Value::as_str))?;
+    Some(format!("Subagent: {label}"))
+}
+
+fn entry_timestamp(value: &Value, payload: &Value) -> Option<i64> {
+    value
+        .get("timestamp")
+        .and_then(parse_timestamp)
+        .or_else(|| payload.get("timestamp").and_then(parse_timestamp))
+}
+
+fn push_message(
+    messages: &mut Vec<Message>,
+    timestamps: &mut Vec<i64>,
+    role: Role,
+    content: String,
+    timestamp: Option<i64>,
+    model: Option<String>,
+) {
+    let content = content.trim();
+    if content.is_empty() {
+        return;
+    }
+
+    // Codex emits the same visible message as both a response_item and an
+    // event_msg. Keep the event fallback for older rollouts without indexing
+    // adjacent duplicates from modern CLI versions.
+    if messages.last().is_some_and(|previous| {
+        previous.role == role && previous.content == content && previous.timestamp == timestamp
+    }) {
+        return;
+    }
+
+    if let Some(ts) = timestamp {
+        timestamps.push(ts);
+    }
+
+    messages.push(Message {
+        idx: messages.len(),
+        role,
+        content: content.to_string(),
+        timestamp,
+        model,
+    });
 }
 
 #[derive(Deserialize)]
@@ -378,7 +529,10 @@ fn parse_codex_json(path: &Path) -> Result<Option<Conversation>> {
     let ended_at = timestamps.iter().max().copied();
 
     let source_files = vec![source_file];
-    let fingerprint = source_fingerprint(&source_files);
+    let fingerprint = format!(
+        "codex-v{CODEX_PARSER_REVISION}:{}",
+        source_fingerprint(&source_files)
+    );
 
     Ok(Some(Conversation {
         agent: Agent::Codex,
@@ -521,6 +675,53 @@ mod tests {
         assert!(conv.started_at.is_some());
         assert!(conv.ended_at.is_some());
         assert!(conv.started_at.unwrap() < conv.ended_at.unwrap());
+    }
+
+    #[test]
+    fn test_parse_current_codex_cli_rollout() {
+        let content = r##"{"timestamp":"2026-07-13T21:35:54.123Z","type":"session_meta","payload":{"id":"session-current","cwd":"/tmp/current-codex","cli_version":"0.144.3"}}
+{"timestamp":"2026-07-13T21:35:55.000Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"system guidance"}]}}
+{"timestamp":"2026-07-13T21:35:55.500Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions\nInjected project context"}]}}
+{"timestamp":"2026-07-13T21:35:56.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"current codex fixture prompt"}]}}
+{"timestamp":"2026-07-13T21:35:56.000Z","type":"event_msg","payload":{"type":"user_message","message":"current codex fixture prompt"}}
+{"timestamp":"2026-07-13T21:35:57.000Z","type":"event_msg","payload":{"type":"agent_message","message":"fixture answer"}}
+{"timestamp":"2026-07-13T21:35:57.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"fixture answer"}]}}
+"##;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(content.as_bytes()).unwrap();
+
+        let conv = parse_codex_jsonl(temp_file.path()).unwrap().unwrap();
+
+        assert_eq!(conv.external_id.as_deref(), Some("session-current"));
+        assert_eq!(conv.title.as_deref(), Some("current codex fixture prompt"));
+        assert_eq!(conv.workspace, Some(PathBuf::from("/tmp/current-codex")));
+        assert_eq!(conv.started_at, Some(1_783_978_555_000));
+        assert_eq!(conv.ended_at, Some(1_783_978_557_000));
+        assert_eq!(conv.messages.len(), 4);
+        assert_eq!(conv.messages[0].role, Role::System);
+        assert_eq!(conv.messages[1].role, Role::System);
+        assert_eq!(conv.messages[2].role, Role::User);
+        assert_eq!(conv.messages[3].role, Role::Assistant);
+        assert!(conv.source_fingerprint.starts_with("codex-v2:"));
+    }
+
+    #[test]
+    fn test_subagent_session_title_uses_agent_path() {
+        let payload = serde_json::json!({
+            "source": {
+                "subagent": {
+                    "thread_spawn": {
+                        "agent_path": "/root/desktop_real_pi",
+                        "agent_nickname": "Bohr"
+                    }
+                }
+            }
+        });
+
+        assert_eq!(
+            subagent_session_title(&payload).as_deref(),
+            Some("Subagent: desktop_real_pi")
+        );
     }
 
     #[test]

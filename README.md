@@ -95,7 +95,7 @@ sess view /path/to/session.jsonl --json
 | Agent | Default location(s) | Env overrides |
 |---|---|---|
 | Claude Code | `~/.claude/projects` | — |
-| Codex | `~/.codex` | `CODEX_HOME` |
+| Codex CLI | `~/.codex/sessions`, `~/.codex/archived_sessions` | `CODEX_HOME` |
 | OpenCode | `~/.local/share/opencode/storage` | `OPENCODE_STORAGE_ROOT` |
 | Pi Agent (+ shiv/openclaw layouts) | `~/.pi/agent`, `~/.local/share/shiv`, `~/.openclaw` | `PI_CODING_AGENT_DIR`, `SHIV_AGENT_DIR`, `OPENCLAW_HOME` |
 

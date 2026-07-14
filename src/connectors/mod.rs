@@ -30,6 +30,12 @@ pub trait Connector: Send + Sync {
     /// `since_ts` is a best-effort incremental hint.
     fn scan(&self, roots: &[PathBuf], since_ts: Option<i64>) -> Result<Vec<Conversation>>;
 
+    /// Revision of the connector's normalized output format. Bumping this
+    /// requests one full source rescan so existing rows can be migrated.
+    fn parser_revision(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Error handling policy for this connector.
     fn on_parse_error(&self, _path: &Path, _error: &anyhow::Error) -> ErrorAction {
         ErrorAction::Skip

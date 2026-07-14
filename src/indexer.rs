@@ -114,6 +114,11 @@ impl Indexer {
 
         // Commit changes
         self.tantivy.commit()?;
+        for connector in &connectors {
+            if detected_agents.contains(&connector.agent()) {
+                self.record_connector_parser_revision(connector.as_ref())?;
+            }
+        }
 
         // Store embeddings if semantic search is enabled
         if self.semantic.is_some() {
@@ -167,7 +172,8 @@ impl Indexer {
             }
 
             let roots = connector.default_roots();
-            let conversations = connector.scan(&roots, since_ts)?;
+            let connector_since = self.connector_scan_since(connector.as_ref(), since_ts)?;
+            let conversations = connector.scan(&roots, connector_since)?;
 
             stats.files_scanned += conversations.len();
 
@@ -196,6 +202,11 @@ impl Indexer {
 
         // Commit changes
         self.tantivy.commit()?;
+        for connector in &connectors {
+            if detected_agents.contains(&connector.agent()) {
+                self.record_connector_parser_revision(connector.as_ref())?;
+            }
+        }
 
         // Update embeddings for changed conversations
         if self.semantic.is_some() && stats.conversations_updated > 0 {
@@ -390,7 +401,8 @@ impl Indexer {
                 continue;
             }
             let roots = connector.default_roots();
-            let conversations = connector.scan(&roots, since_ts)?;
+            let connector_since = self.connector_scan_since(connector.as_ref(), since_ts)?;
+            let conversations = connector.scan(&roots, connector_since)?;
             let agent = connector.agent();
             *report.would_scan_by_agent.entry(agent).or_insert(0) += conversations.len();
             for conv in conversations {
@@ -434,6 +446,39 @@ impl Indexer {
         report.uncertain_paths = uncertain;
 
         Ok(report)
+    }
+
+    fn connector_scan_since(
+        &self,
+        connector: &dyn Connector,
+        since_ts: Option<i64>,
+    ) -> Result<Option<i64>> {
+        let Some(revision) = connector.parser_revision() else {
+            return Ok(since_ts);
+        };
+
+        let key = format!("connector_parser_revision_{}", connector.agent().slug());
+        let indexed_revision = self.storage.get_meta(&key)?;
+        if indexed_revision.as_deref() == Some(revision) {
+            return Ok(since_ts);
+        }
+
+        tracing::info!(
+            agent = connector.agent().slug(),
+            parser_revision = revision,
+            previous_revision = indexed_revision.as_deref().unwrap_or("none"),
+            "Connector parser revision changed; performing full source rescan"
+        );
+        Ok(None)
+    }
+
+    fn record_connector_parser_revision(&self, connector: &dyn Connector) -> Result<()> {
+        let Some(revision) = connector.parser_revision() else {
+            return Ok(());
+        };
+
+        let key = format!("connector_parser_revision_{}", connector.agent().slug());
+        self.storage.set_meta(&key, revision)
     }
 
     fn delete_missing(&mut self, detected_agents: &HashSet<Agent>) -> Result<StaleDeletionSummary> {
@@ -489,6 +534,30 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let indexer = Indexer::new(&temp_dir.path().to_path_buf(), false).unwrap();
         assert!(indexer.semantic().is_none());
+    }
+
+    #[test]
+    fn test_connector_parser_revision_forces_one_full_rescan() {
+        let temp_dir = TempDir::new().unwrap();
+        let indexer = Indexer::new(&temp_dir.path().to_path_buf(), false).unwrap();
+        let connector = crate::connectors::codex::CodexConnector::new();
+
+        assert_eq!(
+            indexer
+                .connector_scan_since(&connector, Some(1234))
+                .unwrap(),
+            None
+        );
+
+        indexer
+            .record_connector_parser_revision(&connector)
+            .unwrap();
+        assert_eq!(
+            indexer
+                .connector_scan_since(&connector, Some(1234))
+                .unwrap(),
+            Some(1234)
+        );
     }
 
     #[test]
