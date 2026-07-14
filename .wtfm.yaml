@@ -1,0 +1,72 @@
+project:
+  name: sess
+  type: cli
+  description: Search coding-agent transcripts from one local index.
+verify:
+  install: cargo build --release
+  build: cargo build --release
+  test: cargo test
+  commands:
+    - id: build-release
+      run: cargo build --release
+      expect_exit: 0
+      doc_section: install
+      max_lines: 40
+    - id: test
+      run: cargo test
+      expect_exit: 0
+      doc_section: development
+      max_lines: 40
+    - id: cli-help
+      run: ./target/release/sess --help
+      expect_exit: 0
+      doc_section: usage
+      max_lines: 40
+    - id: index-full-no-semantic
+      run: ./target/release/sess --no-semantic index --full
+      expect_exit: 0
+      doc_section: quickstart
+      max_lines: 40
+    - id: search-json
+      run: ./target/release/sess --no-auto-index search "auth middleware" --json --limit 20
+      expect_exit: 0
+      doc_section: quickstart
+      max_lines: 40
+    - id: agents-json
+      run: ./target/release/sess agents --json
+      expect_exit: 0
+      doc_section: usage
+      max_lines: 40
+    - id: stats-json
+      run: ./target/release/sess stats --json
+      expect_exit: 0
+      doc_section: usage
+      max_lines: 40
+    - id: search-help
+      run: ./target/release/sess search --help
+      expect_exit: 0
+      doc_section: usage
+      max_lines: 40
+    - id: index-help
+      run: ./target/release/sess index --help
+      expect_exit: 0
+      doc_section: usage
+      max_lines: 40
+    - id: stats-help
+      run: ./target/release/sess stats --help
+      expect_exit: 0
+      doc_section: usage
+      max_lines: 40
+    - id: agents-help
+      run: ./target/release/sess agents --help
+      expect_exit: 0
+      doc_section: usage
+      max_lines: 40
+    - id: view-help
+      run: ./target/release/sess view --help
+      expect_exit: 0
+      doc_section: usage
+      max_lines: 40
+doc:
+  toc: true
+  badges: [version, stars]

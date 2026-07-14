@@ -1,159 +1,99 @@
-# sess (`session-search`)
+# sess
 
-Search across your coding-agent sessions from one place.
+> Search coding-agent transcripts from one local index.
 
-`sess` is a local-first Rust CLI + TUI that ingests transcripts from multiple agents, indexes them, and lets you search/filter/view conversations quickly.
+`sess` is a local-first Rust CLI and terminal UI for people who work across
+Claude Code, Codex CLI, OpenCode, and Pi Agent sessions. It normalizes local
+transcripts into SQLite, derives a Tantivy keyword index, and can add optional
+FastEmbed-powered semantic ranking.
 
-## Highlights
+## Quickstart
 
-- Multi-agent ingestion (Claude Code, Codex, OpenCode, Pi Agent)
-- Fast local keyword search (Tantivy)
-- Optional semantic search (FastEmbed)
-- JSON output for automation/bots
-- Interactive terminal UI (`sess` with no subcommand)
-
-## Install / Build
+Build the binary, create a local index without downloading the embedding model,
+and run a JSON search:
 
 ```bash
 cargo build --release
+./target/release/sess --no-semantic index --full
+./target/release/sess --no-auto-index search "auth middleware" --json --limit 20
 ```
 
-Binary:
+The data directory defaults to your platform local-data directory plus `sess`
+(for example, `~/.local/share/sess` on Linux). Pass `--data-dir <PATH>` to use
+a different location.
+
+## Usage
+
+Run the built binary without a subcommand to open the interactive terminal UI.
+It shows a query field, results, and the selected conversation's full message
+stream.
+
+![sess TUI showing a local search result and conversation detail](docs/images/tui-search.png)
+
+Use the command help for the complete, generated interface:
 
 ```bash
-./target/release/sess
+./target/release/sess --help
 ```
 
-## Quick Start
+### Common operations
 
 ```bash
-# 1) Build
-cargo build --release
-
-# 2) Create initial index
-./target/release/sess index --full
-
-# 3) Search
-./target/release/sess search "auth middleware"
-
-# 4) Launch TUI
-./target/release/sess
+./target/release/sess agents --json
+./target/release/sess stats --json
 ```
 
-## Screenshots
-
-![sess TUI search](docs/images/tui-search.png)
-
-![sess search workflow](docs/images/search-workflow.gif)
-
-## CLI Commands
+`search` accepts agent, workspace, date, pagination, and ranking filters. Use
+`--semantic` on a search to combine keyword results with embeddings when they
+are available. `view` accepts either a conversation ID or its source path.
 
 ```bash
-sess --help
-sess search --help
-sess index --help
-sess stats --help
-sess agents --help
-sess view --help
+./target/release/sess search --help
+./target/release/sess index --help
+./target/release/sess stats --help
+./target/release/sess agents --help
+./target/release/sess view --help
 ```
 
-Common examples:
+### Index behavior
 
-```bash
-# JSON output for scripts
-sess search "voice regression" --json --limit 20
+`sess search` and the TUI create an initial index when needed, then refresh a
+stale index by default after 15 minutes. `--no-refresh` disables only the
+age-based refresh; `--no-auto-index` disables both initial and stale refresh.
+`--max-age` accepts values such as `5m`, `1h`, and `2h30m`.
 
-# Filter by agent/workspace/time
-sess search "voice" --agent pi_agent --workspace /home/user/project --since 7d --json
+Use `index --full` to rescan all supported transcript roots. Use `index
+--rebuild` to derive Tantivy from the SQLite database without rescanning source
+files, and `index --dry-run` to inspect a prospective incremental update
+without writing.
 
-# Hybrid keyword + semantic
-sess search "crashes when opening tool panel" --semantic --ranking balanced --json
+### Supported sources
 
-# Stats and agent detection
-sess stats --json
-sess agents --json
-
-# View conversation by ID or source path
-sess view 42
-sess view /path/to/session.jsonl --json
-```
-
-## TUI Keys (short)
-
-- `q` / `Ctrl+C` — quit
-- `?` — help overlay
-- Type in search bar — live query
-- `Tab` — switch focus
-- `Enter` — open detail pane
-- `PgUp` / `PgDn` — page through results or scroll detail faster
-- `F3` — cycle agent filter
-- `F5` — cycle time filter
-- `F12` — cycle ranking mode
-
-## Supported Agent Sources
-
-| Agent | Default location(s) | Env overrides |
+| Source | Default location | Override |
 |---|---|---|
 | Claude Code | `~/.claude/projects` | — |
 | Codex CLI | `~/.codex/sessions`, `~/.codex/archived_sessions` | `CODEX_HOME` |
 | OpenCode | `~/.local/share/opencode/storage` | `OPENCODE_STORAGE_ROOT` |
-| Pi Agent (+ shiv/openclaw layouts) | `~/.pi/agent`, `~/.local/share/shiv`, `~/.openclaw` | `PI_CODING_AGENT_DIR`, `SHIV_AGENT_DIR`, `OPENCLAW_HOME` |
+| Pi Agent and compatible layouts | `~/.pi/agent`, `~/.local/share/shiv`, `~/.openclaw` | `PI_CODING_AGENT_DIR`, `SHIV_AGENT_DIR`, `OPENCLAW_HOME` |
 
-## Data Location
+## Background refresh
 
-Default data dir is your local data directory + `/sess` (for example, often `~/.local/share/sess` on Linux).
-You can override with:
+For an unattended local index, optional integrations are provided for
+[systemd user units](./contrib/systemd/README.md) and
+[oxmgr](./contrib/oxmgr/README.md). The systemd service disables semantic
+embeddings by default; the oxmgr loop enables them unless configured otherwise.
 
-```bash
-sess --data-dir /custom/path ...
-```
-
-## Keeping the index fresh
-
-`sess search` and the TUI auto-refresh a stale index (default threshold 15
-minutes). Tune or disable via global flags:
+## Development
 
 ```bash
-sess --max-age 1h search foo
-sess --no-refresh search foo   # use whatever's on disk
-sess --no-auto-index search foo  # don't index automatically at all
+cargo test
 ```
 
-For users who never keep the TUI open, optional background refresh is
-shipped in two forms:
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for contribution guidance and
+[ARCHITECTURE.md](./ARCHITECTURE.md) for the storage, indexing, and connector
+layout. The prioritized project direction is in [ROADMAP.md](./ROADMAP.md).
 
-**oxmgr** (preferred if you already supervise services with oxmgr):
+## Security note
 
-```bash
-# see contrib/oxmgr/README.md for the oxfile.toml snippet
-oxmgr apply ~/.config/oxmgr/oxfile.toml
-oxmgr logs sess-index -f
-```
-
-The oxmgr loop runs `sess index` (semantic embeddings **on**) every 15
-minutes by default.
-
-**systemd-user timer**:
-
-```bash
-mkdir -p ~/.config/systemd/user
-cp contrib/systemd/sess-index.{service,timer} ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now sess-index.timer
-```
-
-The systemd service defaults to `sess --no-semantic index` so background
-runs never silently download or initialize the embedding model. See
-[`contrib/systemd/README.md`](./contrib/systemd/README.md) for the
-semantic override, or [`contrib/oxmgr/README.md`](./contrib/oxmgr/README.md)
-for the oxmgr unit.
-
-## Documentation
-
-- Architecture and deep project assessment: [`ARCHITECTURE.md`](./ARCHITECTURE.md)
-- Contributing guide: [`CONTRIBUTING.md`](./CONTRIBUTING.md)
-- Prioritized roadmap: [`ROADMAP.md`](./ROADMAP.md)
-
-## Security Note
-
-Session transcripts may include sensitive prompts/code/secrets. Treat your index data (`sess.db`, Tantivy index) as sensitive local data.
+Session transcripts may contain sensitive prompts, source code, or secrets.
+Treat the local SQLite database and Tantivy index as sensitive data.
