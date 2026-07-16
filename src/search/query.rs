@@ -709,6 +709,7 @@ mod tests {
                 timestamp: Some(1705312800000),
                 model: None,
             }],
+            usage: vec![],
         };
 
         index.add_conversation(&conv, 1).unwrap();
@@ -742,6 +743,7 @@ mod tests {
             started_at: Some(1705312800000),
             ended_at: None,
             messages: vec![],
+            usage: vec![],
         };
 
         index
@@ -825,6 +827,7 @@ mod tests {
                 timestamp: None,
                 model: None,
             }],
+            usage: vec![],
         };
         index.add_conversation(&conv1, 1).unwrap();
 
@@ -846,6 +849,7 @@ mod tests {
                 timestamp: None,
                 model: None,
             }],
+            usage: vec![],
         };
         index.add_conversation(&conv2, 2).unwrap();
         index.commit().unwrap();
@@ -884,6 +888,7 @@ mod tests {
                 timestamp: None,
                 model: None,
             }],
+            usage: vec![],
         };
         index.add_conversation(&conv, 1).unwrap();
         index.commit().unwrap();
@@ -918,6 +923,7 @@ mod tests {
                 timestamp: None,
                 model: None,
             }],
+            usage: vec![],
         };
         index.add_conversation(&conv, 1).unwrap();
         index.commit().unwrap();
@@ -962,6 +968,7 @@ mod tests {
                     timestamp: None,
                     model: None,
                 }],
+                usage: vec![],
             };
             index.add_conversation(&conv, i).unwrap();
         }

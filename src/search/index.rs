@@ -337,6 +337,7 @@ mod tests {
                 timestamp: Some(1000),
                 model: None,
             }],
+            usage: vec![],
         }
     }
 

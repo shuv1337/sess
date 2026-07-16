@@ -9,8 +9,13 @@ use base64::Engine;
 use serde_json::Value;
 use walkdir::WalkDir;
 
-use crate::connectors::{Connector, file_modified_since, parse_role, source_file};
-use crate::model::{Agent, Conversation, Message, Role, source_fingerprint};
+use crate::connectors::{
+    Connector, ConnectorScan, file_modified_since, json_f64, json_u64, normalized_token_total,
+    parse_role, source_file,
+};
+use crate::model::{Agent, Conversation, Message, Role, UsageRecord, source_fingerprint};
+
+const PARSER_REVISION: &str = "3";
 
 pub struct PiAgentConnector {
     home_dir: Option<PathBuf>,
@@ -56,9 +61,10 @@ impl PiAgentConnector {
             }
         }
         if let Some(home) = home_dir {
-            // Keep the user's personal Pi sessions even when an override is set,
-            // then add the two standard shuvhelm agent roots.
+            // Keep personal, Codex external-runtime, and shuvhelm Pi sessions
+            // even when an override is set.
             push_unique_root(&mut roots, &mut seen, home.join(".pi/agent"));
+            push_unique_root(&mut roots, &mut seen, home.join(".shuvpi/agent"));
             push_unique_root(&mut roots, &mut seen, home.join(".shuvhelm/pi-agent"));
             push_unique_root(&mut roots, &mut seen, home.join(".shuvhelm/mate"));
         }
@@ -82,28 +88,68 @@ impl PiAgentConnector {
         self.home_dir.as_ref().map(|h| h.join(".openclaw"))
     }
 
-    fn session_roots_for(&self, root: &Path) -> Vec<PathBuf> {
+    fn session_roots_for_scan(&self, root: &Path) -> (Vec<PathBuf>, bool) {
         let mut session_roots = Vec::new();
+        let mut complete = true;
 
         let direct_sessions = root.join("sessions");
-        if direct_sessions.exists() {
+        if directory_is_accessible(&direct_sessions, &mut complete) {
             session_roots.push(direct_sessions);
         }
 
         // OpenClaw layout: ~/.openclaw/agents/<agent>/sessions
         let agents_dir = root.join("agents");
-        if agents_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(&agents_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path().join("sessions");
-                    if path.exists() {
-                        session_roots.push(path);
+        if directory_is_accessible(&agents_dir, &mut complete) {
+            match std::fs::read_dir(&agents_dir) {
+                Ok(entries) => {
+                    for entry in entries {
+                        match entry {
+                            Ok(entry) => {
+                                let agent_root = entry.path();
+                                match std::fs::metadata(&agent_root) {
+                                    Ok(metadata) if metadata.is_dir() => {}
+                                    Ok(_) => continue,
+                                    Err(error) => {
+                                        complete = false;
+                                        tracing::warn!(
+                                            agent = Agent::PiAgent.slug(),
+                                            root = %agent_root.display(),
+                                            error = %error,
+                                            "Failed to inspect an OpenClaw agent entry"
+                                        );
+                                        continue;
+                                    }
+                                }
+                                let path = agent_root.join("sessions");
+                                if directory_is_accessible(&path, &mut complete) {
+                                    session_roots.push(path);
+                                }
+                            }
+                            Err(error) => {
+                                complete = false;
+                                tracing::warn!(
+                                    agent = Agent::PiAgent.slug(),
+                                    root = %agents_dir.display(),
+                                    error = %error,
+                                    "Failed to inspect an OpenClaw agent directory"
+                                );
+                            }
+                        }
                     }
+                }
+                Err(error) => {
+                    complete = false;
+                    tracing::warn!(
+                        agent = Agent::PiAgent.slug(),
+                        root = %agents_dir.display(),
+                        error = %error,
+                        "Failed to read OpenClaw agent directories"
+                    );
                 }
             }
         }
 
-        session_roots
+        (session_roots, complete)
     }
 }
 
@@ -113,15 +159,42 @@ impl Default for PiAgentConnector {
     }
 }
 
+fn directory_is_accessible(path: &Path, complete: &mut bool) -> bool {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => true,
+        Ok(_) => {
+            *complete = false;
+            tracing::warn!(
+                agent = Agent::PiAgent.slug(),
+                root = %path.display(),
+                "Pi Agent session path exists but is not a directory"
+            );
+            false
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            *complete = false;
+            tracing::warn!(
+                agent = Agent::PiAgent.slug(),
+                root = %path.display(),
+                error = %error,
+                "Failed to inspect Pi Agent session directory"
+            );
+            false
+        }
+    }
+}
+
 impl Connector for PiAgentConnector {
     fn agent(&self) -> Agent {
         Agent::PiAgent
     }
 
     fn detect(&self) -> bool {
-        self.default_roots()
-            .iter()
-            .any(|root| !self.session_roots_for(root).is_empty())
+        self.default_roots().iter().any(|root| {
+            let (session_roots, complete) = self.session_roots_for_scan(root);
+            !session_roots.is_empty() || !complete
+        })
     }
 
     fn default_roots(&self) -> Vec<PathBuf> {
@@ -136,28 +209,41 @@ impl Connector for PiAgentConnector {
         roots
     }
 
-    fn scan(&self, roots: &[PathBuf], since_ts: Option<i64>) -> Result<Vec<Conversation>> {
+    fn scan(&self, roots: &[PathBuf], since_ts: Option<i64>) -> Result<ConnectorScan> {
         let mut conversations = Vec::new();
         let mut seen_session_roots = HashSet::new();
+        let mut complete = true;
 
         for root in roots {
-            for sessions_root in self.session_roots_for(root) {
+            let (session_roots, roots_complete) = self.session_roots_for_scan(root);
+            complete &= roots_complete;
+            for sessions_root in session_roots {
                 if !seen_session_roots.insert(path_identity(&sessions_root)) {
                     continue;
                 }
                 // Walk session directories
-                for entry in WalkDir::new(&sessions_root)
-                    .follow_links(true)
-                    .into_iter()
-                    .filter_map(|e| e.ok())
-                    .filter(|e| {
-                        e.file_type().is_file()
-                            && e.path()
-                                .extension()
-                                .map(|ext| ext == "jsonl")
-                                .unwrap_or(false)
-                    })
-                {
+                for entry in WalkDir::new(&sessions_root).follow_links(true) {
+                    let entry = match entry {
+                        Ok(entry) => entry,
+                        Err(error) => {
+                            complete = false;
+                            tracing::warn!(
+                                agent = Agent::PiAgent.slug(),
+                                root = %sessions_root.display(),
+                                error = %error,
+                                "Failed to traverse Pi Agent session storage"
+                            );
+                            continue;
+                        }
+                    };
+                    if !entry.file_type().is_file()
+                        || entry
+                            .path()
+                            .extension()
+                            .is_none_or(|extension| extension != "jsonl")
+                    {
+                        continue;
+                    }
                     let path = entry.path();
                     let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
@@ -178,6 +264,7 @@ impl Connector for PiAgentConnector {
                             // Empty or no messages, skip
                         }
                         Err(e) => {
+                            complete = false;
                             let action = self.on_parse_error(path, &e);
                             match action {
                                 crate::connectors::ErrorAction::Skip => {
@@ -190,7 +277,7 @@ impl Connector for PiAgentConnector {
                                     tracing::warn!(
                                         "Skipping remaining Pi Agent files due to error"
                                     );
-                                    return Ok(conversations);
+                                    return Ok(ConnectorScan::new(conversations, false));
                                 }
                             }
                         }
@@ -199,7 +286,11 @@ impl Connector for PiAgentConnector {
             }
         }
 
-        Ok(conversations)
+        Ok(ConnectorScan::new(conversations, complete))
+    }
+
+    fn parser_revision(&self) -> Option<&'static str> {
+        Some(PARSER_REVISION)
     }
 }
 
@@ -236,6 +327,8 @@ fn parse_pi_session(path: &Path) -> Result<Option<Conversation>> {
     let mut external_id: Option<String> = None;
     let mut timestamps: Vec<i64> = Vec::new();
     let mut current_model: Option<String> = None;
+    let mut current_provider: Option<String> = None;
+    let mut usage: Vec<UsageRecord> = Vec::new();
 
     for (line_num, line) in reader.lines().enumerate() {
         let line = line.with_context(|| {
@@ -272,11 +365,17 @@ fn parse_pi_session(path: &Path) -> Result<Option<Conversation>> {
                 if let Some(model) = value.get("modelId").and_then(|v| v.as_str()) {
                     current_model = Some(model.to_string());
                 }
+                if let Some(provider) = value.get("provider").and_then(Value::as_str) {
+                    current_provider = Some(provider.to_string());
+                }
             }
             Some("model_change") => {
                 // Update current model
                 if let Some(model) = value.get("modelId").and_then(|v| v.as_str()) {
                     current_model = Some(model.to_string());
+                }
+                if let Some(provider) = value.get("provider").and_then(Value::as_str) {
+                    current_provider = Some(provider.to_string());
                 }
             }
             Some("message") => {
@@ -303,6 +402,66 @@ fn parse_pi_session(path: &Path) -> Result<Option<Conversation>> {
                         timestamps.push(ts);
                     }
 
+                    let message_model = msg
+                        .get("model")
+                        .or_else(|| msg.get("modelId"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .or_else(|| current_model.clone());
+                    let message_provider = msg
+                        .get("provider")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .or_else(|| current_provider.clone());
+                    if role == Role::Assistant
+                        && let Some(raw_usage) = msg.get("usage")
+                    {
+                        let source_event_id = value
+                            .get("id")
+                            .or_else(|| msg.get("id"))
+                            .or_else(|| msg.get("responseId"))
+                            .or_else(|| msg.get("response_id"))
+                            .and_then(Value::as_str)
+                            .and_then(|id| {
+                                timestamp.map(|timestamp| format!("pi-message:{id}:{timestamp}"))
+                            });
+                        let input = json_u64(raw_usage, &["/input", "/inputTokens"]);
+                        let output = json_u64(raw_usage, &["/output", "/outputTokens"]);
+                        let cache_read = json_u64(raw_usage, &["/cacheRead", "/cache_read_tokens"]);
+                        let cache_write =
+                            json_u64(raw_usage, &["/cacheWrite", "/cache_write_tokens"]);
+                        let record = UsageRecord {
+                            timestamp,
+                            provider: message_provider.clone(),
+                            model: message_model.clone(),
+                            source_event_id,
+                            api_calls: 1,
+                            input_tokens: input,
+                            output_tokens: output,
+                            cache_read_tokens: cache_read,
+                            cache_write_tokens: cache_write,
+                            reasoning_tokens: json_u64(
+                                raw_usage,
+                                &["/reasoning", "/reasoningTokens"],
+                            ),
+                            total_tokens: normalized_token_total(
+                                json_u64(raw_usage, &["/totalTokens", "/total_tokens"]),
+                                input,
+                                output,
+                                cache_read,
+                                cache_write,
+                            ),
+                            actual_cost_usd: None,
+                            estimated_cost_usd: json_f64(
+                                raw_usage,
+                                &["/cost/total", "/costUsd", "/cost_usd"],
+                            ),
+                        };
+                        if record.has_usage() {
+                            usage.push(record);
+                        }
+                    }
+
                     // Extract content - handle array of content blocks
                     let content = if let Some(content) = msg.get("content") {
                         extract_pi_content(content)
@@ -316,7 +475,7 @@ fn parse_pi_session(path: &Path) -> Result<Option<Conversation>> {
                             role,
                             content,
                             timestamp,
-                            model: current_model.clone(),
+                            model: message_model,
                         });
                     }
                 }
@@ -330,7 +489,7 @@ fn parse_pi_session(path: &Path) -> Result<Option<Conversation>> {
         }
     }
 
-    if messages.is_empty() {
+    if messages.is_empty() && usage.is_empty() {
         return Ok(None);
     }
 
@@ -351,7 +510,10 @@ fn parse_pi_session(path: &Path) -> Result<Option<Conversation>> {
     let ended_at = timestamps.iter().max().copied();
 
     let source_files = vec![source_file];
-    let fingerprint = source_fingerprint(&source_files);
+    let fingerprint = format!(
+        "pi-v{PARSER_REVISION}:{}",
+        source_fingerprint(&source_files)
+    );
 
     // Extract session ID from filename if not found in JSON
     let external_id = external_id.or_else(|| {
@@ -371,6 +533,7 @@ fn parse_pi_session(path: &Path) -> Result<Option<Conversation>> {
         started_at,
         ended_at,
         messages,
+        usage,
     }))
 }
 
@@ -459,6 +622,48 @@ mod tests {
         assert_eq!(conv.external_id, Some("test-session".to_string()));
         assert!(conv.started_at.is_some());
         assert!(conv.ended_at.is_some());
+    }
+
+    #[test]
+    fn test_parse_pi_assistant_usage() {
+        let content = r#"{"type":"session","id":"usage-session","cwd":"/test","provider":"fallback","modelId":"fallback-model"}
+{"type":"message","timestamp":"2024-01-15T10:00:00Z","message":{"role":"user","content":"Hello"}}
+{"type":"message","id":"assistant-1","timestamp":"2024-01-15T10:00:05Z","message":{"role":"assistant","provider":"anthropic","model":"claude-fable-5","content":"Done","usage":{"input":2,"output":74,"cacheRead":22295,"cacheWrite":0,"reasoning":23,"totalTokens":22371,"cost":{"total":0.026015}}}}
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(content.as_bytes()).unwrap();
+
+        let conversation = parse_pi_session(temp_file.path()).unwrap().unwrap();
+        assert_eq!(conversation.usage.len(), 1);
+        let usage = &conversation.usage[0];
+        assert_eq!(usage.provider.as_deref(), Some("anthropic"));
+        assert_eq!(usage.model.as_deref(), Some("claude-fable-5"));
+        assert_eq!(usage.api_calls, 1);
+        assert_eq!(usage.input_tokens, 2);
+        assert_eq!(usage.output_tokens, 74);
+        assert_eq!(usage.reasoning_tokens, 23);
+        assert_eq!(usage.cache_read_tokens, 22_295);
+        assert_eq!(usage.cache_write_tokens, 0);
+        assert_eq!(usage.total_tokens, 22_371);
+        assert_eq!(usage.estimated_cost_usd, Some(0.026015));
+        assert_eq!(
+            usage.source_event_id.as_deref(),
+            Some("pi-message:assistant-1:1705312805000")
+        );
+    }
+
+    #[test]
+    fn usage_only_session_is_preserved() {
+        let content = r#"{"type":"session","id":"usage-only","cwd":"/test","provider":"anthropic","modelId":"claude-test"}
+{"type":"message","id":"assistant-1","timestamp":"2024-01-15T10:00:05Z","message":{"role":"assistant","content":"","usage":{"input":10,"output":5,"totalTokens":15}}}
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(content.as_bytes()).unwrap();
+
+        let conversation = parse_pi_session(temp_file.path()).unwrap().unwrap();
+        assert!(conversation.messages.is_empty());
+        assert_eq!(conversation.usage.len(), 1);
+        assert_eq!(conversation.usage[0].total_tokens, 15);
     }
 
     #[test]
@@ -647,6 +852,51 @@ mod tests {
         assert_eq!(conversations.len(), 2);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn traversal_error_marks_pi_scan_incomplete() {
+        let dir = TempDir::new().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::os::unix::fs::symlink(sessions.join("missing"), sessions.join("broken")).unwrap();
+        let connector = PiAgentConnector {
+            home_dir: Some(PathBuf::from("/nonexistent")),
+        };
+
+        let scan = connector.scan(&[dir.path().to_path_buf()], None).unwrap();
+        assert!(!scan.complete);
+    }
+
+    #[test]
+    fn invalid_openclaw_agents_path_marks_pi_scan_incomplete() {
+        let home = TempDir::new().unwrap();
+        let openclaw = home.path().join(".openclaw");
+        std::fs::create_dir_all(&openclaw).unwrap();
+        std::fs::write(openclaw.join("agents"), "not a directory").unwrap();
+        let connector = PiAgentConnector {
+            home_dir: Some(home.path().to_path_buf()),
+        };
+
+        assert!(connector.detect());
+        let scan = connector.scan(&connector.default_roots(), None).unwrap();
+        assert!(!scan.complete);
+    }
+
+    #[test]
+    fn persona_files_in_agents_directory_are_ignored() {
+        let root = TempDir::new().unwrap();
+        std::fs::create_dir_all(root.path().join("sessions")).unwrap();
+        std::fs::create_dir_all(root.path().join("agents")).unwrap();
+        std::fs::write(root.path().join("agents/planner.md"), "# Planner").unwrap();
+        let connector = PiAgentConnector {
+            home_dir: Some(PathBuf::from("/nonexistent")),
+        };
+
+        let (session_roots, complete) = connector.session_roots_for_scan(root.path());
+        assert!(complete);
+        assert_eq!(session_roots, vec![root.path().join("sessions")]);
+    }
+
     #[test]
     fn test_pi_connector_default_roots_include_shiv_and_openclaw() {
         let home = TempDir::new().unwrap();
@@ -660,6 +910,7 @@ mod tests {
 
         let roots = connector.default_roots();
         assert!(roots.contains(&home.path().join(".pi/agent")));
+        assert!(roots.contains(&home.path().join(".shuvpi/agent")));
         assert!(roots.contains(&home.path().join(".shuvhelm/pi-agent")));
         assert!(roots.contains(&home.path().join(".shuvhelm/mate")));
         assert!(roots.contains(&home.path().join(".local/share/shiv")));
@@ -683,6 +934,7 @@ mod tests {
 
         assert_eq!(roots.iter().filter(|root| **root == personal).count(), 1);
         assert_eq!(roots.iter().filter(|root| **root == extra).count(), 1);
+        assert!(roots.contains(&home.path().join(".shuvpi/agent")));
         assert!(roots.contains(&home.path().join(".shuvhelm/pi-agent")));
         assert!(roots.contains(&home.path().join(".shuvhelm/mate")));
     }

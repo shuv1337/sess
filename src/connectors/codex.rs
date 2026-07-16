@@ -8,11 +8,14 @@ use serde_json::Value;
 use walkdir::WalkDir;
 
 use crate::connectors::{
-    Connector, file_modified_since, flatten_json_content, parse_role, source_file,
+    Connector, ConnectorScan, file_modified_since, flatten_json_content, json_u64,
+    normalized_token_total, parse_role, source_file,
 };
-use crate::model::{Agent, Conversation, Message, Role, parse_timestamp, source_fingerprint};
+use crate::model::{
+    Agent, Conversation, Message, Role, UsageRecord, parse_timestamp, source_fingerprint,
+};
 
-const CODEX_PARSER_REVISION: &str = "2";
+const CODEX_PARSER_REVISION: &str = "5";
 
 pub struct CodexConnector {
     home_dir: Option<PathBuf>,
@@ -59,8 +62,9 @@ impl Connector for CodexConnector {
         self.session_roots()
     }
 
-    fn scan(&self, roots: &[PathBuf], since_ts: Option<i64>) -> Result<Vec<Conversation>> {
+    fn scan(&self, roots: &[PathBuf], since_ts: Option<i64>) -> Result<ConnectorScan> {
         let mut conversations = Vec::new();
+        let mut complete = true;
 
         for root in roots {
             if !root.is_dir() {
@@ -80,19 +84,30 @@ impl Connector for CodexConnector {
 
             // Codex CLI stores active and archived rollouts as JSONL (with
             // legacy JSON files supported for compatibility).
-            for entry in WalkDir::new(root)
-                .follow_links(true)
-                .into_iter()
-                .filter_map(|e| e.ok())
-                .filter(|e| {
-                    if !e.file_type().is_file() {
-                        return false;
+            for entry in WalkDir::new(root).follow_links(true) {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        complete = false;
+                        parse_errors += 1;
+                        tracing::warn!(
+                            agent = Agent::Codex.slug(),
+                            root = %root.display(),
+                            error = %error,
+                            "Failed to traverse Codex session storage"
+                        );
+                        continue;
                     }
-                    let name = e.file_name().to_string_lossy();
-                    name.starts_with("rollout-")
-                        && (name.ends_with(".jsonl") || name.ends_with(".json"))
-                })
-            {
+                };
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy();
+                if !name.starts_with("rollout-")
+                    || (!name.ends_with(".jsonl") && !name.ends_with(".json"))
+                {
+                    continue;
+                }
                 files_discovered += 1;
                 let path = entry.path();
 
@@ -110,6 +125,7 @@ impl Connector for CodexConnector {
                         // Empty or no messages, skip
                     }
                     Err(e) => {
+                        complete = false;
                         parse_errors += 1;
                         let action = self.on_parse_error(path, &e);
                         match action {
@@ -126,7 +142,7 @@ impl Connector for CodexConnector {
                             }
                             crate::connectors::ErrorAction::SkipAgent => {
                                 tracing::warn!("Skipping remaining Codex files due to error");
-                                return Ok(conversations);
+                                return Ok(ConnectorScan::new(conversations, false));
                             }
                         }
                     }
@@ -143,7 +159,7 @@ impl Connector for CodexConnector {
             );
         }
 
-        Ok(conversations)
+        Ok(ConnectorScan::new(conversations, complete))
     }
 
     fn parser_revision(&self) -> Option<&'static str> {
@@ -172,9 +188,13 @@ fn parse_codex_jsonl(path: &Path) -> Result<Option<Conversation>> {
     let mut external_id: Option<String> = None;
     let mut workspace: Option<PathBuf> = None;
     let mut current_model: Option<String> = None;
+    let mut current_provider: Option<String> = None;
     let mut session_title: Option<String> = None;
     let mut user_title_candidates: Vec<String> = Vec::new();
     let mut timestamps: Vec<i64> = Vec::new();
+    let mut usage: Vec<UsageRecord> = Vec::new();
+    let mut last_cumulative_signature: Option<[u64; 9]> = None;
+    let mut usage_forwarded_by_pi = false;
 
     for (line_num, line) in reader.lines().enumerate() {
         let line = line.with_context(|| {
@@ -202,6 +222,16 @@ fn parse_codex_jsonl(path: &Path) -> Result<Option<Conversation>> {
         match entry_type {
             Some("session_meta") => {
                 if let Some(payload) = value.get("payload") {
+                    usage_forwarded_by_pi = is_pi_external_runtime(payload);
+                    if usage_forwarded_by_pi {
+                        // Codex external-runtime rollouts mirror the Pi
+                        // runtime's cumulative token telemetry. The canonical
+                        // per-call records are indexed from Pi's own session
+                        // store, so retaining this copy would both sum
+                        // cumulative snapshots and double-count the calls
+                        // across harnesses.
+                        usage.clear();
+                    }
                     if external_id.is_none() {
                         external_id = payload
                             .get("id")
@@ -212,6 +242,11 @@ fn parse_codex_jsonl(path: &Path) -> Result<Option<Conversation>> {
                     if let Some(cwd) = payload.get("cwd").and_then(|v| v.as_str()) {
                         workspace = Some(PathBuf::from(cwd));
                     }
+                    current_provider = payload
+                        .get("model_provider")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .or(current_provider);
                     if session_title.is_none() {
                         session_title = subagent_session_title(payload);
                     }
@@ -310,8 +345,65 @@ fn parse_codex_jsonl(path: &Path) -> Result<Option<Conversation>> {
                                 );
                             }
                         }
+                        Some("token_count") => {
+                            if !usage_forwarded_by_pi
+                                && let Some(info) = payload.get("info")
+                                && let Some(last) = info.get("last_token_usage")
+                            {
+                                let signature = info.get("total_token_usage").map(|cumulative| {
+                                    [
+                                        json_u64(cumulative, &["/input_tokens"]),
+                                        json_u64(cumulative, &["/output_tokens"]),
+                                        json_u64(cumulative, &["/cached_input_tokens"]),
+                                        json_u64(cumulative, &["/total_tokens"]),
+                                        json_u64(last, &["/input_tokens"]),
+                                        json_u64(last, &["/output_tokens"]),
+                                        json_u64(last, &["/cached_input_tokens"]),
+                                        json_u64(last, &["/reasoning_output_tokens"]),
+                                        json_u64(last, &["/total_tokens"]),
+                                    ]
+                                });
+                                if signature.is_none() || last_cumulative_signature != signature {
+                                    let raw_input = json_u64(last, &["/input_tokens"]);
+                                    let output = json_u64(last, &["/output_tokens"]);
+                                    let cache_read = json_u64(last, &["/cached_input_tokens"]);
+                                    let input = raw_input.saturating_sub(cache_read);
+                                    let total = normalized_token_total(
+                                        json_u64(last, &["/total_tokens"]),
+                                        input,
+                                        output,
+                                        cache_read,
+                                        0,
+                                    );
+                                    let record = UsageRecord {
+                                        timestamp: entry_timestamp(&value, payload),
+                                        provider: current_provider.clone(),
+                                        model: current_model.clone(),
+                                        source_event_id: None,
+                                        api_calls: 1,
+                                        input_tokens: input,
+                                        output_tokens: output,
+                                        cache_read_tokens: cache_read,
+                                        cache_write_tokens: 0,
+                                        reasoning_tokens: json_u64(
+                                            last,
+                                            &["/reasoning_output_tokens"],
+                                        ),
+                                        total_tokens: total,
+                                        actual_cost_usd: None,
+                                        estimated_cost_usd: None,
+                                    };
+                                    if record.has_usage() {
+                                        usage.push(record);
+                                    }
+                                    if let Some(signature) = signature {
+                                        last_cumulative_signature = Some(signature);
+                                    }
+                                }
+                            }
+                        }
                         _ => {
-                            // Skip other event types like token_count, turn_aborted, etc.
+                            // Skip other event types like turn_aborted.
                         }
                     }
                 }
@@ -322,7 +414,7 @@ fn parse_codex_jsonl(path: &Path) -> Result<Option<Conversation>> {
         }
     }
 
-    if messages.is_empty() {
+    if messages.is_empty() && usage.is_empty() {
         return Ok(None);
     }
 
@@ -363,6 +455,7 @@ fn parse_codex_jsonl(path: &Path) -> Result<Option<Conversation>> {
         started_at,
         ended_at,
         messages,
+        usage,
     }))
 }
 
@@ -401,6 +494,13 @@ fn subagent_session_title(payload: &Value) -> Option<String> {
         .and_then(|name| name.to_str())
         .or_else(|| spawn.get("agent_nickname").and_then(Value::as_str))?;
     Some(format!("Subagent: {label}"))
+}
+
+fn is_pi_external_runtime(payload: &Value) -> bool {
+    payload
+        .pointer("/source/subagent/thread_spawn/agent_role")
+        .and_then(Value::as_str)
+        .is_some_and(|role| role.starts_with("pi-"))
 }
 
 fn entry_timestamp(value: &Value, payload: &Value) -> Option<i64> {
@@ -545,6 +645,7 @@ fn parse_codex_json(path: &Path) -> Result<Option<Conversation>> {
         started_at,
         ended_at,
         messages,
+        usage: Vec::new(),
     }))
 }
 
@@ -580,6 +681,91 @@ mod tests {
         assert_eq!(conv.messages[0].content, "Can you help with this code?");
         assert_eq!(conv.messages[1].role, Role::Assistant);
         assert!(conv.messages[1].content.contains("I'll help you"));
+    }
+
+    #[test]
+    fn test_parse_codex_token_usage_uses_last_call_and_session_provider() {
+        let content = r#"{"type":"session_meta","payload":{"cwd":"/project","model_provider":"custom-openai"}}
+{"type":"turn_context","payload":{"model":"gpt-test"}}
+{"type":"event_msg","timestamp":1705312800.5,"payload":{"type":"user_message","message":"Hello"}}
+{"type":"event_msg","timestamp":1705312801.0,"payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":40,"output_tokens":30,"reasoning_output_tokens":10,"total_tokens":130},"last_token_usage":{"input_tokens":100,"cached_input_tokens":40,"output_tokens":30,"reasoning_output_tokens":10,"total_tokens":130}}}}
+{"type":"event_msg","timestamp":1705312801.1,"payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":40,"output_tokens":30,"reasoning_output_tokens":10,"total_tokens":130},"last_token_usage":{"input_tokens":100,"cached_input_tokens":40,"output_tokens":30,"reasoning_output_tokens":10,"total_tokens":130}}}}
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(content.as_bytes()).unwrap();
+
+        let conversation = parse_codex_jsonl(temp_file.path()).unwrap().unwrap();
+        assert_eq!(conversation.usage.len(), 1);
+        let usage = &conversation.usage[0];
+        assert_eq!(usage.provider.as_deref(), Some("custom-openai"));
+        assert_eq!(usage.model.as_deref(), Some("gpt-test"));
+        assert_eq!(usage.api_calls, 1);
+        assert_eq!(usage.input_tokens, 60);
+        assert_eq!(usage.cache_read_tokens, 40);
+        assert_eq!(usage.output_tokens, 30);
+        assert_eq!(usage.reasoning_tokens, 10);
+        assert_eq!(usage.total_tokens, 130);
+    }
+
+    #[test]
+    fn token_usage_without_cumulative_totals_keeps_distinct_calls() {
+        let content = r#"{"type":"event_msg","timestamp":1705312800.5,"payload":{"type":"user_message","message":"Hello"}}
+{"type":"event_msg","timestamp":1705312801.0,"payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}}}
+{"type":"event_msg","timestamp":1705312802.0,"payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}}}
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(content.as_bytes()).unwrap();
+
+        let conversation = parse_codex_jsonl(temp_file.path()).unwrap().unwrap();
+        assert_eq!(conversation.usage.len(), 2);
+        assert_eq!(conversation.usage[0].total_tokens, 15);
+        assert_eq!(conversation.usage[1].total_tokens, 15);
+    }
+
+    #[test]
+    fn usage_only_session_is_preserved() {
+        let content = r#"{"type":"session_meta","payload":{"id":"usage-only","cwd":"/project","model_provider":"openai"}}
+{"type":"turn_context","payload":{"model":"gpt-test"}}
+{"type":"event_msg","timestamp":1705312801.0,"payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}}}
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(content.as_bytes()).unwrap();
+
+        let conversation = parse_codex_jsonl(temp_file.path()).unwrap().unwrap();
+        assert!(conversation.messages.is_empty());
+        assert_eq!(conversation.usage.len(), 1);
+        assert_eq!(conversation.usage[0].total_tokens, 15);
+    }
+
+    #[test]
+    fn cumulative_replay_after_model_change_is_not_counted_twice() {
+        let content = r#"{"type":"turn_context","payload":{"model":"gpt-a"}}
+{"type":"event_msg","timestamp":1705312800.5,"payload":{"type":"user_message","message":"Hello"}}
+{"type":"event_msg","timestamp":1705312801.0,"payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":30,"total_tokens":130},"last_token_usage":{"input_tokens":100,"output_tokens":30,"total_tokens":130}}}}
+{"type":"turn_context","payload":{"model":"gpt-b"}}
+{"type":"event_msg","timestamp":1705312802.0,"payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":30,"total_tokens":130},"last_token_usage":{"input_tokens":100,"output_tokens":30,"total_tokens":130}}}}
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(content.as_bytes()).unwrap();
+
+        let conversation = parse_codex_jsonl(temp_file.path()).unwrap().unwrap();
+        assert_eq!(conversation.usage.len(), 1);
+        assert_eq!(conversation.usage[0].model.as_deref(), Some("gpt-a"));
+    }
+
+    #[test]
+    fn pi_external_runtime_usage_is_left_to_the_pi_connector() {
+        let content = r#"{"type":"session_meta","payload":{"cwd":"/project","model_provider":"anthropic","source":{"subagent":{"thread_spawn":{"agent_role":"pi-sonnet"}}}}}
+{"type":"turn_context","payload":{"model":"claude-sonnet-5"}}
+{"type":"event_msg","timestamp":1705312800.5,"payload":{"type":"user_message","message":"Hello"}}
+{"type":"event_msg","timestamp":1705312801.0,"payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":30,"total_tokens":130},"last_token_usage":{"input_tokens":100,"output_tokens":30,"total_tokens":130}}}}
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(content.as_bytes()).unwrap();
+
+        let conversation = parse_codex_jsonl(temp_file.path()).unwrap().unwrap();
+        assert_eq!(conversation.messages.len(), 1);
+        assert!(conversation.usage.is_empty());
     }
 
     #[test]
@@ -702,7 +888,7 @@ mod tests {
         assert_eq!(conv.messages[1].role, Role::System);
         assert_eq!(conv.messages[2].role, Role::User);
         assert_eq!(conv.messages[3].role, Role::Assistant);
-        assert!(conv.source_fingerprint.starts_with("codex-v2:"));
+        assert!(conv.source_fingerprint.starts_with("codex-v5:"));
     }
 
     #[test]
@@ -788,5 +974,18 @@ mod tests {
             .scan(&[PathBuf::from("/totally/nonexistent")], None)
             .unwrap();
         assert!(result.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn traversal_error_marks_codex_scan_incomplete() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::os::unix::fs::symlink(dir.path().join("missing"), dir.path().join("broken")).unwrap();
+        let connector = CodexConnector {
+            home_dir: Some(PathBuf::from("/nonexistent")),
+        };
+
+        let scan = connector.scan(&[dir.path().to_path_buf()], None).unwrap();
+        assert!(!scan.complete);
     }
 }

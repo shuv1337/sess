@@ -5,3 +5,4 @@ pub mod model;
 pub mod search;
 pub mod storage;
 pub mod tui;
+pub mod usage;

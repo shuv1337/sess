@@ -11,6 +11,7 @@ mod model;
 mod search;
 mod storage;
 mod tui;
+mod usage;
 
 use cli::{AgentInfoOutput, Cli, Commands, DEFAULT_MAX_AGE, SearchOutput, StatsOutput};
 use indexer::Indexer;
@@ -32,6 +33,11 @@ fn maybe_auto_refresh(flags: &GlobalFlags, indexer: &mut Indexer) -> Result<()> 
         indexer.full_index()?;
         return Ok(());
     }
+    if indexer.needs_connector_rescan()? {
+        eprintln!("Connector data model changed. Refreshing source records...");
+        indexer.incremental_index()?;
+        return Ok(());
+    }
     if flags.no_refresh {
         return Ok(());
     }
@@ -50,6 +56,7 @@ fn main() {
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter("sess=info,warn")
+        .with_writer(std::io::stderr)
         .init();
 
     if let Err(e) = run() {
@@ -134,7 +141,7 @@ fn run() -> Result<()> {
                 agent_filter: agent.as_ref().and_then(|a| a.parse().ok()),
                 workspace_filter: workspace,
                 since: since.and_then(|s| cli::parse_date(&s).ok()),
-                until: until.and_then(|u| cli::parse_date(&u).ok()),
+                until: until.and_then(|u| cli::parse_until_date(&u).ok()),
                 limit,
                 offset,
                 ranking: ranking.into(),
@@ -290,6 +297,54 @@ fn run() -> Result<()> {
                         agent_stats.messages
                     );
                 }
+            }
+        }
+        Some(Commands::Usage {
+            agent,
+            provider,
+            model,
+            workspace,
+            since,
+            until,
+            bucket,
+            top,
+            json,
+            html,
+        }) => {
+            let mut indexer = Indexer::new(&data_dir, !flags.no_semantic)?;
+            maybe_auto_refresh(&flags, &mut indexer)?;
+
+            let agents = agent
+                .into_iter()
+                .map(|value| value.parse::<model::Agent>())
+                .collect::<Result<Vec<_>>>()?;
+            let since = since.as_deref().map(cli::parse_date).transpose()?;
+            let until = until.as_deref().map(cli::parse_until_date).transpose()?;
+            if let (Some(since), Some(until)) = (since, until)
+                && since > until
+            {
+                anyhow::bail!("--since must not be later than --until");
+            }
+            let filters = usage::UsageFilters {
+                agents,
+                providers: provider,
+                models: model,
+                workspace,
+                since,
+                until,
+                bucket: bucket.into(),
+            };
+            let dataset = indexer.storage().usage_dataset()?;
+            let report = usage::build_report(&dataset, &filters);
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else if let Some(path) = html {
+                let document = usage::render_html(&report, top);
+                usage::write_html(&path, &document)?;
+                println!("Wrote usage report to {}", path.display());
+            } else {
+                print!("{}", usage::render_terminal(&report, top));
             }
         }
         Some(Commands::Agents { json }) => {

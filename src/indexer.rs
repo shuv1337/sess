@@ -96,6 +96,7 @@ impl Indexer {
             .map(|c| c.agent())
             .collect();
         let mut observed_root_fingerprints = HashMap::new();
+        let mut completed_agents = HashSet::new();
 
         for connector in &connectors {
             if !detected_agents.contains(&connector.agent()) {
@@ -110,11 +111,19 @@ impl Indexer {
             let roots = connector.default_roots();
             observed_root_fingerprints
                 .insert(connector.agent(), Self::discovered_root_fingerprint(&roots));
-            let conversations = connector.scan(&roots, None)?;
+            let scan = connector.scan(&roots, None)?;
+            if scan.complete {
+                completed_agents.insert(connector.agent());
+            } else {
+                tracing::warn!(
+                    agent = connector.agent().slug(),
+                    "Connector scan was incomplete; migration cursor will be retried"
+                );
+            }
 
-            stats.files_scanned += conversations.len();
+            stats.files_scanned += scan.len();
 
-            for conv in conversations {
+            for conv in scan {
                 self.index_conversation(&conv, &mut stats)?;
             }
         }
@@ -126,15 +135,24 @@ impl Indexer {
         // Commit changes
         self.tantivy.commit()?;
         for connector in &connectors {
-            if detected_agents.contains(&connector.agent()) {
+            if completed_agents.contains(&connector.agent()) {
                 self.record_connector_parser_revision(connector.as_ref())?;
+                self.record_connector_root_fingerprint(
+                    connector.as_ref(),
+                    observed_root_fingerprints
+                        .get(&connector.agent())
+                        .expect("every connector root set is observed before commit"),
+                )?;
+            } else if detected_agents.contains(&connector.agent()) {
+                self.mark_connector_scan_incomplete(connector.as_ref())?;
+            } else {
+                self.record_connector_root_fingerprint(
+                    connector.as_ref(),
+                    observed_root_fingerprints
+                        .get(&connector.agent())
+                        .expect("every connector root set is observed before commit"),
+                )?;
             }
-            self.record_connector_root_fingerprint(
-                connector.as_ref(),
-                observed_root_fingerprints
-                    .get(&connector.agent())
-                    .expect("every connector root set is observed before commit"),
-            )?;
         }
 
         // Store embeddings if semantic search is enabled
@@ -143,10 +161,12 @@ impl Indexer {
         }
 
         // Update last scan timestamp
-        self.storage.set_meta(
-            "last_scan_ts",
-            &chrono::Utc::now().timestamp_millis().to_string(),
-        )?;
+        if completed_agents.len() == detected_agents.len() {
+            self.storage.set_meta(
+                "last_scan_ts",
+                &chrono::Utc::now().timestamp_millis().to_string(),
+            )?;
+        }
 
         stats.time_ms = start.elapsed().as_millis() as u64;
 
@@ -183,6 +203,7 @@ impl Indexer {
             .map(|c| c.agent())
             .collect();
         let mut observed_root_fingerprints = HashMap::new();
+        let mut completed_agents = HashSet::new();
 
         for connector in &connectors {
             if !detected_agents.contains(&connector.agent()) {
@@ -195,11 +216,19 @@ impl Indexer {
             let scan_plan = self.connector_scan_plan(connector.as_ref(), &roots, since_ts)?;
             observed_root_fingerprints
                 .insert(connector.agent(), scan_plan.root_fingerprint.clone());
-            let conversations = connector.scan(&roots, scan_plan.since_ts)?;
+            let scan = connector.scan(&roots, scan_plan.since_ts)?;
+            if scan.complete {
+                completed_agents.insert(connector.agent());
+            } else {
+                tracing::warn!(
+                    agent = connector.agent().slug(),
+                    "Connector scan was incomplete; migration cursor will be retried"
+                );
+            }
 
-            stats.files_scanned += conversations.len();
+            stats.files_scanned += scan.len();
 
-            for conv in conversations {
+            for conv in scan {
                 // Check if we need to reindex
                 if !self
                     .storage
@@ -225,15 +254,24 @@ impl Indexer {
         // Commit changes
         self.tantivy.commit()?;
         for connector in &connectors {
-            if detected_agents.contains(&connector.agent()) {
+            if completed_agents.contains(&connector.agent()) {
                 self.record_connector_parser_revision(connector.as_ref())?;
+                self.record_connector_root_fingerprint(
+                    connector.as_ref(),
+                    observed_root_fingerprints
+                        .get(&connector.agent())
+                        .expect("every connector root set is observed before commit"),
+                )?;
+            } else if detected_agents.contains(&connector.agent()) {
+                self.mark_connector_scan_incomplete(connector.as_ref())?;
+            } else {
+                self.record_connector_root_fingerprint(
+                    connector.as_ref(),
+                    observed_root_fingerprints
+                        .get(&connector.agent())
+                        .expect("every connector root set is observed before commit"),
+                )?;
             }
-            self.record_connector_root_fingerprint(
-                connector.as_ref(),
-                observed_root_fingerprints
-                    .get(&connector.agent())
-                    .expect("every connector root set is observed before commit"),
-            )?;
         }
 
         // Update embeddings for changed conversations
@@ -242,10 +280,12 @@ impl Indexer {
         }
 
         // Update last scan timestamp
-        self.storage.set_meta(
-            "last_scan_ts",
-            &chrono::Utc::now().timestamp_millis().to_string(),
-        )?;
+        if completed_agents.len() == detected_agents.len() {
+            self.storage.set_meta(
+                "last_scan_ts",
+                &chrono::Utc::now().timestamp_millis().to_string(),
+            )?;
+        }
 
         stats.time_ms = start.elapsed().as_millis() as u64;
 
@@ -407,6 +447,22 @@ impl Indexer {
         }
     }
 
+    /// Whether a detected connector needs an unbounded migration scan because
+    /// its parser revision or discovered source roots changed.
+    pub fn needs_connector_rescan(&self) -> Result<bool> {
+        for connector in all_connectors()
+            .into_iter()
+            .filter(|connector| connector.detect())
+        {
+            let roots = connector.default_roots();
+            let plan = self.connector_scan_plan(connector.as_ref(), &roots, Some(0))?;
+            if plan.since_ts.is_none() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Read-only dry-run: classify what an incremental index *would* do without
     /// touching SQLite or Tantivy.
     pub fn incremental_index_dry_run(&mut self) -> Result<IndexDryRunReport> {
@@ -549,6 +605,11 @@ impl Indexer {
         self.storage.set_meta(&key, fingerprint)
     }
 
+    fn mark_connector_scan_incomplete(&self, connector: &dyn Connector) -> Result<()> {
+        let key = format!("connector_root_fingerprint_{}", connector.agent().slug());
+        self.storage.set_meta(&key, "__incomplete__")
+    }
+
     fn connector_source_exists(
         connectors: &[Box<dyn Connector>],
         agent: Agent,
@@ -675,12 +736,46 @@ mod tests {
         indexer
             .record_connector_root_fingerprint(&connector, &first_plan.root_fingerprint)
             .unwrap();
+        indexer
+            .record_connector_parser_revision(&connector)
+            .unwrap();
 
         let unchanged_plan = indexer
             .connector_scan_plan(&connector, &roots, Some(1234))
             .unwrap();
         assert_eq!(unchanged_plan.since_ts, Some(1234));
         assert_eq!(unchanged_plan.root_fingerprint, first_plan.root_fingerprint);
+    }
+
+    #[test]
+    fn test_incomplete_connector_scan_retries_without_time_bound() {
+        let temp_dir = TempDir::new().unwrap();
+        let indexer = Indexer::new(&temp_dir.path().to_path_buf(), false).unwrap();
+        let connector = crate::connectors::pi_agent::PiAgentConnector::new();
+        let roots = vec![temp_dir.path().join("pi-agent")];
+        std::fs::create_dir_all(&roots[0]).unwrap();
+        let root_fingerprint = Indexer::discovered_root_fingerprint(&roots);
+        indexer
+            .record_connector_root_fingerprint(&connector, &root_fingerprint)
+            .unwrap();
+        indexer
+            .record_connector_parser_revision(&connector)
+            .unwrap();
+
+        assert_eq!(
+            indexer
+                .connector_scan_plan(&connector, &roots, Some(1234))
+                .unwrap()
+                .since_ts,
+            Some(1234)
+        );
+
+        indexer.mark_connector_scan_incomplete(&connector).unwrap();
+        let retry = indexer
+            .connector_scan_plan(&connector, &roots, Some(1234))
+            .unwrap();
+        assert_eq!(retry.since_ts, None);
+        assert_eq!(retry.root_fingerprint, root_fingerprint);
     }
 
     #[test]
@@ -794,6 +889,7 @@ mod tests {
                 timestamp: Some(1000),
                 model: None,
             }],
+            usage: vec![],
         };
 
         let mut stats = IndexStats::default();
@@ -841,6 +937,7 @@ mod tests {
                 timestamp: None,
                 model: None,
             }],
+            usage: vec![],
         };
 
         // Index twice with same fingerprint

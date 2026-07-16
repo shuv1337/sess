@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, Transaction, types::Value as SqliteValue};
 
-use crate::model::{Agent, Conversation, Message, Role, SourceFile};
+use crate::model::{Agent, Conversation, Message, Role, SourceFile, UsageRecord};
+use crate::usage::{TokenCounts, UsageDataset, UsageEventRow};
 
 /// A DB row whose backing source file is missing on disk.
 #[derive(Debug, Clone)]
@@ -57,6 +58,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 2,
         name: "add_embeddings",
         sql: include_str!("migrations/002_add_embeddings.sql"),
+    },
+    Migration {
+        version: 3,
+        name: "add_usage_events",
+        sql: include_str!("migrations/003_add_usage_events.sql"),
     },
 ];
 
@@ -149,10 +155,7 @@ impl Storage {
                 self.conn.execute_batch(migration.sql)?;
                 self.conn.execute(
                     "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
-                    [
-                        migration.version,
-                        chrono::Utc::now().timestamp_millis() as u32,
-                    ],
+                    rusqlite::params![migration.version, chrono::Utc::now().timestamp_millis(),],
                 )?;
             }
         }
@@ -265,9 +268,11 @@ impl Storage {
 
                 // Delete old messages
                 tx.execute("DELETE FROM messages WHERE conversation_id = ?", [id])?;
+                tx.execute("DELETE FROM usage_events WHERE conversation_id = ?", [id])?;
 
                 // Insert new messages
                 insert_messages(&tx, id, &conv.messages)?;
+                insert_usage_events(&tx, id, &conv.usage)?;
 
                 (id, false, true)
             } else {
@@ -299,6 +304,7 @@ impl Storage {
 
             // Insert messages
             insert_messages(&tx, id, &conv.messages)?;
+            insert_usage_events(&tx, id, &conv.usage)?;
 
             (id, true, true)
         };
@@ -395,6 +401,7 @@ impl Storage {
 
         // Get messages
         let messages = self.get_messages(row.id)?;
+        let usage = self.get_usage(row.id)?;
 
         // Reconstruct source_files from the fingerprint (simplified)
         let source_file = SourceFile {
@@ -414,6 +421,7 @@ impl Storage {
             started_at: row.started_at,
             ended_at: row.ended_at,
             messages,
+            usage,
         }))
     }
 
@@ -451,6 +459,81 @@ impl Storage {
         }
 
         Ok(results)
+    }
+
+    /// Get normalized provider usage for a conversation.
+    pub fn get_usage(&self, conversation_id: i64) -> Result<Vec<UsageRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT timestamp, provider, model, source_event_id, api_calls, input_tokens, output_tokens,
+                    cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                    total_tokens, actual_cost_usd, estimated_cost_usd
+             FROM usage_events
+             WHERE conversation_id = ?
+             ORDER BY idx",
+        )?;
+        let rows = stmt.query_map([conversation_id], |row| {
+            Ok(UsageRecord {
+                timestamp: row.get(0)?,
+                provider: row.get(1)?,
+                model: row.get(2)?,
+                source_event_id: row.get(3)?,
+                api_calls: row.get(4)?,
+                input_tokens: row.get(5)?,
+                output_tokens: row.get(6)?,
+                cache_read_tokens: row.get(7)?,
+                cache_write_tokens: row.get(8)?,
+                reasoning_tokens: row.get(9)?,
+                total_tokens: row.get(10)?,
+                actual_cost_usd: row.get(11)?,
+                estimated_cost_usd: row.get(12)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Load normalized usage events with the conversation dimensions needed by
+    /// the analytics renderers.
+    pub fn usage_dataset(&self) -> Result<UsageDataset> {
+        let mut stmt = self.conn.prepare(
+            "SELECT u.conversation_id, c.agent, c.workspace, u.timestamp,
+                    u.provider, u.model, u.source_event_id, u.api_calls, u.input_tokens,
+                    u.output_tokens, u.cache_read_tokens, u.cache_write_tokens,
+                    u.reasoning_tokens, u.total_tokens, u.actual_cost_usd,
+                    u.estimated_cost_usd
+             FROM usage_events u
+             JOIN conversations c ON c.id = u.conversation_id
+             ORDER BY u.timestamp, u.conversation_id, u.idx",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let agent: String = row.get(1)?;
+            let nonnegative = |value: i64| value.max(0) as u64;
+            Ok(UsageEventRow {
+                conversation_id: row.get(0)?,
+                agent: agent_from_slug(&agent),
+                workspace: row.get(2)?,
+                timestamp: row.get(3)?,
+                provider: row.get(4)?,
+                model: row.get(5)?,
+                source_event_id: row.get(6)?,
+                api_calls: nonnegative(row.get(7)?),
+                tokens: TokenCounts {
+                    input: nonnegative(row.get(8)?),
+                    output: nonnegative(row.get(9)?),
+                    cache_read: nonnegative(row.get(10)?),
+                    cache_write: nonnegative(row.get(11)?),
+                    reasoning: nonnegative(row.get(12)?),
+                    total: nonnegative(row.get(13)?),
+                },
+                actual_cost_usd: row.get(14)?,
+                estimated_cost_usd: row.get(15)?,
+            })
+        })?;
+        let stats = self.stats()?;
+        Ok(UsageDataset {
+            events: rows.collect::<std::result::Result<Vec<_>, _>>()?,
+            indexed_conversations: stats.total_conversations as u64,
+            indexed_messages: stats.total_messages as u64,
+        })
     }
 
     /// Find DB rows whose backing source file no longer exists on disk.
@@ -788,6 +871,46 @@ fn insert_messages(tx: &Transaction, conversation_id: i64, messages: &[Message])
     Ok(())
 }
 
+fn insert_usage_events(
+    tx: &Transaction,
+    conversation_id: i64,
+    usage: &[UsageRecord],
+) -> Result<()> {
+    let mut stmt = tx.prepare(
+        "INSERT INTO usage_events
+            (conversation_id, idx, timestamp, provider, model, source_event_id, api_calls, input_tokens,
+             output_tokens, cache_read_tokens, cache_write_tokens,
+             reasoning_tokens, total_tokens, actual_cost_usd, estimated_cost_usd)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )?;
+
+    for (idx, record) in usage.iter().enumerate() {
+        stmt.execute(rusqlite::params![
+            conversation_id,
+            idx as i64,
+            record.timestamp,
+            record.provider.as_deref(),
+            record.model.as_deref(),
+            record.source_event_id.as_deref(),
+            sqlite_counter(record.api_calls),
+            sqlite_counter(record.input_tokens),
+            sqlite_counter(record.output_tokens),
+            sqlite_counter(record.cache_read_tokens),
+            sqlite_counter(record.cache_write_tokens),
+            sqlite_counter(record.reasoning_tokens),
+            sqlite_counter(record.total_tokens),
+            record.actual_cost_usd,
+            record.estimated_cost_usd,
+        ])?;
+    }
+
+    Ok(())
+}
+
+fn sqlite_counter(value: u64) -> i64 {
+    value.min(i64::MAX as u64) as i64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -824,6 +947,7 @@ mod tests {
                     model: Some("claude-3".to_string()),
                 },
             ],
+            usage: vec![],
         }
     }
 
@@ -855,6 +979,70 @@ mod tests {
         let stats = storage.stats().unwrap();
         assert_eq!(stats.total_conversations, 1);
         assert_eq!(stats.total_messages, 2);
+    }
+
+    #[test]
+    fn usage_round_trips_and_is_replaced_atomically_on_update() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut storage = Storage::new(temp_file.path()).unwrap();
+        let mut conv = create_test_conversation();
+        conv.usage = vec![UsageRecord {
+            timestamp: Some(2_000),
+            provider: Some("anthropic".to_string()),
+            model: Some("claude-3".to_string()),
+            source_event_id: Some("message:test".to_string()),
+            api_calls: 2,
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_read_tokens: 25,
+            cache_write_tokens: 5,
+            reasoning_tokens: 10,
+            total_tokens: 180,
+            actual_cost_usd: None,
+            estimated_cost_usd: Some(0.25),
+        }];
+
+        let outcome = storage.upsert_conversation(&conv).unwrap();
+        let stored = storage
+            .get_conversation(outcome.conversation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.usage, conv.usage);
+
+        let dataset = storage.usage_dataset().unwrap();
+        assert_eq!(dataset.events.len(), 1);
+        assert_eq!(dataset.events[0].agent, Agent::ClaudeCode);
+        assert_eq!(dataset.events[0].api_calls, 2);
+        assert_eq!(dataset.events[0].tokens.total, 180);
+        assert_eq!(dataset.indexed_conversations, 1);
+        assert_eq!(dataset.indexed_messages, 2);
+
+        conv.source_fingerprint = "replacement".to_string();
+        conv.usage[0].total_tokens = 200;
+        storage.upsert_conversation(&conv).unwrap();
+        let replaced = storage.get_usage(outcome.conversation_id).unwrap();
+        assert_eq!(replaced.len(), 1);
+        assert_eq!(replaced[0].total_tokens, 200);
+    }
+
+    #[test]
+    fn oversized_usage_counters_saturate_at_sqlite_integer_limit() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut storage = Storage::new(temp_file.path()).unwrap();
+        let mut conv = create_test_conversation();
+        conv.usage = vec![UsageRecord {
+            api_calls: u64::MAX,
+            input_tokens: u64::MAX,
+            total_tokens: u64::MAX,
+            ..UsageRecord::default()
+        }];
+
+        let outcome = storage.upsert_conversation(&conv).unwrap();
+        let stored = storage.get_usage(outcome.conversation_id).unwrap();
+
+        assert_eq!(stored[0].api_calls, i64::MAX as u64);
+        assert_eq!(stored[0].input_tokens, i64::MAX as u64);
+        assert_eq!(stored[0].total_tokens, i64::MAX as u64);
     }
 
     #[test]

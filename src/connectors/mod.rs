@@ -7,6 +7,41 @@ use serde_json::Value;
 
 use crate::model::{Agent, Conversation, Role, SourceFile, parse_timestamp};
 
+/// Conversations returned by one connector scan plus whether every discovered
+/// source was read successfully. Partial rows remain useful, but an incomplete
+/// scan must not advance migration/freshness cursors.
+#[derive(Debug)]
+pub struct ConnectorScan {
+    pub conversations: Vec<Conversation>,
+    pub complete: bool,
+}
+
+impl ConnectorScan {
+    pub fn new(conversations: Vec<Conversation>, complete: bool) -> Self {
+        Self {
+            conversations,
+            complete,
+        }
+    }
+}
+
+impl std::ops::Deref for ConnectorScan {
+    type Target = [Conversation];
+
+    fn deref(&self) -> &Self::Target {
+        &self.conversations
+    }
+}
+
+impl IntoIterator for ConnectorScan {
+    type Item = Conversation;
+    type IntoIter = std::vec::IntoIter<Conversation>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.conversations.into_iter()
+    }
+}
+
 /// Action to take when a file fails to parse.
 #[derive(Debug, Clone, Copy, Default)]
 pub enum ErrorAction {
@@ -29,7 +64,7 @@ pub trait Connector: Send + Sync {
 
     /// Scan session files and return normalized conversations.
     /// `since_ts` is a best-effort incremental hint.
-    fn scan(&self, roots: &[PathBuf], since_ts: Option<i64>) -> Result<Vec<Conversation>>;
+    fn scan(&self, roots: &[PathBuf], since_ts: Option<i64>) -> Result<ConnectorScan>;
 
     /// Revision of the connector's normalized output format. Bumping this
     /// requests one full source rescan so existing rows can be migrated.
@@ -86,6 +121,44 @@ pub fn source_file(path: &Path) -> Option<SourceFile> {
         })
     } else {
         None
+    }
+}
+
+/// Read the first non-negative integer found at one of the JSON pointers.
+pub fn json_u64(value: &Value, pointers: &[&str]) -> u64 {
+    pointers
+        .iter()
+        .find_map(|pointer| {
+            let value = value.pointer(pointer)?;
+            value
+                .as_u64()
+                .or_else(|| value.as_i64().and_then(|number| number.try_into().ok()))
+        })
+        .unwrap_or(0)
+}
+
+/// Read the first finite number found at one of the JSON pointers.
+pub fn json_f64(value: &Value, pointers: &[&str]) -> Option<f64> {
+    pointers
+        .iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(Value::as_f64))
+        .filter(|number| number.is_finite())
+}
+
+pub fn normalized_token_total(
+    reported: u64,
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+) -> u64 {
+    if reported > 0 {
+        reported
+    } else {
+        input
+            .saturating_add(output)
+            .saturating_add(cache_read)
+            .saturating_add(cache_write)
     }
 }
 

@@ -4,7 +4,9 @@ use assert_cmd::Command;
 use serde_json::Value;
 use tempfile::TempDir;
 
-use session_search::model::{Agent, Conversation, Message, Role, SourceFile, source_fingerprint};
+use session_search::model::{
+    Agent, Conversation, Message, Role, SourceFile, UsageRecord, source_fingerprint,
+};
 use session_search::search::TantivyIndex;
 use session_search::storage::Storage;
 
@@ -34,6 +36,14 @@ fn make_conversation(
         size: content.len() as u64,
     }];
 
+    let (provider, model, input, output, estimate) = match agent {
+        Agent::PiAgent => (Some("anthropic"), "claude-sonnet", 100, 50, Some(0.01)),
+        Agent::Codex => (Some("openai"), "gpt-5", 200, 100, None),
+        Agent::ClaudeCode => (None, "claude-opus", 80, 40, None),
+        Agent::Hermes => (Some("openrouter"), "hermes-model", 50, 25, Some(0.02)),
+        Agent::OpenCode => (Some("openai"), "gpt-5-mini", 40, 20, Some(0.001)),
+    };
+
     Conversation {
         agent,
         external_id: None,
@@ -50,6 +60,21 @@ fn make_conversation(
             content: content.to_string(),
             timestamp: Some(started_at),
             model: None,
+        }],
+        usage: vec![UsageRecord {
+            timestamp: Some(started_at),
+            provider: provider.map(str::to_string),
+            model: Some(model.to_string()),
+            source_event_id: None,
+            api_calls: 1,
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            total_tokens: input + output,
+            actual_cost_usd: None,
+            estimated_cost_usd: estimate,
         }],
     }
 }
@@ -144,6 +169,21 @@ fn run_search(data_dir: &Path, args: &[&str]) -> Value {
         cmd.arg(arg);
     }
 
+    let assert = cmd.assert().success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8 stdout");
+    serde_json::from_str(&stdout).expect("json output")
+}
+
+fn run_usage_json(data_dir: &Path, args: &[&str]) -> Value {
+    let mut cmd = Command::cargo_bin("sess").expect("sess binary");
+    cmd.arg("--data-dir")
+        .arg(data_dir)
+        .arg("--no-auto-index")
+        .arg("usage");
+    for arg in args {
+        cmd.arg(arg);
+    }
+    cmd.arg("--json");
     let assert = cmd.assert().success();
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8 stdout");
     serde_json::from_str(&stdout).expect("json output")
@@ -283,4 +323,88 @@ fn cli_json_shape_contract_for_bots() {
         .iter()
         .any(|h| h["id"].as_i64() == Some(seeded.ids.claude_nonvoice));
     assert!(!has_nonvoice_conv);
+}
+
+#[test]
+fn cli_usage_reports_harness_provider_and_model_splits() {
+    let seeded = seed_data();
+    let json = run_usage_json(&seeded.data_dir, &[]);
+
+    assert_eq!(json["totals"]["tokens"]["total"], 570);
+    assert_eq!(json["totals"]["api_calls"], 3);
+    assert_eq!(json["by_harness"].as_array().unwrap().len(), 3);
+    assert!(
+        json["by_provider"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["label"] == "Unknown")
+    );
+    assert!(
+        json["by_model"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["label"] == "gpt-5")
+    );
+}
+
+#[test]
+fn cli_usage_accepts_harness_alias_and_writes_standalone_html() {
+    let seeded = seed_data();
+    let filtered = run_usage_json(&seeded.data_dir, &["--harness", "codex"]);
+    assert_eq!(filtered["totals"]["tokens"]["total"], 300);
+    assert_eq!(filtered["by_harness"][0]["key"], "codex");
+
+    let report_path = seeded.data_dir.join("reports/usage.html");
+    let mut cmd = Command::cargo_bin("sess").expect("sess binary");
+    cmd.arg("--data-dir")
+        .arg(&seeded.data_dir)
+        .arg("--no-auto-index")
+        .arg("usage")
+        .arg("--html")
+        .arg(&report_path)
+        .assert()
+        .success();
+    let html = std::fs::read_to_string(report_path).expect("usage report");
+    assert!(html.contains("Agent usage"));
+    assert!(html.contains("<svg"));
+    assert!(!html.contains("https://"));
+}
+
+#[test]
+fn cli_usage_json_keeps_stdout_machine_readable_on_fresh_storage() {
+    let tmp = TempDir::new().expect("tempdir");
+    let mut cmd = Command::cargo_bin("sess").expect("sess binary");
+    let assert = cmd
+        .arg("--data-dir")
+        .arg(tmp.path())
+        .arg("--no-auto-index")
+        .arg("usage")
+        .arg("--json")
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8 stdout");
+    let report: Value = serde_json::from_str(&stdout).expect("stdout is pure JSON");
+    assert_eq!(report["totals"]["events"], 0);
+}
+
+#[test]
+fn cli_usage_rejects_reversed_date_ranges() {
+    let seeded = seed_data();
+    let mut cmd = Command::cargo_bin("sess").expect("sess binary");
+    cmd.arg("--data-dir")
+        .arg(&seeded.data_dir)
+        .arg("--no-auto-index")
+        .arg("usage")
+        .arg("--since")
+        .arg("2026-07-20")
+        .arg("--until")
+        .arg("2026-07-10")
+        .arg("--json")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "--since must not be later than --until",
+        ));
 }

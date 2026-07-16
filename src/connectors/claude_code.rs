@@ -8,9 +8,12 @@ use serde_json::Value;
 use walkdir::WalkDir;
 
 use crate::connectors::{
-    Connector, file_modified_since, flatten_json_content, parse_role, source_file,
+    Connector, ConnectorScan, file_modified_since, flatten_json_content, json_u64,
+    normalized_token_total, parse_role, source_file,
 };
-use crate::model::{Agent, Conversation, Message, Role, SourceFile, source_fingerprint};
+use crate::model::{Agent, Conversation, Message, Role, UsageRecord, source_fingerprint};
+
+const PARSER_REVISION: &str = "2";
 
 pub struct ClaudeCodeConnector {
     home_dir: Option<PathBuf>,
@@ -49,23 +52,37 @@ impl Connector for ClaudeCodeConnector {
         self.projects_dir().into_iter().collect()
     }
 
-    fn scan(&self, roots: &[PathBuf], since_ts: Option<i64>) -> Result<Vec<Conversation>> {
+    fn scan(&self, roots: &[PathBuf], since_ts: Option<i64>) -> Result<ConnectorScan> {
         let mut conversations = Vec::new();
+        let mut complete = true;
 
         for root in roots {
             if !root.exists() {
                 continue;
             }
 
-            for entry in WalkDir::new(root)
-                .follow_links(true)
-                .into_iter()
-                .filter_map(|e| e.ok())
-                .filter(|e| {
-                    e.file_type().is_file()
-                        && e.path().extension().map(|e| e == "jsonl").unwrap_or(false)
-                })
-            {
+            for entry in WalkDir::new(root).follow_links(true) {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        complete = false;
+                        tracing::warn!(
+                            agent = Agent::ClaudeCode.slug(),
+                            root = %root.display(),
+                            error = %error,
+                            "Failed to traverse Claude Code session storage"
+                        );
+                        continue;
+                    }
+                };
+                if !entry.file_type().is_file()
+                    || entry
+                        .path()
+                        .extension()
+                        .is_none_or(|extension| extension != "jsonl")
+                {
+                    continue;
+                }
                 let path = entry.path();
 
                 // Check if file was modified since the given timestamp
@@ -81,6 +98,7 @@ impl Connector for ClaudeCodeConnector {
                         // Empty or no messages, skip
                     }
                     Err(e) => {
+                        complete = false;
                         let action = self.on_parse_error(path, &e);
                         match action {
                             crate::connectors::ErrorAction::Skip => {
@@ -91,7 +109,7 @@ impl Connector for ClaudeCodeConnector {
                             }
                             crate::connectors::ErrorAction::SkipAgent => {
                                 tracing::warn!("Skipping remaining Claude Code files due to error");
-                                return Ok(conversations);
+                                return Ok(ConnectorScan::new(conversations, false));
                             }
                         }
                     }
@@ -99,7 +117,11 @@ impl Connector for ClaudeCodeConnector {
             }
         }
 
-        Ok(conversations)
+        Ok(ConnectorScan::new(conversations, complete))
+    }
+
+    fn parser_revision(&self) -> Option<&'static str> {
+        Some(PARSER_REVISION)
     }
 }
 
@@ -115,6 +137,7 @@ fn parse_claude_session(path: &Path) -> Result<Option<Conversation>> {
     let mut external_id: Option<String> = None;
     let mut timestamps: Vec<i64> = Vec::new();
     let mut current_model: Option<String> = None;
+    let mut usage_by_message: HashMap<String, UsageRecord> = HashMap::new();
 
     for (line_num, line) in reader.lines().enumerate() {
         let line = line.with_context(|| {
@@ -207,6 +230,61 @@ fn parse_claude_session(path: &Path) -> Result<Option<Conversation>> {
                 if let Some(model) = message.get("model").and_then(|v| v.as_str()) {
                     current_model = Some(model.to_string());
                 }
+                if let Some(raw_usage) = message.get("usage") {
+                    let input = json_u64(raw_usage, &["/input_tokens"]);
+                    let output = json_u64(raw_usage, &["/output_tokens"]);
+                    let cache_read = json_u64(raw_usage, &["/cache_read_input_tokens"]);
+                    let cache_write = json_u64(raw_usage, &["/cache_creation_input_tokens"]);
+                    let total = normalized_token_total(0, input, output, cache_read, cache_write);
+                    let source_event_id = message
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(|id| format!("message:{id}"))
+                        .or_else(|| {
+                            value
+                                .get("requestId")
+                                .and_then(Value::as_str)
+                                .map(|id| format!("request:{id}"))
+                        });
+                    let record = UsageRecord {
+                        timestamp: timestamps.last().copied(),
+                        provider: message
+                            .get("provider")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        model: current_model.clone(),
+                        source_event_id: source_event_id.clone(),
+                        api_calls: 1,
+                        input_tokens: input,
+                        output_tokens: output,
+                        cache_read_tokens: cache_read,
+                        cache_write_tokens: cache_write,
+                        reasoning_tokens: json_u64(raw_usage, &["/reasoning_tokens"]),
+                        total_tokens: total,
+                        actual_cost_usd: None,
+                        estimated_cost_usd: None,
+                    };
+                    let synthetic_zero = record.total_tokens == 0
+                        && record.reasoning_tokens == 0
+                        && record.model.as_deref().is_some_and(|model| {
+                            model
+                                .trim_matches(&['<', '>'][..])
+                                .eq_ignore_ascii_case("synthetic")
+                        });
+                    if record.has_usage() && !synthetic_zero {
+                        let key = source_event_id.unwrap_or_else(|| format!("line-{line_num}"));
+                        usage_by_message
+                            .entry(key)
+                            .and_modify(|existing| {
+                                if (record.total_tokens, record.timestamp)
+                                    > (existing.total_tokens, existing.timestamp)
+                                {
+                                    *existing = record.clone();
+                                }
+                            })
+                            .or_insert(record);
+                    }
+                }
             }
 
             // Skip empty content
@@ -224,7 +302,8 @@ fn parse_claude_session(path: &Path) -> Result<Option<Conversation>> {
         }
     }
 
-    if messages.is_empty() {
+    let mut usage: Vec<_> = usage_by_message.into_values().collect();
+    if messages.is_empty() && usage.is_empty() {
         return Ok(None);
     }
 
@@ -241,7 +320,19 @@ fn parse_claude_session(path: &Path) -> Result<Option<Conversation>> {
     let ended_at = timestamps.iter().max().copied();
 
     let source_files = vec![source_file];
-    let fingerprint = source_fingerprint(&source_files);
+    let fingerprint = format!(
+        "claude-v{PARSER_REVISION}:{}",
+        source_fingerprint(&source_files)
+    );
+    usage.sort_by(|left, right| {
+        left.timestamp
+            .cmp(&right.timestamp)
+            .then_with(|| left.provider.cmp(&right.provider))
+            .then_with(|| left.model.cmp(&right.model))
+            .then_with(|| left.total_tokens.cmp(&right.total_tokens))
+            .then_with(|| left.input_tokens.cmp(&right.input_tokens))
+            .then_with(|| left.output_tokens.cmp(&right.output_tokens))
+    });
 
     Ok(Some(Conversation {
         agent: Agent::ClaudeCode,
@@ -254,6 +345,7 @@ fn parse_claude_session(path: &Path) -> Result<Option<Conversation>> {
         started_at,
         ended_at,
         messages,
+        usage,
     }))
 }
 
@@ -285,6 +377,54 @@ mod tests {
         assert!(conv.started_at.is_some());
         assert!(conv.ended_at.is_some());
         assert!(conv.started_at.unwrap() <= conv.ended_at.unwrap());
+    }
+
+    #[test]
+    fn test_parse_claude_usage_deduplicates_response_rows() {
+        let content = r#"{"type":"user","cwd":"/test","message":{"role":"user","content":"Hello"},"timestamp":"2024-01-15T10:00:00Z"}
+{"type":"assistant","message":{"id":"msg-usage","role":"assistant","content":[{"type":"thinking","thinking":"hidden"}],"provider":"vertex","model":"claude-test","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":30,"cache_creation_input_tokens":40}},"timestamp":"2024-01-15T10:00:05Z"}
+{"type":"assistant","message":{"id":"msg-usage","role":"assistant","content":[{"type":"text","text":"Done"}],"provider":"vertex","model":"claude-test","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":30,"cache_creation_input_tokens":40}},"timestamp":"2024-01-15T10:00:06Z"}
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(content.as_bytes()).unwrap();
+
+        let conversation = parse_claude_session(temp_file.path()).unwrap().unwrap();
+        assert_eq!(conversation.usage.len(), 1);
+        let usage = &conversation.usage[0];
+        assert_eq!(usage.provider.as_deref(), Some("vertex"));
+        assert_eq!(usage.model.as_deref(), Some("claude-test"));
+        assert_eq!(usage.source_event_id.as_deref(), Some("message:msg-usage"));
+        assert_eq!(usage.api_calls, 1);
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 20);
+        assert_eq!(usage.cache_read_tokens, 30);
+        assert_eq!(usage.cache_write_tokens, 40);
+        assert_eq!(usage.total_tokens, 100);
+    }
+
+    #[test]
+    fn synthetic_zero_usage_is_not_counted_as_an_api_call() {
+        let content = r#"{"type":"user","message":{"role":"user","content":"Hello"}}
+{"type":"assistant","message":{"id":"synthetic","role":"assistant","content":"bookkeeping","model":"<synthetic>","usage":{"input_tokens":0,"output_tokens":0}}}
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(content.as_bytes()).unwrap();
+
+        let conversation = parse_claude_session(temp_file.path()).unwrap().unwrap();
+        assert!(conversation.usage.is_empty());
+    }
+
+    #[test]
+    fn usage_only_session_is_preserved() {
+        let content = r#"{"type":"assistant","message":{"id":"usage-only","role":"assistant","content":"","model":"claude-test","usage":{"input_tokens":10,"output_tokens":5}},"timestamp":"2024-01-15T10:00:05Z"}
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(content.as_bytes()).unwrap();
+
+        let conversation = parse_claude_session(temp_file.path()).unwrap().unwrap();
+        assert!(conversation.messages.is_empty());
+        assert_eq!(conversation.usage.len(), 1);
+        assert_eq!(conversation.usage[0].total_tokens, 15);
     }
 
     #[test]
@@ -384,6 +524,19 @@ mod tests {
             .scan(&[PathBuf::from("/totally/nonexistent")], None)
             .unwrap();
         assert!(conversations.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn traversal_error_marks_claude_scan_incomplete() {
+        let dir = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(dir.path().join("missing"), dir.path().join("broken")).unwrap();
+        let connector = ClaudeCodeConnector {
+            home_dir: Some(PathBuf::from("/nonexistent")),
+        };
+
+        let scan = connector.scan(&[dir.path().to_path_buf()], None).unwrap();
+        assert!(!scan.complete);
     }
 
     #[test]

@@ -39,6 +39,7 @@ fn make_conv(agent: Agent, path: &std::path::Path, content: &str, ts: i64) -> Co
             timestamp: Some(ts),
             model: None,
         }],
+        usage: vec![],
     }
 }
 

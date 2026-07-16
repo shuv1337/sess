@@ -125,6 +125,41 @@ pub struct Message {
     pub model: Option<String>,  // e.g. "claude-opus-4-5", "gpt-5.1-codex"
 }
 
+/// Provider-reported usage for one model invocation.
+///
+/// Token categories preserve the source harness semantics. `total_tokens` is
+/// normalized by each connector to the source's reported total, or to the sum
+/// of input, output, cache-read, and cache-write tokens when no total is
+/// provided. Reasoning tokens are a subset of output tokens and are therefore
+/// not added to the total a second time.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct UsageRecord {
+    pub timestamp: Option<i64>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    /// Stable source invocation identity when the harness exposes one.
+    #[serde(default)]
+    pub source_event_id: Option<String>,
+    pub api_calls: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub total_tokens: u64,
+    pub actual_cost_usd: Option<f64>,
+    pub estimated_cost_usd: Option<f64>,
+}
+
+impl UsageRecord {
+    pub fn has_usage(&self) -> bool {
+        self.api_calls > 0
+            || self.total_tokens > 0
+            || self.actual_cost_usd.is_some()
+            || self.estimated_cost_usd.is_some()
+    }
+}
+
 impl Message {
     pub fn preview(&self, max_len: usize) -> String {
         let content = self.content.trim();
@@ -156,6 +191,8 @@ pub struct Conversation {
     pub started_at: Option<i64>,    // Unix millis UTC
     pub ended_at: Option<i64>,
     pub messages: Vec<Message>,
+    #[serde(default)]
+    pub usage: Vec<UsageRecord>,
 }
 
 impl Conversation {
@@ -473,6 +510,7 @@ mod tests {
             started_at: None,
             ended_at: None,
             messages,
+            usage: vec![],
         }
     }
 
@@ -631,6 +669,7 @@ mod tests {
             started_at: None,
             ended_at: None,
             messages: vec![],
+            usage: vec![],
         };
         assert_eq!(conv.source_mtime_max(), 300);
     }

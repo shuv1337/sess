@@ -624,6 +624,7 @@ mod tests {
                     model: Some("model-x".to_string()),
                 },
             ],
+            usage: vec![],
         };
 
         let upsert = storage.upsert_conversation(&conv).unwrap();

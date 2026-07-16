@@ -41,6 +41,7 @@ Use the command help for the complete, generated interface:
 ```bash
 ./target/release/sess agents --json
 ./target/release/sess stats --json
+./target/release/sess usage
 ```
 
 `search` accepts agent, workspace, date, pagination, and ranking filters. Use
@@ -53,13 +54,49 @@ are available. `view` accepts either a conversation ID or its source path.
 ./target/release/sess stats --help
 ./target/release/sess agents --help
 ./target/release/sess view --help
+./target/release/sess usage --help
 ```
+
+### Usage analytics
+
+`sess usage` summarizes provider-reported API calls and tokens by harness,
+provider, and model. The terminal report is the default; the same normalized
+report is available as JSON or as a standalone, responsive HTML dashboard with
+inline SVG charts and no remote assets.
+
+```bash
+# Terminal summary across all indexed usage
+./target/release/sess usage
+
+# Filters repeat within a dimension; --harness is an alias for --agent
+./target/release/sess usage --harness codex --provider openai --since 30d
+
+# Machine-readable data or a shareable local visual report
+./target/release/sess usage --bucket week --json
+./target/release/sess usage --since 90d --html ./usage-report.html
+```
+
+Usage rows are read from the original source stores during indexing. Existing
+indexes receive a one-time connector migration scan so historical rows gain
+usage data. The report keeps unknown provider/model buckets visible instead of
+guessing attribution. Token totals remain source-reported when available;
+reasoning is shown as a subset of output, and cache reads/writes stay separate.
+Costs are included only when a source records an actual or estimated value, so
+cost coverage is shown explicitly and estimates should not be treated as a
+bill. Session/model aggregates without event-exact timing contribute to
+all-time totals but not date-filtered reports or trend charts. Provider and
+model coverage percentages are weighted by represented API calls. `--top`
+limits only the terminal and HTML breakdowns; JSON always contains every group.
+Extremely wide explicit timelines omit zero-only gaps instead of truncating
+late usage; the terminal, JSON, and HTML outputs mark those timelines as sparse.
 
 ### Index behavior
 
-`sess search` and the TUI create an initial index when needed, then refresh a
-stale index by default after 15 minutes. `--no-refresh` disables only the
-age-based refresh; `--no-auto-index` disables both initial and stale refresh.
+`sess search`, `sess usage`, and the TUI create an initial index when needed,
+then refresh a stale index by default after 15 minutes. Connector parser or
+source-root changes trigger one migration scan even when the age threshold has
+not elapsed. `--no-refresh` disables only the age-based refresh;
+`--no-auto-index` disables automatic indexing entirely.
 `--max-age` accepts values such as `5m`, `1h`, and `2h30m`.
 
 Use `index --full` to rescan all supported transcript roots. Use `index
@@ -75,12 +112,13 @@ without writing.
 | Codex CLI | `~/.codex/sessions`, `~/.codex/archived_sessions` | `CODEX_HOME` |
 | Hermes Agent | `~/.hermes/state.db`, `~/.hermes/profiles/*/state.db` | `HERMES_HOME` |
 | OpenCode / shuvcode | `~/.local/share/opencode/storage`, `~/.local/share/opencode/*.db` | `OPENCODE_STORAGE_ROOT`, `OPENCODE_DB` |
-| Pi Agent and compatible layouts | `~/.pi/agent`, `~/.shuvhelm/pi-agent`, `~/.shuvhelm/mate`, `~/.local/share/shiv`, `~/.openclaw` | `SESS_PI_AGENT_DIRS`, `PI_CODING_AGENT_DIR`, `SHIV_AGENT_DIR`, `OPENCLAW_HOME` |
+| Pi Agent and compatible layouts | `~/.pi/agent`, `~/.shuvpi/agent`, `~/.shuvhelm/pi-agent`, `~/.shuvhelm/mate`, `~/.local/share/shiv`, `~/.openclaw` | `SESS_PI_AGENT_DIRS`, `PI_CODING_AGENT_DIR`, `SHIV_AGENT_DIR`, `OPENCLAW_HOME` |
 
 `SESS_PI_AGENT_DIRS` accepts a platform path list (`:`-separated on Unix) for
 additional Pi-compatible agent roots. The legacy single-root
 `PI_CODING_AGENT_DIR` remains supported. Both are additive: they do not hide
-the personal Pi root or the standard shuvhelm fleet and mate roots.
+the personal Pi root, Codex external-runtime Pi root, or the standard shuvhelm
+fleet and mate roots.
 
 ## Background refresh
 

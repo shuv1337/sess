@@ -12,10 +12,14 @@ use serde_json::Value;
 use walkdir::WalkDir;
 
 use crate::connectors::{
-    Connector, database_source_path, file_modified_since, flatten_json_content,
-    parse_database_source_path, source_file,
+    Connector, ConnectorScan, database_source_path, file_modified_since, flatten_json_content,
+    json_f64, json_u64, normalized_token_total, parse_database_source_path, source_file,
 };
-use crate::model::{Agent, Conversation, Message, Role, SourceFile, source_fingerprint};
+use crate::model::{
+    Agent, Conversation, Message, Role, SourceFile, UsageRecord, source_fingerprint,
+};
+
+const PARSER_REVISION: &str = "5";
 
 /// Progress information for OpenCode scanning.
 #[derive(Debug, Clone)]
@@ -105,12 +109,12 @@ impl Connector for OpenCodeConnector {
         roots
     }
 
-    fn scan(&self, roots: &[PathBuf], since_ts: Option<i64>) -> Result<Vec<Conversation>> {
+    fn scan(&self, roots: &[PathBuf], since_ts: Option<i64>) -> Result<ConnectorScan> {
         scan_opencode_roots(roots, since_ts)
     }
 
     fn parser_revision(&self) -> Option<&'static str> {
-        Some("2")
+        Some(PARSER_REVISION)
     }
 
     fn source_exists(&self, path: &Path) -> Result<bool> {
@@ -148,14 +152,16 @@ impl Connector for OpenCodeConnector {
     }
 }
 
-fn scan_opencode_roots(roots: &[PathBuf], since_ts: Option<i64>) -> Result<Vec<Conversation>> {
-    let mut legacy_roots = Vec::new();
-    let mut databases: HashMap<PathBuf, PathBuf> = HashMap::new();
+fn scan_opencode_roots(roots: &[PathBuf], since_ts: Option<i64>) -> Result<ConnectorScan> {
+    #[derive(Default)]
+    struct Family {
+        legacy_roots: Vec<PathBuf>,
+        databases: Vec<PathBuf>,
+    }
+
+    let mut families: HashMap<PathBuf, Family> = HashMap::new();
 
     for root in roots {
-        if let Some(storage) = legacy_storage_root(root) {
-            legacy_roots.push(storage);
-        }
         let virtual_root = if root.is_file() {
             root.parent().unwrap_or(Path::new(".")).to_path_buf()
         } else if root.file_name().is_some_and(|name| name == "storage") {
@@ -163,64 +169,95 @@ fn scan_opencode_roots(roots: &[PathBuf], since_ts: Option<i64>) -> Result<Vec<C
         } else {
             root.clone()
         };
-        for database in discover_databases(root) {
-            databases
-                .entry(database)
-                .or_insert_with(|| virtual_root.clone());
+        let family = families.entry(virtual_root.clone()).or_default();
+        if let Some(storage) = legacy_storage_root(root) {
+            family.legacy_roots.push(storage);
         }
+        if let Some(storage) = legacy_storage_root(&virtual_root) {
+            family.legacy_roots.push(storage);
+        }
+        family.databases.extend(discover_databases(&virtual_root));
     }
-    legacy_roots.sort();
-    legacy_roots.dedup();
+    let mut families = families.into_iter().collect::<Vec<_>>();
+    families.sort_by(|left, right| left.0.cmp(&right.0));
+    for (_, family) in &mut families {
+        family.legacy_roots.sort();
+        family.legacy_roots.dedup();
+        family.databases.sort();
+        family.databases.dedup();
+    }
 
-    let legacy_paths = inventory_legacy_sources(&legacy_roots);
+    let all_legacy_roots = families
+        .iter()
+        .flat_map(|(_, family)| family.legacy_roots.iter().cloned())
+        .collect::<Vec<_>>();
+    let legacy_paths = inventory_legacy_sources(&all_legacy_roots);
+    let database_count = families
+        .iter()
+        .map(|(_, family)| family.databases.len())
+        .sum::<usize>();
     let mut by_session: HashMap<String, Conversation> = HashMap::new();
     let mut parse_errors = 0usize;
 
-    for storage in &legacy_roots {
-        match scan_legacy_storage(storage, since_ts) {
-            Ok(conversations) => {
-                for conversation in conversations {
-                    merge_conversation(&mut by_session, conversation);
-                }
-            }
-            Err(error) => {
-                parse_errors += 1;
-                tracing::warn!(
-                    agent = Agent::OpenCode.slug(),
-                    root = %storage.display(),
-                    error = %error,
-                    "Failed to scan legacy OpenCode storage"
-                );
-            }
-        }
-    }
-
-    let database_count = databases.len();
-    for (database, virtual_root) in databases {
-        if !database_modified_since(&database, since_ts) {
+    for (virtual_root, family) in families {
+        let family_changed = since_ts.is_none()
+            || family
+                .legacy_roots
+                .iter()
+                .any(|storage| legacy_storage_modified_since(storage, since_ts))
+            || family
+                .databases
+                .iter()
+                .any(|database| database_modified_since(database, since_ts));
+        if !family_changed {
             continue;
         }
-        match scan_opencode_database(&database, &virtual_root) {
-            Ok(mut conversations) => {
-                for conversation in &mut conversations {
-                    if let Some(id) = &conversation.external_id
-                        && let Some(path) = legacy_paths.get(id)
-                    {
-                        conversation.source_path = path.clone();
+
+        for storage in &family.legacy_roots {
+            match scan_legacy_storage(storage, None) {
+                Ok((conversations, complete)) => {
+                    if !complete {
+                        parse_errors += 1;
+                    }
+                    for conversation in conversations {
+                        merge_conversation(&mut by_session, conversation);
                     }
                 }
-                for conversation in conversations {
-                    merge_conversation(&mut by_session, conversation);
+                Err(error) => {
+                    parse_errors += 1;
+                    tracing::warn!(
+                        agent = Agent::OpenCode.slug(),
+                        root = %storage.display(),
+                        error = %error,
+                        "Failed to scan legacy OpenCode storage"
+                    );
                 }
             }
-            Err(error) => {
-                parse_errors += 1;
-                tracing::debug!(
-                    agent = Agent::OpenCode.slug(),
-                    database = %database.display(),
-                    error = %error,
-                    "Skipping unsupported OpenCode database"
-                );
+        }
+
+        for database in family.databases {
+            match scan_opencode_database(&database, &virtual_root) {
+                Ok(mut conversations) => {
+                    for conversation in &mut conversations {
+                        if let Some(id) = &conversation.external_id
+                            && let Some(path) = legacy_paths.get(id)
+                        {
+                            conversation.source_path = path.clone();
+                        }
+                    }
+                    for conversation in conversations {
+                        merge_conversation(&mut by_session, conversation);
+                    }
+                }
+                Err(error) => {
+                    parse_errors += 1;
+                    tracing::debug!(
+                        agent = Agent::OpenCode.slug(),
+                        database = %database.display(),
+                        error = %error,
+                        "Skipping unsupported OpenCode database"
+                    );
+                }
             }
         }
     }
@@ -236,13 +273,24 @@ fn scan_opencode_roots(roots: &[PathBuf], since_ts: Option<i64>) -> Result<Vec<C
         parse_errors,
         "Completed OpenCode session scan"
     );
-    Ok(conversations)
+    Ok(ConnectorScan::new(conversations, parse_errors == 0))
 }
 
-fn merge_conversation(
-    conversations: &mut HashMap<String, Conversation>,
-    mut candidate: Conversation,
-) {
+fn legacy_storage_modified_since(storage: &Path, since_ts: Option<i64>) -> bool {
+    if since_ts.is_none() {
+        return true;
+    }
+    for entry in WalkDir::new(storage).follow_links(true) {
+        match entry {
+            Ok(entry) if file_modified_since(entry.path(), since_ts) => return true,
+            Ok(_) => {}
+            Err(_) => return true,
+        }
+    }
+    false
+}
+
+fn merge_conversation(conversations: &mut HashMap<String, Conversation>, candidate: Conversation) {
     let Some(id) = candidate.external_id.clone() else {
         return;
     };
@@ -251,29 +299,231 @@ fn merge_conversation(
         return;
     };
 
-    let existing_score = (
-        existing
-            .ended_at
-            .or(existing.started_at)
-            .unwrap_or_default(),
-        existing.messages.len(),
-    );
-    let candidate_score = (
-        candidate
-            .ended_at
-            .or(candidate.started_at)
-            .unwrap_or_default(),
-        candidate.messages.len(),
-    );
-    if candidate_score > existing_score {
-        if existing.source_path.try_exists().unwrap_or(false) {
-            candidate.source_path = existing.source_path.clone();
-        } else if !candidate.source_path.try_exists().unwrap_or(false) {
-            candidate.source_path =
-                std::cmp::min(existing.source_path.clone(), candidate.source_path.clone());
-        }
-        *existing = candidate;
+    existing.source_path = canonical_source_path(&existing.source_path, &candidate.source_path);
+    existing.source_files.extend(candidate.source_files);
+    normalize_source_files(&mut existing.source_files);
+
+    existing.started_at = match (existing.started_at, candidate.started_at) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (left, right) => left.or(right),
+    };
+    existing.ended_at = match (existing.ended_at, candidate.ended_at) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (left, right) => left.or(right),
+    };
+    existing.title = preferred_text(existing.title.take(), candidate.title);
+    existing.workspace = preferred_path(existing.workspace.take(), candidate.workspace);
+
+    existing.messages.extend(candidate.messages);
+    normalize_messages(&mut existing.messages);
+    existing.usage.extend(candidate.usage);
+    normalize_usage(&mut existing.usage);
+    existing.source_fingerprint = conversation_fingerprint(existing);
+}
+
+fn canonical_source_path(left: &Path, right: &Path) -> PathBuf {
+    let left_exists = left.try_exists().unwrap_or(false);
+    let right_exists = right.try_exists().unwrap_or(false);
+    match (left_exists, right_exists) {
+        (true, false) => left.to_path_buf(),
+        (false, true) => right.to_path_buf(),
+        _ => std::cmp::min(left.to_path_buf(), right.to_path_buf()),
     }
+}
+
+fn preferred_text(left: Option<String>, right: Option<String>) -> Option<String> {
+    [left, right]
+        .into_iter()
+        .flatten()
+        .filter(|value| !value.trim().is_empty())
+        .max_by(|left, right| (left.len(), left).cmp(&(right.len(), right)))
+}
+
+fn preferred_path(left: Option<PathBuf>, right: Option<PathBuf>) -> Option<PathBuf> {
+    [left, right].into_iter().flatten().max_by(|left, right| {
+        let left = left.to_string_lossy();
+        let right = right.to_string_lossy();
+        (left.len(), left.as_ref()).cmp(&(right.len(), right.as_ref()))
+    })
+}
+
+fn normalize_source_files(source_files: &mut Vec<SourceFile>) {
+    source_files.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| right.mtime.cmp(&left.mtime))
+            .then_with(|| right.size.cmp(&left.size))
+    });
+    source_files.dedup_by(|left, right| left.path == right.path);
+}
+
+fn normalize_messages(messages: &mut Vec<Message>) {
+    messages.sort_by(|left, right| {
+        (
+            left.timestamp,
+            left.role.as_str(),
+            left.model.as_deref(),
+            left.content.as_str(),
+        )
+            .cmp(&(
+                right.timestamp,
+                right.role.as_str(),
+                right.model.as_deref(),
+                right.content.as_str(),
+            ))
+    });
+    messages.dedup_by(|left, right| {
+        left.timestamp == right.timestamp
+            && left.role == right.role
+            && left.model == right.model
+            && left.content == right.content
+    });
+    for (index, message) in messages.iter_mut().enumerate() {
+        message.idx = index;
+    }
+}
+
+fn normalize_usage(usage: &mut Vec<UsageRecord>) {
+    let mut identified: HashMap<String, UsageRecord> = HashMap::new();
+    let mut anonymous = Vec::new();
+    for record in usage.drain(..) {
+        if let Some(identity) = record
+            .source_event_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|identity| !identity.is_empty())
+        {
+            identified
+                .entry(identity.to_string())
+                .and_modify(|existing| merge_duplicate_usage(existing, &record))
+                .or_insert(record);
+        } else if !anonymous
+            .iter()
+            .any(|existing| usage_equal(existing, &record))
+        {
+            anonymous.push(record);
+        }
+    }
+    usage.extend(identified.into_values());
+    usage.extend(anonymous);
+    usage.sort_by(usage_cmp);
+}
+
+fn merge_duplicate_usage(existing: &mut UsageRecord, candidate: &UsageRecord) {
+    existing.timestamp = match (existing.timestamp, candidate.timestamp) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (left, right) => left.or(right),
+    };
+    existing.provider = preferred_text(existing.provider.take(), candidate.provider.clone());
+    existing.model = preferred_text(existing.model.take(), candidate.model.clone());
+    existing.api_calls = existing.api_calls.max(candidate.api_calls);
+    existing.input_tokens = existing.input_tokens.max(candidate.input_tokens);
+    existing.output_tokens = existing.output_tokens.max(candidate.output_tokens);
+    existing.cache_read_tokens = existing.cache_read_tokens.max(candidate.cache_read_tokens);
+    existing.cache_write_tokens = existing
+        .cache_write_tokens
+        .max(candidate.cache_write_tokens);
+    existing.reasoning_tokens = existing.reasoning_tokens.max(candidate.reasoning_tokens);
+    let merged_component_total = existing
+        .input_tokens
+        .saturating_add(existing.output_tokens)
+        .saturating_add(existing.cache_read_tokens)
+        .saturating_add(existing.cache_write_tokens);
+    existing.total_tokens = existing
+        .total_tokens
+        .max(candidate.total_tokens)
+        .max(merged_component_total);
+    existing.actual_cost_usd = preferred_cost(existing.actual_cost_usd, candidate.actual_cost_usd);
+    existing.estimated_cost_usd =
+        preferred_cost(existing.estimated_cost_usd, candidate.estimated_cost_usd);
+}
+
+fn preferred_cost(left: Option<f64>, right: Option<f64>) -> Option<f64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(if left.total_cmp(&right).is_ge() {
+            left
+        } else {
+            right
+        }),
+        (left, right) => left.or(right),
+    }
+}
+
+fn usage_equal(left: &UsageRecord, right: &UsageRecord) -> bool {
+    left.timestamp == right.timestamp
+        && left.provider == right.provider
+        && left.model == right.model
+        && left.api_calls == right.api_calls
+        && left.input_tokens == right.input_tokens
+        && left.output_tokens == right.output_tokens
+        && left.cache_read_tokens == right.cache_read_tokens
+        && left.cache_write_tokens == right.cache_write_tokens
+        && left.reasoning_tokens == right.reasoning_tokens
+        && left.total_tokens == right.total_tokens
+        && option_f64_bits(left.actual_cost_usd) == option_f64_bits(right.actual_cost_usd)
+        && option_f64_bits(left.estimated_cost_usd) == option_f64_bits(right.estimated_cost_usd)
+}
+
+fn option_f64_bits(value: Option<f64>) -> Option<u64> {
+    value.map(f64::to_bits)
+}
+
+fn usage_cmp(left: &UsageRecord, right: &UsageRecord) -> std::cmp::Ordering {
+    (
+        (left.timestamp.is_none(), left.timestamp.unwrap_or_default()),
+        left.source_event_id.as_deref(),
+        left.provider.as_deref(),
+        left.model.as_deref(),
+        (
+            left.api_calls,
+            left.input_tokens,
+            left.output_tokens,
+            left.cache_read_tokens,
+            left.cache_write_tokens,
+            left.reasoning_tokens,
+            left.total_tokens,
+        ),
+        option_f64_bits(left.actual_cost_usd),
+        option_f64_bits(left.estimated_cost_usd),
+    )
+        .cmp(&(
+            (
+                right.timestamp.is_none(),
+                right.timestamp.unwrap_or_default(),
+            ),
+            right.source_event_id.as_deref(),
+            right.provider.as_deref(),
+            right.model.as_deref(),
+            (
+                right.api_calls,
+                right.input_tokens,
+                right.output_tokens,
+                right.cache_read_tokens,
+                right.cache_write_tokens,
+                right.reasoning_tokens,
+                right.total_tokens,
+            ),
+            option_f64_bits(right.actual_cost_usd),
+            option_f64_bits(right.estimated_cost_usd),
+        ))
+}
+
+fn conversation_fingerprint(conversation: &Conversation) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(format!("opencode:{PARSER_REVISION}\0").as_bytes());
+    hasher.update(
+        &serde_json::to_vec(&(
+            &conversation.external_id,
+            &conversation.title,
+            &conversation.workspace,
+            conversation.started_at,
+            conversation.ended_at,
+            &conversation.messages,
+            &conversation.usage,
+        ))
+        .expect("OpenCode normalized conversations are serializable"),
+    );
+    hasher.finalize().to_hex().to_string()
 }
 
 fn legacy_storage_root(root: &Path) -> Option<PathBuf> {
@@ -312,16 +562,20 @@ fn inventory_legacy_sources(roots: &[PathBuf]) -> HashMap<String, PathBuf> {
     sources
 }
 
-fn scan_legacy_storage(storage_root: &Path, since_ts: Option<i64>) -> Result<Vec<Conversation>> {
+fn scan_legacy_storage(
+    storage_root: &Path,
+    since_ts: Option<i64>,
+) -> Result<(Vec<Conversation>, bool)> {
     let session_dir = storage_root.join("session");
     if !session_dir.is_dir() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), true));
     }
-    let sessions = load_sessions(&session_dir, since_ts)?;
+    let (sessions, sessions_complete) = load_sessions_with_status(&session_dir, since_ts)?;
     if sessions.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), sessions_complete));
     }
-    let (message_map, session_messages) = load_messages(&storage_root.join("message"), &sessions)?;
+    let (message_map, session_messages, messages_complete) =
+        load_messages_with_status(&storage_root.join("message"), &sessions)?;
     let part_dir = storage_root.join("part");
     let session_sources: HashMap<String, Vec<SourceFile>> = sessions
         .iter()
@@ -339,88 +593,115 @@ fn scan_legacy_storage(storage_root: &Path, since_ts: Option<i64>) -> Result<Vec
         })
         .collect();
 
-    Ok(sessions
+    let conversations = sessions
         .into_par_iter()
-        .filter_map(|(session_id, session)| {
-            let mut messages = Vec::new();
-            let mut all_source_files = session_sources
-                .get(&session_id)
-                .cloned()
-                .unwrap_or_default();
-            for message_id in session_messages.get(&session_id).into_iter().flatten() {
-                let Some(metadata) = message_map.get(message_id) else {
-                    continue;
-                };
-                let message_part_dir = part_dir.join(message_id);
-                let Ok(parts) = load_parts(&message_part_dir) else {
-                    continue;
-                };
-                for part in parts {
-                    all_source_files.push(part.source_file.clone());
-                    let content = match part.part_type.as_str() {
-                        "text" => part
-                            .data
-                            .get("text")
-                            .and_then(Value::as_str)
-                            .map(ToOwned::to_owned),
-                        "subtask" => part
-                            .data
-                            .get("prompt")
-                            .and_then(Value::as_str)
-                            .map(|prompt| format!("[Subtask] {prompt}")),
-                        "tool" => part
-                            .data
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .map(|name| format!("[Tool: {name}]"))
-                            .or_else(|| Some("[Tool: unknown]".to_string())),
-                        _ => None,
+        .map(
+            |(session_id, session)| -> Result<(Option<Conversation>, bool)> {
+                let mut complete = true;
+                let mut messages = Vec::new();
+                let usage = session_messages
+                    .get(&session_id)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|message_id| message_map.get(message_id))
+                    .filter_map(|metadata| metadata.usage.clone())
+                    .collect::<Vec<_>>();
+                let mut all_source_files = session_sources
+                    .get(&session_id)
+                    .cloned()
+                    .unwrap_or_default();
+                for message_id in session_messages.get(&session_id).into_iter().flatten() {
+                    let Some(metadata) = message_map.get(message_id) else {
+                        continue;
                     };
-                    if let Some(content) = content.filter(|content| !content.trim().is_empty()) {
-                        messages.push(Message {
-                            idx: messages.len(),
-                            role: metadata.role.clone(),
-                            content,
-                            timestamp: metadata.created_at,
-                            model: metadata.model.clone(),
-                        });
+                    let message_part_dir = part_dir.join(message_id);
+                    let (parts, parts_complete) = load_parts_with_status(&message_part_dir)?;
+                    complete &= parts_complete;
+                    for part in parts {
+                        all_source_files.push(part.source_file.clone());
+                        let content = match part.part_type.as_str() {
+                            "text" => part
+                                .data
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .map(ToOwned::to_owned),
+                            "subtask" => part
+                                .data
+                                .get("prompt")
+                                .and_then(Value::as_str)
+                                .map(|prompt| format!("[Subtask] {prompt}")),
+                            "tool" => part
+                                .data
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .map(|name| format!("[Tool: {name}]"))
+                                .or_else(|| Some("[Tool: unknown]".to_string())),
+                            _ => None,
+                        };
+                        if let Some(content) = content.filter(|content| !content.trim().is_empty())
+                        {
+                            messages.push(Message {
+                                idx: messages.len(),
+                                role: metadata.role.clone(),
+                                content,
+                                timestamp: metadata.created_at,
+                                model: metadata.model.clone(),
+                            });
+                        }
                     }
                 }
-            }
-            if messages.is_empty() {
-                return None;
-            }
-            messages.sort_by_key(|message| message.timestamp);
-            for (index, message) in messages.iter_mut().enumerate() {
-                message.idx = index;
-            }
-            let title = session.title.clone().or_else(|| derive_title(&messages));
-            let started_at = messages
-                .iter()
-                .filter_map(|message| message.timestamp)
-                .min()
-                .or(session.created_at);
-            let ended_at = messages
-                .iter()
-                .filter_map(|message| message.timestamp)
-                .max()
-                .or(session.updated_at);
-            all_source_files.sort_by(|left, right| left.path.cmp(&right.path));
-            let fingerprint = source_fingerprint(&all_source_files);
-            Some(Conversation {
-                agent: Agent::OpenCode,
-                external_id: Some(session_id),
-                title,
-                workspace: session.directory,
-                source_path: session.source_file.path,
-                source_files: all_source_files,
-                source_fingerprint: fingerprint,
-                started_at,
-                ended_at,
-                messages,
-            })
-        })
-        .collect())
+                if messages.is_empty() && usage.is_empty() {
+                    return Ok((None, complete));
+                }
+                messages.sort_by_key(|message| message.timestamp);
+                for (index, message) in messages.iter_mut().enumerate() {
+                    message.idx = index;
+                }
+                let title = session.title.clone().or_else(|| derive_title(&messages));
+                let started_at = messages
+                    .iter()
+                    .filter_map(|message| message.timestamp)
+                    .min()
+                    .or(session.created_at);
+                let ended_at = messages
+                    .iter()
+                    .filter_map(|message| message.timestamp)
+                    .max()
+                    .or(session.updated_at);
+                all_source_files.sort_by(|left, right| left.path.cmp(&right.path));
+                let fingerprint = format!(
+                    "opencode-v{PARSER_REVISION}:{}",
+                    source_fingerprint(&all_source_files)
+                );
+                Ok((
+                    Some(Conversation {
+                        agent: Agent::OpenCode,
+                        external_id: Some(session_id),
+                        title,
+                        workspace: session.directory,
+                        source_path: session.source_file.path,
+                        source_files: all_source_files,
+                        source_fingerprint: fingerprint,
+                        started_at,
+                        ended_at,
+                        messages,
+                        usage,
+                    }),
+                    complete,
+                ))
+            },
+        )
+        .collect::<Result<Vec<_>>>()?;
+    let complete = sessions_complete
+        && messages_complete
+        && conversations.iter().all(|(_, complete)| *complete);
+    Ok((
+        conversations
+            .into_iter()
+            .filter_map(|(conversation, _)| conversation)
+            .collect(),
+        complete,
+    ))
 }
 
 fn discover_databases(root: &Path) -> Vec<PathBuf> {
@@ -499,6 +780,10 @@ fn table_columns(connection: &Connection, table: &str) -> Result<HashSet<String>
         .collect::<std::result::Result<HashSet<_>, _>>()?)
 }
 
+fn optional_table_column<'a>(columns: &HashSet<String>, name: &'a str) -> &'a str {
+    if columns.contains(name) { name } else { "NULL" }
+}
+
 fn scan_opencode_database(database: &Path, virtual_root: &Path) -> Result<Vec<Conversation>> {
     let connection = open_read_only(database)?;
     if !table_exists(&connection, "session")? {
@@ -515,8 +800,16 @@ fn scan_opencode_database(database: &Path, virtual_root: &Path) -> Result<Vec<Co
     } else {
         "NULL"
     };
+    let cost = optional_table_column(&columns, "cost");
+    let tokens_input = optional_table_column(&columns, "tokens_input");
+    let tokens_output = optional_table_column(&columns, "tokens_output");
+    let tokens_reasoning = optional_table_column(&columns, "tokens_reasoning");
+    let tokens_cache_read = optional_table_column(&columns, "tokens_cache_read");
+    let tokens_cache_write = optional_table_column(&columns, "tokens_cache_write");
     let query = format!(
-        "SELECT id, directory, title, time_created, time_updated, {model} \
+        "SELECT id, directory, title, time_created, time_updated, {model}, \
+                {cost}, {tokens_input}, {tokens_output}, {tokens_reasoning}, \
+                {tokens_cache_read}, {tokens_cache_write} \
          FROM session ORDER BY time_created, id"
     );
     let has_v1 = table_exists(&connection, "message")? && table_exists(&connection, "part")?;
@@ -531,25 +824,36 @@ fn scan_opencode_database(database: &Path, virtual_root: &Path) -> Result<Vec<Co
             created_at: row.get(3)?,
             updated_at: row.get(4)?,
             model: row.get(5)?,
+            cost: row.get(6)?,
+            input_tokens: row.get(7)?,
+            output_tokens: row.get(8)?,
+            reasoning_tokens: row.get(9)?,
+            cache_read_tokens: row.get(10)?,
+            cache_write_tokens: row.get(11)?,
         })
     })?;
 
     let mut conversations = Vec::new();
     for row in rows {
         let session = row?;
-        let mut messages = if has_v2 {
-            load_v2_messages(&connection, &session)?
-        } else {
-            Vec::new()
-        };
-        if messages.is_empty() && has_v1 {
-            messages = load_v1_messages(&connection, &session)?;
+        let mut messages = Vec::new();
+        let mut usage = Vec::new();
+        if has_v1 {
+            let (v1_messages, v1_usage) = load_v1_messages(&connection, &session)?;
+            messages.extend(v1_messages);
+            usage.extend(v1_usage);
         }
-        if messages.is_empty() {
+        if has_v2 {
+            let (v2_messages, v2_usage) = load_v2_messages(&connection, &session)?;
+            messages.extend(v2_messages);
+            usage.extend(v2_usage);
+        }
+        normalize_messages(&mut messages);
+        normalize_usage(&mut usage);
+        append_session_usage_residual(&session, &mut usage);
+        normalize_usage(&mut usage);
+        if messages.is_empty() && usage.is_empty() {
             continue;
-        }
-        for (index, message) in messages.iter_mut().enumerate() {
-            message.idx = index;
         }
         let title = Some(session.title.clone())
             .filter(|title| !title.trim().is_empty())
@@ -564,8 +868,14 @@ fn scan_opencode_database(database: &Path, virtual_root: &Path) -> Result<Vec<Co
             .filter_map(|message| message.timestamp)
             .max()
             .or(Some(session.updated_at));
-        let fingerprint =
-            database_fingerprint(&session, title.as_deref(), started_at, ended_at, &messages)?;
+        let fingerprint = database_fingerprint(
+            &session,
+            title.as_deref(),
+            started_at,
+            ended_at,
+            &messages,
+            &usage,
+        )?;
         conversations.push(Conversation {
             agent: Agent::OpenCode,
             external_id: Some(session.id.clone()),
@@ -577,6 +887,7 @@ fn scan_opencode_database(database: &Path, virtual_root: &Path) -> Result<Vec<Co
             started_at,
             ended_at,
             messages,
+            usage,
         });
     }
     Ok(conversations)
@@ -589,25 +900,96 @@ struct DatabaseSession {
     created_at: i64,
     updated_at: i64,
     model: Option<String>,
+    cost: Option<f64>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    reasoning_tokens: Option<i64>,
+    cache_read_tokens: Option<i64>,
+    cache_write_tokens: Option<i64>,
 }
 
-fn load_v1_messages(connection: &Connection, session: &DatabaseSession) -> Result<Vec<Message>> {
+fn append_session_usage_residual(session: &DatabaseSession, usage: &mut Vec<UsageRecord>) {
+    let nonnegative = |value: Option<i64>| value.unwrap_or_default().max(0) as u64;
+    let input = nonnegative(session.input_tokens);
+    let visible_output = nonnegative(session.output_tokens);
+    let reasoning = nonnegative(session.reasoning_tokens);
+    let output = visible_output.saturating_add(reasoning);
+    let cache_read = nonnegative(session.cache_read_tokens);
+    let cache_write = nonnegative(session.cache_write_tokens);
+    let aggregate_total = input
+        .saturating_add(output)
+        .saturating_add(cache_read)
+        .saturating_add(cache_write);
+    let aggregate_cost = session.cost.filter(|cost| cost.is_finite() && *cost > 0.0);
+    if aggregate_total == 0 && aggregate_cost.is_none() {
+        return;
+    }
+
+    let sum = |value: fn(&UsageRecord) -> u64| {
+        usage
+            .iter()
+            .fold(0_u64, |total, row| total.saturating_add(value(row)))
+    };
+    let projected_input = sum(|row| row.input_tokens);
+    let projected_output = sum(|row| row.output_tokens);
+    let projected_reasoning = sum(|row| row.reasoning_tokens);
+    let projected_cache_read = sum(|row| row.cache_read_tokens);
+    let projected_cache_write = sum(|row| row.cache_write_tokens);
+    let projected_total = sum(|row| row.total_tokens);
+    let projected_cost = usage
+        .iter()
+        .filter_map(|row| row.actual_cost_usd.or(row.estimated_cost_usd))
+        .filter(|cost| cost.is_finite() && *cost > 0.0)
+        .sum::<f64>();
+
+    let residual_cost = aggregate_cost
+        .map(|cost| (cost - projected_cost).max(0.0))
+        .filter(|cost| *cost > f64::EPSILON);
+    let residual = UsageRecord {
+        // These are authoritative session aggregates, not event-exact rows.
+        timestamp: None,
+        provider: parse_provider(session.model.as_deref()),
+        model: parse_model(session.model.as_deref()),
+        source_event_id: Some(format!("opencode-session-aggregate:{}", session.id)),
+        api_calls: 0,
+        input_tokens: input.saturating_sub(projected_input),
+        output_tokens: output.saturating_sub(projected_output),
+        cache_read_tokens: cache_read.saturating_sub(projected_cache_read),
+        cache_write_tokens: cache_write.saturating_sub(projected_cache_write),
+        reasoning_tokens: reasoning.saturating_sub(projected_reasoning),
+        total_tokens: aggregate_total.saturating_sub(projected_total),
+        actual_cost_usd: None,
+        estimated_cost_usd: residual_cost,
+    };
+    if residual.has_usage() {
+        usage.push(residual);
+    }
+}
+
+fn load_v1_messages(
+    connection: &Connection,
+    session: &DatabaseSession,
+) -> Result<(Vec<Message>, Vec<UsageRecord>)> {
     let mut statement = connection.prepare(
-        "SELECT m.time_created, m.data, p.data \
+        "SELECT m.id, m.time_created, m.data, p.data \
          FROM message m LEFT JOIN part p ON p.message_id = m.id \
          WHERE m.session_id = ? ORDER BY m.time_created, m.id, p.time_created, p.id",
     )?;
     let rows = statement.query_map([&session.id], |row| {
         Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Option<String>>(2)?,
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
         ))
     })?;
     let fallback_model = parse_model(session.model.as_deref());
+    let fallback_provider = parse_provider(session.model.as_deref());
     let mut messages = Vec::new();
+    let mut usage = Vec::new();
+    let mut usage_messages = HashSet::new();
     for row in rows {
-        let (created_at, message_json, part_json) = row?;
+        let (message_id, created_at, message_json, part_json) = row?;
         let message_data: Value = serde_json::from_str(&message_json)?;
         let role = message_data
             .get("role")
@@ -619,6 +1001,18 @@ fn load_v1_messages(connection: &Connection, session: &DatabaseSession) -> Resul
             .pointer("/time/created")
             .and_then(Value::as_i64)
             .or(Some(created_at));
+        if role == Role::Assistant
+            && usage_messages.insert(message_id.clone())
+            && let Some(record) = opencode_usage_record(
+                &message_data,
+                timestamp,
+                fallback_provider.clone(),
+                fallback_model.clone(),
+                Some(opencode_usage_event_id(&session.id, &message_id)),
+            )
+        {
+            usage.push(record);
+        }
         let Some(part_json) = part_json else {
             continue;
         };
@@ -650,25 +1044,31 @@ fn load_v1_messages(connection: &Connection, session: &DatabaseSession) -> Resul
             });
         }
     }
-    Ok(messages)
+    Ok((messages, usage))
 }
 
-fn load_v2_messages(connection: &Connection, session: &DatabaseSession) -> Result<Vec<Message>> {
+fn load_v2_messages(
+    connection: &Connection,
+    session: &DatabaseSession,
+) -> Result<(Vec<Message>, Vec<UsageRecord>)> {
     let mut statement = connection.prepare(
-        "SELECT type, time_created, data FROM session_message \
+        "SELECT id, type, time_created, data FROM session_message \
          WHERE session_id = ? ORDER BY seq, id",
     )?;
     let rows = statement.query_map([&session.id], |row| {
         Ok((
             row.get::<_, String>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, String>(2)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
         ))
     })?;
     let fallback_model = parse_model(session.model.as_deref());
+    let fallback_provider = parse_provider(session.model.as_deref());
     let mut messages = Vec::new();
+    let mut usage = Vec::new();
     for row in rows {
-        let (message_type, created_at, raw_data) = row?;
+        let (message_id, message_type, created_at, raw_data) = row?;
         let data: Value = serde_json::from_str(&raw_data)?;
         let timestamp = data
             .pointer("/time/created")
@@ -737,6 +1137,15 @@ fn load_v2_messages(connection: &Connection, session: &DatabaseSession) -> Resul
             }
             "assistant" => {
                 let model = message_model(&data).or_else(|| fallback_model.clone());
+                if let Some(record) = opencode_usage_record(
+                    &data,
+                    timestamp,
+                    fallback_provider.clone(),
+                    fallback_model.clone(),
+                    Some(opencode_usage_event_id(&session.id, &message_id)),
+                ) {
+                    usage.push(record);
+                }
                 let before = messages.len();
                 for content in data
                     .get("content")
@@ -800,7 +1209,7 @@ fn load_v2_messages(connection: &Connection, session: &DatabaseSession) -> Resul
             _ => {}
         }
     }
-    Ok(messages)
+    Ok((messages, usage))
 }
 
 fn push_message(
@@ -925,6 +1334,53 @@ fn json_value_text(value: &Value) -> String {
         .unwrap_or_else(|| value.to_string())
 }
 
+fn opencode_usage_record(
+    data: &Value,
+    timestamp: Option<i64>,
+    fallback_provider: Option<String>,
+    fallback_model: Option<String>,
+    source_event_id: Option<String>,
+) -> Option<UsageRecord> {
+    let tokens = data.get("tokens").or_else(|| data.get("usage"))?;
+    let input = json_u64(tokens, &["/input", "/input_tokens"]);
+    let visible_output = json_u64(tokens, &["/output", "/output_tokens"]);
+    let reasoning = json_u64(tokens, &["/reasoning", "/reasoning_tokens"]);
+    let output = visible_output.saturating_add(reasoning);
+    let cache_read = json_u64(tokens, &["/cache/read", "/cacheRead"]);
+    let cache_write = json_u64(tokens, &["/cache/write", "/cacheWrite"]);
+    let record = UsageRecord {
+        timestamp,
+        provider: data
+            .pointer("/model/providerID")
+            .or_else(|| data.get("providerID"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or(fallback_provider),
+        model: message_model(data).or(fallback_model),
+        source_event_id,
+        api_calls: 1,
+        input_tokens: input,
+        output_tokens: output,
+        cache_read_tokens: cache_read,
+        cache_write_tokens: cache_write,
+        reasoning_tokens: reasoning,
+        total_tokens: normalized_token_total(
+            json_u64(tokens, &["/total", "/totalTokens", "/total_tokens"]),
+            input,
+            output,
+            cache_read,
+            cache_write,
+        ),
+        actual_cost_usd: None,
+        estimated_cost_usd: json_f64(data, &["/cost", "/cost/total", "/cost_usd"]),
+    };
+    record.has_usage().then_some(record)
+}
+
+fn opencode_usage_event_id(session_id: &str, message_id: &str) -> String {
+    format!("opencode-message:{session_id}:{message_id}")
+}
+
 fn parse_model(raw: Option<&str>) -> Option<String> {
     let raw = raw?.trim();
     if raw.is_empty() {
@@ -934,6 +1390,20 @@ fn parse_model(raw: Option<&str>) -> Option<String> {
         .ok()
         .and_then(|value| message_model(&value))
         .or_else(|| Some(raw.to_string()))
+}
+
+fn parse_provider(raw: Option<&str>) -> Option<String> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    serde_json::from_str::<Value>(raw).ok().and_then(|value| {
+        value
+            .get("providerID")
+            .or_else(|| value.pointer("/model/providerID"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    })
 }
 
 fn message_model(data: &Value) -> Option<String> {
@@ -962,9 +1432,10 @@ fn database_fingerprint(
     started_at: Option<i64>,
     ended_at: Option<i64>,
     messages: &[Message],
+    usage: &[UsageRecord],
 ) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"opencode:2\0");
+    hasher.update(format!("opencode:{PARSER_REVISION}\0").as_bytes());
     hasher.update(
         serde_json::to_string(&(
             &session.id,
@@ -973,6 +1444,7 @@ fn database_fingerprint(
             started_at,
             ended_at,
             messages,
+            usage,
         ))?
         .as_bytes(),
     );
@@ -997,6 +1469,7 @@ struct MessageMeta {
     role: Role,
     created_at: Option<i64>,
     model: Option<String>,
+    usage: Option<UsageRecord>,
     source_file: SourceFile,
 }
 
@@ -1009,20 +1482,42 @@ struct PartMeta {
     source_file: SourceFile,
 }
 
+#[cfg(test)]
 fn load_sessions(
     session_dir: &Path,
     since_ts: Option<i64>,
 ) -> Result<HashMap<String, SessionMeta>> {
-    let mut sessions = HashMap::new();
+    Ok(load_sessions_with_status(session_dir, since_ts)?.0)
+}
 
-    for entry in WalkDir::new(session_dir)
-        .follow_links(true)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_type().is_file() && e.path().extension().map(|e| e == "json").unwrap_or(false)
-        })
-    {
+fn load_sessions_with_status(
+    session_dir: &Path,
+    since_ts: Option<i64>,
+) -> Result<(HashMap<String, SessionMeta>, bool)> {
+    let mut sessions = HashMap::new();
+    let mut complete = true;
+
+    for entry in WalkDir::new(session_dir).follow_links(true) {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                complete = false;
+                tracing::warn!(
+                    root = %session_dir.display(),
+                    error = %error,
+                    "Failed to traverse OpenCode session storage"
+                );
+                continue;
+            }
+        };
+        if !entry.file_type().is_file()
+            || entry
+                .path()
+                .extension()
+                .is_none_or(|extension| extension != "json")
+        {
+            continue;
+        }
         let path = entry.path();
 
         if !file_modified_since(path, since_ts) {
@@ -1036,11 +1531,12 @@ fn load_sessions(
             Ok(None) => {}
             Err(e) => {
                 tracing::warn!("Failed to parse session file {}: {}", path.display(), e);
+                complete = false;
             }
         }
     }
 
-    Ok(sessions)
+    Ok((sessions, complete))
 }
 
 #[derive(Deserialize)]
@@ -1085,12 +1581,19 @@ fn parse_session_file(path: &Path) -> Result<Option<SessionMeta>> {
     }))
 }
 
-fn load_messages(
+type MessageLoad = (
+    HashMap<String, MessageMeta>,
+    HashMap<String, Vec<String>>,
+    bool,
+);
+
+fn load_messages_with_status(
     message_dir: &Path,
     sessions: &HashMap<String, SessionMeta>,
-) -> Result<(HashMap<String, MessageMeta>, HashMap<String, Vec<String>>)> {
+) -> Result<MessageLoad> {
     let mut message_map = HashMap::new();
     let mut session_messages: HashMap<String, Vec<String>> = HashMap::new();
+    let mut complete = true;
 
     // Only scan message directories for sessions we know about
     for session_id in sessions.keys() {
@@ -1119,12 +1622,13 @@ fn load_messages(
                 Ok(None) => {}
                 Err(e) => {
                     tracing::warn!("Failed to parse message file {}: {}", path.display(), e);
+                    complete = false;
                 }
             }
         }
     }
 
-    Ok((message_map, session_messages))
+    Ok((message_map, session_messages, complete))
 }
 
 #[derive(Deserialize)]
@@ -1135,8 +1639,6 @@ struct MessageJson {
     role: String,
     #[serde(default)]
     time: Option<MessageTime>,
-    #[serde(default)]
-    model: Option<MessageModel>,
 }
 
 #[derive(Deserialize)]
@@ -1145,17 +1647,13 @@ struct MessageTime {
     created: Option<i64>,
 }
 
-#[derive(Deserialize)]
-struct MessageModel {
-    #[serde(default, rename = "modelID")]
-    model_id: Option<String>,
-}
-
 fn parse_message_file(path: &Path) -> Result<Option<MessageMeta>> {
     let content =
         fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
 
-    let data: MessageJson = serde_json::from_str(&content)
+    let raw: Value = serde_json::from_str(&content)
+        .with_context(|| format!("Failed to parse {}", path.display()))?;
+    let data: MessageJson = serde_json::from_value(raw.clone())
         .with_context(|| format!("Failed to parse {}", path.display()))?;
 
     let source_file = source_file(path)
@@ -1169,18 +1667,43 @@ fn parse_message_file(path: &Path) -> Result<Option<MessageMeta>> {
         _ => Role::User, // Default to user for unknown roles
     };
 
+    let timestamp = data.time.as_ref().and_then(|t| t.created);
+    let model = message_model(&raw);
+    let usage = (role == Role::Assistant)
+        .then(|| {
+            opencode_usage_record(
+                &raw,
+                timestamp,
+                None,
+                model.clone(),
+                Some(opencode_usage_event_id(&data.session_id, &data.id)),
+            )
+        })
+        .flatten();
+
     Ok(Some(MessageMeta {
         id: data.id,
         session_id: data.session_id,
         role,
-        created_at: data.time.as_ref().and_then(|t| t.created),
-        model: data.model.and_then(|m| m.model_id),
+        created_at: timestamp,
+        model,
+        usage,
         source_file,
     }))
 }
 
+#[cfg(test)]
 fn load_parts(part_dir: &Path) -> Result<Vec<PartMeta>> {
+    Ok(load_parts_with_status(part_dir)?.0)
+}
+
+fn load_parts_with_status(part_dir: &Path) -> Result<(Vec<PartMeta>, bool)> {
     let mut parts = Vec::new();
+    let mut complete = true;
+
+    if !part_dir.is_dir() {
+        return Ok((parts, true));
+    }
 
     for entry in fs::read_dir(part_dir)? {
         let entry = entry?;
@@ -1197,6 +1720,7 @@ fn load_parts(part_dir: &Path) -> Result<Vec<PartMeta>> {
             Ok(None) => {}
             Err(e) => {
                 tracing::warn!("Failed to parse part file {}: {}", path.display(), e);
+                complete = false;
             }
         }
     }
@@ -1204,7 +1728,7 @@ fn load_parts(part_dir: &Path) -> Result<Vec<PartMeta>> {
     // Sort parts by ID for stable ordering
     parts.sort_by(|a, b| a.id.cmp(&b.id));
 
-    Ok(parts)
+    Ok((parts, complete))
 }
 
 #[derive(Deserialize)]
@@ -1431,6 +1955,46 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_legacy_message_usage_from_top_level_fields() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("msg-usage.json");
+        fs::write(
+            &path,
+            r#"{
+                "id": "msg-usage",
+                "sessionID": "sess1",
+                "role": "assistant",
+                "time": {"created": 1705312800000},
+                "providerID": "openrouter",
+                "modelID": "gpt-test",
+                "tokens": {
+                    "input": 100,
+                    "output": 20,
+                    "reasoning": 5,
+                    "cache": {"read": 30, "write": 10},
+                    "total": 165
+                },
+                "cost": 0.125
+            }"#,
+        )
+        .unwrap();
+
+        let message = parse_message_file(&path).unwrap().unwrap();
+        assert_eq!(message.model.as_deref(), Some("gpt-test"));
+        let usage = message.usage.as_ref().unwrap();
+        assert_eq!(usage.provider.as_deref(), Some("openrouter"));
+        assert_eq!(usage.model.as_deref(), Some("gpt-test"));
+        assert_eq!(usage.api_calls, 1);
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 25);
+        assert_eq!(usage.reasoning_tokens, 5);
+        assert_eq!(usage.cache_read_tokens, 30);
+        assert_eq!(usage.cache_write_tokens, 10);
+        assert_eq!(usage.total_tokens, 165);
+        assert_eq!(usage.estimated_cost_usd, Some(0.125));
+    }
+
+    #[test]
     fn test_parse_message_file_unknown_role() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("msg_unknown.json");
@@ -1567,6 +2131,18 @@ mod tests {
 
         let sessions = load_sessions(dir.path(), None).unwrap();
         assert_eq!(sessions.len(), 1);
+    }
+
+    #[test]
+    fn malformed_legacy_source_marks_scan_incomplete_but_keeps_valid_sessions() {
+        let root = TempDir::new().unwrap();
+        create_opencode_tree(root.path());
+        fs::write(root.path().join("session/proj1/malformed.json"), "NOT JSON").unwrap();
+
+        let scan = scan_opencode_roots(&[root.path().to_path_buf()], None).unwrap();
+        assert!(!scan.complete);
+        assert_eq!(scan.conversations.len(), 1);
+        assert_eq!(scan.conversations[0].external_id.as_deref(), Some("sess1"));
     }
 
     #[test]
@@ -1754,7 +2330,7 @@ mod tests {
                 INSERT INTO session_message VALUES
                     ('u1', 'sqlite-v2', 'user', 1, 1000, 1000, '{"time":{"created":1000},"text":"v2 user text","files":[{"name":"brief.txt","mime":"text/plain","data":"YXR0YWNobWVudCB0ZXh0"}]}'),
                     ('a1', 'sqlite-v2', 'assistant', 2, 2000, 3000,
-                     '{"time":{"created":2000},"model":{"id":"gpt-v2","providerID":"test"},"content":[{"type":"text","text":"v2 assistant text"},{"type":"reasoning","text":"hidden"},{"type":"tool","name":"shell","state":{"status":"completed","input":{"command":"pwd"},"output":"/tmp/v2"}}]}');"#,
+                     '{"time":{"created":2000},"model":{"id":"gpt-v2","providerID":"test"},"tokens":{"input":100,"output":20,"reasoning":5,"cache":{"read":30,"write":10},"total":165},"cost":0.125,"content":[{"type":"text","text":"v2 assistant text"},{"type":"reasoning","text":"hidden"},{"type":"tool","name":"shell","state":{"status":"completed","input":{"command":"pwd"},"output":"/tmp/v2"}}]}');"#,
             )
             .unwrap();
         drop(connection);
@@ -1774,5 +2350,442 @@ mod tests {
         assert_eq!(conversation.messages[1].model.as_deref(), Some("gpt-v2"));
         assert_eq!(conversation.messages[2].role, Role::Tool);
         assert!(!conversation.full_text().contains("hidden"));
+        assert_eq!(conversation.usage.len(), 1);
+        let usage = &conversation.usage[0];
+        assert_eq!(usage.provider.as_deref(), Some("test"));
+        assert_eq!(usage.model.as_deref(), Some("gpt-v2"));
+        assert_eq!(usage.output_tokens, 25);
+        assert_eq!(usage.reasoning_tokens, 5);
+        assert_eq!(usage.total_tokens, 165);
+        assert_eq!(usage.estimated_cost_usd, Some(0.125));
+    }
+
+    #[test]
+    fn v2_usage_only_session_is_preserved() {
+        let root = TempDir::new().unwrap();
+        let connection = Connection::open(root.path().join("usage-only.db")).unwrap();
+        connection
+            .execute_batch(
+                r#"CREATE TABLE session (
+                    id TEXT PRIMARY KEY, directory TEXT NOT NULL, title TEXT NOT NULL,
+                    time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, model TEXT
+                );
+                CREATE TABLE session_message (
+                    id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL,
+                    seq INTEGER NOT NULL, time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL, data TEXT NOT NULL
+                );
+                INSERT INTO session VALUES
+                    ('usage-only', '/tmp/v2', 'Usage only', 1000, 2000, NULL);
+                INSERT INTO session_message VALUES
+                    ('a1', 'usage-only', 'assistant', 1, 1000, 2000,
+                     '{"time":{"created":1000},"model":{"id":"gpt-v2","providerID":"test"},"tokens":{"input":10,"output":5},"content":[]}');"#,
+            )
+            .unwrap();
+        drop(connection);
+        let connector = OpenCodeConnector {
+            storage_root: None,
+            data_root: Some(root.path().to_path_buf()),
+            db_override: None,
+        };
+
+        let conversations = connector.scan(&connector.default_roots(), None).unwrap();
+        assert_eq!(conversations.len(), 1);
+        assert!(conversations[0].messages.is_empty());
+        assert_eq!(conversations[0].usage.len(), 1);
+        assert_eq!(conversations[0].usage[0].total_tokens, 15);
+    }
+
+    #[test]
+    fn v2_session_aggregate_fills_missing_projected_usage() {
+        let root = TempDir::new().unwrap();
+        let connection = Connection::open(root.path().join("aggregate.db")).unwrap();
+        connection
+            .execute_batch(
+                r#"CREATE TABLE session (
+                    id TEXT PRIMARY KEY, directory TEXT NOT NULL, title TEXT NOT NULL,
+                    time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, model TEXT,
+                    cost REAL NOT NULL DEFAULT 0,
+                    tokens_input INTEGER NOT NULL DEFAULT 0,
+                    tokens_output INTEGER NOT NULL DEFAULT 0,
+                    tokens_reasoning INTEGER NOT NULL DEFAULT 0,
+                    tokens_cache_read INTEGER NOT NULL DEFAULT 0,
+                    tokens_cache_write INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE session_message (
+                    id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL,
+                    seq INTEGER NOT NULL, time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL, data TEXT NOT NULL
+                );
+                INSERT INTO session VALUES
+                    ('aggregate', '/tmp/v2', 'Aggregate', 1000, 2000,
+                     '{"id":"gpt-v2","providerID":"test"}',
+                     0.2, 100, 20, 5, 30, 10);
+                INSERT INTO session_message VALUES
+                    ('a1', 'aggregate', 'assistant', 1, 1000, 2000,
+                     '{"time":{"created":1000},"model":{"id":"gpt-v2","providerID":"test"},"tokens":{"input":40,"output":5,"reasoning":2,"cache":{"read":10,"write":0},"total":57},"cost":0.05,"content":[]}');"#,
+            )
+            .unwrap();
+        drop(connection);
+        let connector = OpenCodeConnector {
+            storage_root: None,
+            data_root: Some(root.path().to_path_buf()),
+            db_override: None,
+        };
+
+        let conversations = connector.scan(&connector.default_roots(), None).unwrap();
+        assert_eq!(conversations.len(), 1);
+        let usage = &conversations[0].usage;
+        assert_eq!(usage.len(), 2);
+        assert_eq!(usage.iter().map(|row| row.total_tokens).sum::<u64>(), 165);
+        assert_eq!(usage.iter().map(|row| row.api_calls).sum::<u64>(), 1);
+        assert_eq!(usage[1].timestamp, None);
+        assert_eq!(usage[1].input_tokens, 60);
+        assert_eq!(usage[1].output_tokens, 18);
+        assert_eq!(usage[1].reasoning_tokens, 3);
+        assert!((usage[1].estimated_cost_usd.unwrap() - 0.15).abs() < 1e-9);
+    }
+
+    #[test]
+    fn hybrid_database_reconciles_v1_and_v2_rows_without_duplicate_usage() {
+        let root = TempDir::new().unwrap();
+        let database = root.path().join("hybrid.db");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                r#"CREATE TABLE session (
+                    id TEXT PRIMARY KEY, directory TEXT NOT NULL, title TEXT NOT NULL,
+                    time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, model TEXT
+                );
+                CREATE TABLE message (
+                    id TEXT PRIMARY KEY, session_id TEXT NOT NULL, time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL, data TEXT NOT NULL
+                );
+                CREATE TABLE part (
+                    id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL,
+                    time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL
+                );
+                CREATE TABLE session_message (
+                    id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL,
+                    seq INTEGER NOT NULL, time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL, data TEXT NOT NULL
+                );
+                INSERT INTO session VALUES
+                    ('hybrid', '/tmp/hybrid', 'Hybrid', 1000, 3000,
+                     '{"id":"gpt-hybrid","providerID":"test"}');
+                INSERT INTO message VALUES
+                    ('m-user', 'hybrid', 1000, 1000,
+                     '{"role":"user","time":{"created":1000},"model":{"modelID":"gpt-hybrid"}}'),
+                    ('m-shared', 'hybrid', 2000, 2000,
+                     '{"role":"assistant","time":{"created":2000},"model":{"modelID":"gpt-hybrid","providerID":"test"},"tokens":{"input":10,"output":5,"total":15}}');
+                INSERT INTO part VALUES
+                    ('p-user', 'm-user', 'hybrid', 1000, 1000,
+                     '{"type":"text","text":"v1-only user"}'),
+                    ('p-shared', 'm-shared', 'hybrid', 2000, 2000,
+                     '{"type":"text","text":"shared answer"}');
+                INSERT INTO session_message VALUES
+                    ('m-shared', 'hybrid', 'assistant', 2, 2000, 2000,
+                     '{"time":{"created":2000},"model":{"id":"gpt-hybrid","providerID":"test"},"tokens":{"input":10,"output":5,"total":15},"content":[{"type":"text","text":"shared answer"},{"type":"text","text":"v2-only continuation"}]}');"#,
+            )
+            .unwrap();
+        drop(connection);
+
+        let conversations = scan_opencode_database(&database, root.path()).unwrap();
+        assert_eq!(conversations.len(), 1);
+        let conversation = &conversations[0];
+        assert_eq!(conversation.messages.len(), 3);
+        assert!(conversation.full_text().contains("v1-only user"));
+        assert!(conversation.full_text().contains("shared answer"));
+        assert!(conversation.full_text().contains("v2-only continuation"));
+        assert_eq!(conversation.usage.len(), 1);
+        assert_eq!(conversation.usage[0].total_tokens, 15);
+        assert_eq!(conversation.usage[0].api_calls, 1);
+        assert_eq!(
+            conversation.usage[0].source_event_id.as_deref(),
+            Some("opencode-message:hybrid:m-shared")
+        );
+    }
+
+    #[test]
+    fn sibling_databases_union_complementary_usage_deterministically() {
+        fn create_database(path: &Path, include_second_call: bool) {
+            let connection = Connection::open(path).unwrap();
+            connection
+                .execute_batch(
+                    r#"CREATE TABLE session (
+                        id TEXT PRIMARY KEY, directory TEXT NOT NULL, title TEXT NOT NULL,
+                        time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, model TEXT
+                    );
+                    CREATE TABLE session_message (
+                        id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL,
+                        seq INTEGER NOT NULL, time_created INTEGER NOT NULL,
+                        time_updated INTEGER NOT NULL, data TEXT NOT NULL
+                    );
+                    INSERT INTO session VALUES
+                        ('shared-usage', '/tmp/shared', 'Shared usage', 1000, 3000,
+                         '{"id":"gpt-shared","providerID":"test"}');
+                    INSERT INTO session_message VALUES
+                        ('u1', 'shared-usage', 'user', 1, 1000, 1000,
+                         '{"time":{"created":1000},"text":"same prompt"}'),
+                        ('a1', 'shared-usage', 'assistant', 2, 2000, 2000,
+                         '{"time":{"created":2000},"model":{"id":"gpt-shared","providerID":"test"},"tokens":{"input":10,"output":5,"total":15},"content":[{"type":"text","text":"first answer"}]}');"#,
+                )
+                .unwrap();
+            if include_second_call {
+                connection
+                    .execute_batch(
+                        r#"INSERT INTO session_message VALUES
+                            ('a2', 'shared-usage', 'assistant', 3, 3000, 3000,
+                             '{"time":{"created":3000},"model":{"id":"gpt-shared","providerID":"test"},"tokens":{"input":20,"output":7,"total":27},"content":[{"type":"text","text":"second answer"}]}');"#,
+                    )
+                    .unwrap();
+            }
+        }
+
+        let root = TempDir::new().unwrap();
+        let first = root.path().join("a.db");
+        let second = root.path().join("b.db");
+        create_database(&first, false);
+        create_database(&second, true);
+
+        let scan = scan_opencode_roots(&[root.path().to_path_buf()], None).unwrap();
+        assert_eq!(scan.conversations.len(), 1);
+        let conversation = &scan.conversations[0];
+        assert_eq!(conversation.messages.len(), 3);
+        assert!(conversation.full_text().contains("first answer"));
+        assert!(conversation.full_text().contains("second answer"));
+        assert_eq!(conversation.usage.len(), 2);
+        assert_eq!(
+            conversation
+                .usage
+                .iter()
+                .map(|record| record.total_tokens)
+                .sum::<u64>(),
+            42
+        );
+        assert_eq!(conversation.source_files.len(), 2);
+        assert_eq!(
+            conversation.source_path,
+            database_source_path(root.path(), Agent::OpenCode, "shared-usage")
+        );
+
+        let left = scan_opencode_database(&first, root.path())
+            .unwrap()
+            .remove(0);
+        let right = scan_opencode_database(&second, root.path())
+            .unwrap()
+            .remove(0);
+        let mut forward = HashMap::new();
+        merge_conversation(&mut forward, left.clone());
+        merge_conversation(&mut forward, right.clone());
+        let mut reverse = HashMap::new();
+        merge_conversation(&mut reverse, right);
+        merge_conversation(&mut reverse, left);
+        let forward = forward.remove("shared-usage").unwrap();
+        let reverse = reverse.remove("shared-usage").unwrap();
+        assert_eq!(
+            serde_json::to_value((&forward.messages, &forward.usage)).unwrap(),
+            serde_json::to_value((&reverse.messages, &reverse.usage)).unwrap()
+        );
+        assert_eq!(forward.source_fingerprint, reverse.source_fingerprint);
+        assert_eq!(
+            forward
+                .source_files
+                .iter()
+                .map(|source| &source.path)
+                .collect::<Vec<_>>(),
+            reverse
+                .source_files
+                .iter()
+                .map(|source| &source.path)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn changed_database_rescans_unchanged_legacy_family() {
+        let root = TempDir::new().unwrap();
+        let storage = root.path().join("storage");
+        create_opencode_tree(&storage);
+        for entry in WalkDir::new(&storage)
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+        {
+            std::fs::File::open(entry.path())
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)),
+                )
+                .unwrap();
+        }
+
+        let database = root.path().join("changed.db");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                r#"CREATE TABLE session (
+                    id TEXT PRIMARY KEY, directory TEXT NOT NULL, title TEXT NOT NULL,
+                    time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, model TEXT
+                );
+                CREATE TABLE session_message (
+                    id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL,
+                    seq INTEGER NOT NULL, time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL, data TEXT NOT NULL
+                );
+                INSERT INTO session VALUES
+                    ('sess1', '/tmp/db', 'DB copy', 1000, 2000, NULL);
+                INSERT INTO session_message VALUES
+                    ('db-a1', 'sess1', 'assistant', 1, 2000, 2000,
+                     '{"time":{"created":2000},"content":[{"type":"text","text":"changed DB content"}]}');"#,
+            )
+            .unwrap();
+        drop(connection);
+
+        let since = chrono::Utc::now().timestamp_millis() - 60_000;
+        let scan = scan_opencode_roots(&[root.path().to_path_buf()], Some(since)).unwrap();
+        assert_eq!(scan.conversations.len(), 1);
+        assert!(
+            scan.conversations[0]
+                .full_text()
+                .contains("Sure, I can help!")
+        );
+        assert!(
+            scan.conversations[0]
+                .full_text()
+                .contains("changed DB content")
+        );
+        assert_eq!(
+            scan.conversations[0].source_path,
+            storage.join("session/proj1/sess1.json")
+        );
+    }
+
+    #[test]
+    fn sibling_session_aggregates_keep_one_conservative_residual() {
+        fn create_database(path: &Path, aggregate_input: u64, aggregate_output: u64) {
+            let connection = Connection::open(path).unwrap();
+            connection
+                .execute_batch(&format!(
+                    r#"CREATE TABLE session (
+                        id TEXT PRIMARY KEY, directory TEXT NOT NULL, title TEXT NOT NULL,
+                        time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, model TEXT,
+                        cost REAL NOT NULL DEFAULT 0, tokens_input INTEGER NOT NULL DEFAULT 0,
+                        tokens_output INTEGER NOT NULL DEFAULT 0,
+                        tokens_reasoning INTEGER NOT NULL DEFAULT 0,
+                        tokens_cache_read INTEGER NOT NULL DEFAULT 0,
+                        tokens_cache_write INTEGER NOT NULL DEFAULT 0
+                    );
+                    CREATE TABLE session_message (
+                        id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL,
+                        seq INTEGER NOT NULL, time_created INTEGER NOT NULL,
+                        time_updated INTEGER NOT NULL, data TEXT NOT NULL
+                    );
+                    INSERT INTO session VALUES
+                        ('aggregate-shared', '/tmp/shared', 'Aggregate', 1000, 2000,
+                         '{{"id":"gpt-shared","providerID":"test"}}', 0,
+                         {aggregate_input}, {aggregate_output}, 0, 0, 0);
+                    INSERT INTO session_message VALUES
+                        ('a1', 'aggregate-shared', 'assistant', 1, 1000, 1000,
+                         '{{"time":{{"created":1000}},"model":{{"id":"gpt-shared","providerID":"test"}},"tokens":{{"input":10,"output":5,"total":15}},"content":[]}}');"#
+                ))
+                .unwrap();
+        }
+
+        let root = TempDir::new().unwrap();
+        // Each sibling is more complete for a different monotonic counter. The
+        // merged residual must keep the component-wise maxima and normalize
+        // its total to match those merged buckets.
+        create_database(&root.path().join("complete.db"), 100, 10);
+        create_database(&root.path().join("partial.db"), 60, 20);
+        let scan = scan_opencode_roots(&[root.path().to_path_buf()], None).unwrap();
+        let usage = &scan.conversations[0].usage;
+        assert_eq!(usage.len(), 2);
+        assert_eq!(usage.iter().map(|row| row.total_tokens).sum::<u64>(), 120);
+        assert_eq!(
+            usage
+                .iter()
+                .filter(|row| row
+                    .source_event_id
+                    .as_deref()
+                    .is_some_and(|id| id == "opencode-session-aggregate:aggregate-shared"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn incremental_database_scan_merges_unchanged_sibling_copies() {
+        fn create_database(path: &Path, rich: bool) {
+            let connection = Connection::open(path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE session (
+                        id TEXT PRIMARY KEY, directory TEXT NOT NULL, title TEXT NOT NULL,
+                        time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, model TEXT
+                     );
+                     CREATE TABLE session_message (
+                        id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL,
+                        seq INTEGER NOT NULL, time_created INTEGER NOT NULL,
+                        time_updated INTEGER NOT NULL, data TEXT NOT NULL
+                     );
+                     INSERT INTO session VALUES
+                        ('shared-session', '/tmp/shared', 'Shared', 1000, 2000, NULL);",
+                )
+                .unwrap();
+            if rich {
+                connection
+                    .execute_batch(
+                        r#"INSERT INTO session_message VALUES
+                            ('u1', 'shared-session', 'user', 1, 1000, 1000,
+                             '{"time":{"created":1000},"text":"richer canonical user"}'),
+                            ('a1', 'shared-session', 'assistant', 2, 2000, 2000,
+                             '{"time":{"created":2000},"content":[{"type":"text","text":"richer canonical answer"}]}');"#,
+                    )
+                    .unwrap();
+            } else {
+                connection
+                    .execute_batch(
+                        r#"INSERT INTO session_message VALUES
+                            ('a1', 'shared-session', 'assistant', 1, 2000, 2000,
+                             '{"time":{"created":2000},"content":[{"type":"text","text":"poorer copy"}]}');"#,
+                    )
+                    .unwrap();
+            }
+        }
+
+        let root = TempDir::new().unwrap();
+        let rich = root.path().join("rich.db");
+        let poor = root.path().join("poor.db");
+        create_database(&rich, true);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&rich)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)),
+            )
+            .unwrap();
+        create_database(&poor, false);
+
+        let connector = OpenCodeConnector {
+            storage_root: None,
+            data_root: Some(root.path().to_path_buf()),
+            db_override: None,
+        };
+        let since = chrono::Utc::now().timestamp_millis() - 60_000;
+        let conversations = connector
+            .scan(&connector.default_roots(), Some(since))
+            .unwrap();
+
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].messages.len(), 3);
+        assert!(
+            conversations[0]
+                .full_text()
+                .contains("richer canonical user")
+        );
+        assert!(conversations[0].full_text().contains("poorer copy"));
     }
 }

@@ -7,12 +7,12 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::Value;
 
 use crate::connectors::{
-    Connector, database_source_path, file_modified_since, flatten_json_content,
+    Connector, ConnectorScan, database_source_path, file_modified_since, flatten_json_content,
     parse_database_source_path, parse_role, source_file,
 };
-use crate::model::{Agent, Conversation, Message, Role, SourceFile};
+use crate::model::{Agent, Conversation, Message, Role, SourceFile, UsageRecord};
 
-const PARSER_REVISION: &str = "1";
+const PARSER_REVISION: &str = "3";
 
 pub struct HermesConnector {
     base_home: Option<PathBuf>,
@@ -68,7 +68,7 @@ impl Connector for HermesConnector {
         self.homes()
     }
 
-    fn scan(&self, roots: &[PathBuf], since_ts: Option<i64>) -> Result<Vec<Conversation>> {
+    fn scan(&self, roots: &[PathBuf], since_ts: Option<i64>) -> Result<ConnectorScan> {
         let mut conversations = Vec::new();
         let mut discovered = 0usize;
         let mut parsed = 0usize;
@@ -119,7 +119,7 @@ impl Connector for HermesConnector {
             parse_errors,
             "Completed Hermes session scan"
         );
-        Ok(conversations)
+        Ok(ConnectorScan::new(conversations, parse_errors == 0))
     }
 
     fn parser_revision(&self) -> Option<&'static str> {
@@ -220,8 +220,19 @@ fn scan_database(root: &Path, db_path: &Path) -> Result<Vec<Conversation>> {
     } else {
         "NULL"
     };
+    let input_tokens = optional_column(&session_columns, "input_tokens");
+    let api_call_count = optional_column(&session_columns, "api_call_count");
+    let output_tokens = optional_column(&session_columns, "output_tokens");
+    let cache_read_tokens = optional_column(&session_columns, "cache_read_tokens");
+    let cache_write_tokens = optional_column(&session_columns, "cache_write_tokens");
+    let reasoning_tokens = optional_column(&session_columns, "reasoning_tokens");
+    let billing_provider = optional_column(&session_columns, "billing_provider");
+    let estimated_cost = optional_column(&session_columns, "estimated_cost_usd");
+    let actual_cost = optional_column(&session_columns, "actual_cost_usd");
     let query = format!(
-        "SELECT id, source, model, started_at, {ended_at}, {title}, {cwd} \
+        "SELECT id, source, model, started_at, {ended_at}, {title}, {cwd}, \
+         {api_call_count}, {input_tokens}, {output_tokens}, {cache_read_tokens}, {cache_write_tokens}, \
+         {reasoning_tokens}, {billing_provider}, {estimated_cost}, {actual_cost} \
          FROM sessions ORDER BY started_at, id"
     );
     let source_files = database_files(db_path)?;
@@ -235,6 +246,15 @@ fn scan_database(root: &Path, db_path: &Path) -> Result<Vec<Conversation>> {
             ended_at: row.get(4)?,
             title: row.get(5)?,
             cwd: row.get(6)?,
+            api_calls: row.get::<_, Option<i64>>(7)?.unwrap_or(0).max(0) as u64,
+            input_tokens: row.get::<_, Option<i64>>(8)?.unwrap_or(0).max(0) as u64,
+            output_tokens: row.get::<_, Option<i64>>(9)?.unwrap_or(0).max(0) as u64,
+            cache_read_tokens: row.get::<_, Option<i64>>(10)?.unwrap_or(0).max(0) as u64,
+            cache_write_tokens: row.get::<_, Option<i64>>(11)?.unwrap_or(0).max(0) as u64,
+            reasoning_tokens: row.get::<_, Option<i64>>(12)?.unwrap_or(0).max(0) as u64,
+            billing_provider: row.get(13)?,
+            estimated_cost_usd: row.get(14)?,
+            actual_cost_usd: row.get(15)?,
         })
     })?;
 
@@ -242,9 +262,6 @@ fn scan_database(root: &Path, db_path: &Path) -> Result<Vec<Conversation>> {
     for row in rows {
         let session = row?;
         let messages = load_messages(&connection, &message_columns, &session)?;
-        if messages.is_empty() {
-            continue;
-        }
         let started_at = session.started_at.map(seconds_to_millis).or_else(|| {
             messages
                 .iter()
@@ -258,6 +275,32 @@ fn scan_database(root: &Path, db_path: &Path) -> Result<Vec<Conversation>> {
                 .max()
         });
         let title = session.title.or_else(|| derive_title(&messages));
+        let total_tokens = session
+            .input_tokens
+            .saturating_add(session.output_tokens)
+            .saturating_add(session.cache_read_tokens)
+            .saturating_add(session.cache_write_tokens);
+        let fallback_usage = UsageRecord {
+            // Session totals are aggregates, not event-exact observations.
+            timestamp: None,
+            provider: session.billing_provider.clone(),
+            model: session.model.clone(),
+            source_event_id: None,
+            api_calls: session.api_calls,
+            input_tokens: session.input_tokens,
+            output_tokens: session.output_tokens,
+            cache_read_tokens: session.cache_read_tokens,
+            cache_write_tokens: session.cache_write_tokens,
+            reasoning_tokens: session.reasoning_tokens,
+            total_tokens,
+            actual_cost_usd: session.actual_cost_usd.filter(|cost| *cost > 0.0),
+            estimated_cost_usd: session.estimated_cost_usd.filter(|cost| *cost > 0.0),
+        };
+        let mut usage = load_model_usage(&connection, &session.id)?;
+        append_usage_residual(&mut usage, fallback_usage);
+        if messages.is_empty() && usage.is_empty() {
+            continue;
+        }
         let fingerprint = normalized_fingerprint(
             &session.id,
             &session.source,
@@ -267,6 +310,7 @@ fn scan_database(root: &Path, db_path: &Path) -> Result<Vec<Conversation>> {
             started_at,
             ended_at,
             &messages,
+            &usage,
         )?;
 
         conversations.push(Conversation {
@@ -280,9 +324,72 @@ fn scan_database(root: &Path, db_path: &Path) -> Result<Vec<Conversation>> {
             started_at,
             ended_at,
             messages,
+            usage,
         });
     }
     Ok(conversations)
+}
+
+fn append_usage_residual(usage: &mut Vec<UsageRecord>, aggregate: UsageRecord) {
+    if !aggregate.has_usage() {
+        return;
+    }
+    let sum_u64 = |value: fn(&UsageRecord) -> u64| {
+        usage
+            .iter()
+            .fold(0_u64, |total, row| total.saturating_add(value(row)))
+    };
+    let sum_cost = |value: fn(&UsageRecord) -> Option<f64>| {
+        usage
+            .iter()
+            .filter_map(value)
+            .filter(|cost| cost.is_finite() && *cost > 0.0)
+            .sum::<f64>()
+    };
+    let positive_residual = |total: Option<f64>, projected: f64| {
+        total
+            .filter(|cost| cost.is_finite() && *cost > 0.0)
+            .map(|cost| (cost - projected).max(0.0))
+            .filter(|cost| *cost > f64::EPSILON)
+    };
+    let residual = UsageRecord {
+        timestamp: None,
+        provider: aggregate.provider,
+        model: aggregate.model,
+        source_event_id: None,
+        api_calls: aggregate
+            .api_calls
+            .saturating_sub(sum_u64(|row| row.api_calls)),
+        input_tokens: aggregate
+            .input_tokens
+            .saturating_sub(sum_u64(|row| row.input_tokens)),
+        output_tokens: aggregate
+            .output_tokens
+            .saturating_sub(sum_u64(|row| row.output_tokens)),
+        cache_read_tokens: aggregate
+            .cache_read_tokens
+            .saturating_sub(sum_u64(|row| row.cache_read_tokens)),
+        cache_write_tokens: aggregate
+            .cache_write_tokens
+            .saturating_sub(sum_u64(|row| row.cache_write_tokens)),
+        reasoning_tokens: aggregate
+            .reasoning_tokens
+            .saturating_sub(sum_u64(|row| row.reasoning_tokens)),
+        total_tokens: aggregate
+            .total_tokens
+            .saturating_sub(sum_u64(|row| row.total_tokens)),
+        actual_cost_usd: positive_residual(
+            aggregate.actual_cost_usd,
+            sum_cost(|row| row.actual_cost_usd),
+        ),
+        estimated_cost_usd: positive_residual(
+            aggregate.estimated_cost_usd,
+            sum_cost(|row| row.estimated_cost_usd),
+        ),
+    };
+    if residual.has_usage() {
+        usage.push(residual);
+    }
 }
 
 struct HermesSession {
@@ -293,6 +400,69 @@ struct HermesSession {
     ended_at: Option<f64>,
     title: Option<String>,
     cwd: Option<String>,
+    api_calls: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    reasoning_tokens: u64,
+    billing_provider: Option<String>,
+    estimated_cost_usd: Option<f64>,
+    actual_cost_usd: Option<f64>,
+}
+
+fn optional_column<'a>(columns: &HashSet<String>, name: &'a str) -> &'a str {
+    if columns.contains(name) { name } else { "NULL" }
+}
+
+fn load_model_usage(connection: &Connection, session_id: &str) -> Result<Vec<UsageRecord>> {
+    let columns = table_columns(connection, "session_model_usage")?;
+    if !columns.contains("session_id") || !columns.contains("model") {
+        return Ok(Vec::new());
+    }
+
+    let mut statement = connection.prepare(
+        "SELECT model, billing_provider, api_call_count, input_tokens, output_tokens,
+                cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                estimated_cost_usd, actual_cost_usd
+         FROM session_model_usage
+         WHERE session_id = ?
+         ORDER BY first_seen, model, billing_provider",
+    )?;
+    let rows = statement.query_map([session_id], |row| {
+        let input = row.get::<_, i64>(3)?.max(0) as u64;
+        let output = row.get::<_, i64>(4)?.max(0) as u64;
+        let cache_read = row.get::<_, i64>(5)?.max(0) as u64;
+        let cache_write = row.get::<_, i64>(6)?.max(0) as u64;
+        let provider: String = row.get(1)?;
+        let estimated = row.get::<_, f64>(8)?;
+        let actual = row.get::<_, f64>(9)?;
+        Ok(UsageRecord {
+            // Model rows span first_seen..last_seen and cannot be placed in a
+            // single day/week without inventing a distribution.
+            timestamp: None,
+            provider: (!provider.trim().is_empty()).then_some(provider),
+            model: row.get(0)?,
+            source_event_id: None,
+            api_calls: row.get::<_, i64>(2)?.max(0) as u64,
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: cache_read,
+            cache_write_tokens: cache_write,
+            reasoning_tokens: row.get::<_, i64>(7)?.max(0) as u64,
+            total_tokens: input
+                .saturating_add(output)
+                .saturating_add(cache_read)
+                .saturating_add(cache_write),
+            actual_cost_usd: (actual > 0.0).then_some(actual),
+            estimated_cost_usd: (estimated > 0.0).then_some(estimated),
+        })
+    })?;
+    Ok(rows
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(UsageRecord::has_usage)
+        .collect())
 }
 
 fn load_messages(
@@ -443,12 +613,13 @@ fn normalized_fingerprint(
     started_at: Option<i64>,
     ended_at: Option<i64>,
     messages: &[Message],
+    usage: &[UsageRecord],
 ) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(format!("hermes:{PARSER_REVISION}\0").as_bytes());
     hasher.update(
         serde_json::to_string(&(
-            id, source, model, title, cwd, started_at, ended_at, messages,
+            id, source, model, title, cwd, started_at, ended_at, messages, usage,
         ))?
         .as_bytes(),
     );
@@ -517,6 +688,82 @@ mod tests {
                 .any(|message| message.content.contains("rewound"))
         );
         assert!(connector.source_exists(&conversation.source_path).unwrap());
+    }
+
+    #[test]
+    fn reconciles_partial_model_usage_with_session_totals() {
+        let home = TempDir::new().unwrap();
+        create_database(home.path());
+        let connection = Connection::open(home.path().join("state.db")).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE sessions ADD COLUMN api_call_count INTEGER DEFAULT 0;
+                 ALTER TABLE sessions ADD COLUMN input_tokens INTEGER DEFAULT 0;
+                 ALTER TABLE sessions ADD COLUMN output_tokens INTEGER DEFAULT 0;
+                 ALTER TABLE sessions ADD COLUMN cache_read_tokens INTEGER DEFAULT 0;
+                 ALTER TABLE sessions ADD COLUMN cache_write_tokens INTEGER DEFAULT 0;
+                 ALTER TABLE sessions ADD COLUMN reasoning_tokens INTEGER DEFAULT 0;
+                 ALTER TABLE sessions ADD COLUMN billing_provider TEXT;
+                 ALTER TABLE sessions ADD COLUMN estimated_cost_usd REAL;
+                 ALTER TABLE sessions ADD COLUMN actual_cost_usd REAL;
+                 UPDATE sessions SET
+                    api_call_count = 99, input_tokens = 900, output_tokens = 800,
+                    cache_read_tokens = 700, cache_write_tokens = 600,
+                    reasoning_tokens = 500, billing_provider = 'fallback-provider',
+                    estimated_cost_usd = 9.0, actual_cost_usd = 8.0;
+                 CREATE TABLE session_model_usage (
+                    session_id TEXT NOT NULL, model TEXT NOT NULL,
+                    billing_provider TEXT NOT NULL DEFAULT '',
+                    api_call_count INTEGER NOT NULL DEFAULT 0,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+                    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+                    estimated_cost_usd REAL NOT NULL DEFAULT 0,
+                    actual_cost_usd REAL NOT NULL DEFAULT 0,
+                    first_seen REAL, last_seen REAL
+                 );
+                 INSERT INTO session_model_usage VALUES
+                    ('session-1', 'gpt-split', 'openai-codex', 7,
+                     10, 20, 30, 40, 5, 1.25, 0.75,
+                     1700000001, 1700000009);
+                 DELETE FROM messages;",
+            )
+            .unwrap();
+        drop(connection);
+        let connector = HermesConnector {
+            base_home: Some(home.path().to_path_buf()),
+        };
+
+        let conversations = connector.scan(&connector.default_roots(), None).unwrap();
+        assert_eq!(conversations.len(), 1);
+        assert!(conversations[0].messages.is_empty());
+        assert_eq!(conversations[0].usage.len(), 2);
+        let usage = &conversations[0].usage[0];
+        assert_eq!(usage.provider.as_deref(), Some("openai-codex"));
+        assert_eq!(usage.model.as_deref(), Some("gpt-split"));
+        assert_eq!(usage.api_calls, 7);
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 20);
+        assert_eq!(usage.cache_read_tokens, 30);
+        assert_eq!(usage.cache_write_tokens, 40);
+        assert_eq!(usage.reasoning_tokens, 5);
+        assert_eq!(usage.total_tokens, 100);
+        assert_eq!(usage.estimated_cost_usd, Some(1.25));
+        assert_eq!(usage.actual_cost_usd, Some(0.75));
+        let residual = &conversations[0].usage[1];
+        assert_eq!(residual.provider.as_deref(), Some("fallback-provider"));
+        assert_eq!(residual.model.as_deref(), Some("gpt-test"));
+        assert_eq!(residual.api_calls, 92);
+        assert_eq!(residual.input_tokens, 890);
+        assert_eq!(residual.output_tokens, 780);
+        assert_eq!(residual.cache_read_tokens, 670);
+        assert_eq!(residual.cache_write_tokens, 560);
+        assert_eq!(residual.reasoning_tokens, 495);
+        assert_eq!(residual.total_tokens, 2_900);
+        assert_eq!(residual.estimated_cost_usd, Some(7.75));
+        assert_eq!(residual.actual_cost_usd, Some(7.25));
     }
 
     #[test]

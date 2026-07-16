@@ -1,10 +1,12 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use chrono::TimeZone;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use crate::search::RankingMode;
+use crate::usage::UsageBucket;
 
 /// Default freshness threshold for auto-refresh.
 pub const DEFAULT_MAX_AGE: Duration = Duration::from_secs(15 * 60);
@@ -35,7 +37,7 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_semantic: bool,
 
-    /// Suppress age-based auto-refresh on `search` and TUI launch.
+    /// Suppress age-based auto-refresh on `search`, `usage`, and TUI launch.
     ///
     /// Explicit `sess index` is unaffected. Implied by `--no-auto-index`.
     #[arg(long, global = true)]
@@ -118,6 +120,49 @@ pub enum Commands {
         json: bool,
     },
 
+    /// Summarize provider, model, harness, token, and cost usage
+    Usage {
+        /// Filter by harness (repeat for multiple values)
+        #[arg(short, long, visible_alias = "harness", value_name = "AGENT")]
+        agent: Vec<String>,
+
+        /// Filter by provider (repeat for multiple values)
+        #[arg(short, long, value_name = "PROVIDER")]
+        provider: Vec<String>,
+
+        /// Filter by model (repeat for multiple values)
+        #[arg(short, long, value_name = "MODEL")]
+        model: Vec<String>,
+
+        /// Filter by exact workspace path
+        #[arg(short, long, value_name = "PATH")]
+        workspace: Option<String>,
+
+        /// Filter by start date (ISO date, "7d", "30d", "today")
+        #[arg(long, value_name = "DATE")]
+        since: Option<String>,
+
+        /// Filter by end date
+        #[arg(long, value_name = "DATE")]
+        until: Option<String>,
+
+        /// Timeline bucket size
+        #[arg(long, value_enum, default_value = "auto")]
+        bucket: UsageBucketArg,
+
+        /// Maximum displayed rows per breakdown (terminal/HTML; JSON stays complete)
+        #[arg(long, default_value = "10")]
+        top: usize,
+
+        /// Output the renderer-independent report as JSON
+        #[arg(long, conflicts_with = "html")]
+        json: bool,
+
+        /// Write a standalone HTML report
+        #[arg(long, value_name = "PATH", conflicts_with = "json")]
+        html: Option<PathBuf>,
+    },
+
     /// List detected agents
     Agents {
         /// Output as JSON
@@ -157,27 +202,51 @@ impl From<RankingModeArg> for RankingMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum UsageBucketArg {
+    Auto,
+    Day,
+    Week,
+    Month,
+}
+
+impl From<UsageBucketArg> for UsageBucket {
+    fn from(arg: UsageBucketArg) -> Self {
+        match arg {
+            UsageBucketArg::Auto => UsageBucket::Auto,
+            UsageBucketArg::Day => UsageBucket::Day,
+            UsageBucketArg::Week => UsageBucket::Week,
+            UsageBucketArg::Month => UsageBucket::Month,
+        }
+    }
+}
+
 /// Parse a date string (ISO date, relative like "7d", or "today")
 pub fn parse_date(s: &str) -> anyhow::Result<i64> {
     let now = chrono::Local::now();
 
     if s == "today" {
-        let today = now.date_naive().and_hms_opt(0, 0, 0).unwrap();
-        return Ok(today.and_utc().timestamp_millis());
+        return local_midnight(now.date_naive());
     }
 
     // Try relative format like "7d" or "30d"
-    if let Some(days_str) = s.strip_suffix('d') {
-        if let Ok(days) = days_str.parse::<i64>() {
-            let then = now - chrono::Duration::days(days);
-            return Ok(then.timestamp_millis());
+    if let Some(days_str) = s.strip_suffix('d')
+        && let Ok(days) = days_str.parse::<i64>()
+    {
+        if days < 0 {
+            anyhow::bail!("Relative day count must be non-negative: {s}");
         }
+        let duration = chrono::Duration::try_days(days)
+            .ok_or_else(|| anyhow::anyhow!("Relative date is outside the supported range: {s}"))?;
+        let then = now
+            .checked_sub_signed(duration)
+            .ok_or_else(|| anyhow::anyhow!("Relative date is outside the supported range: {s}"))?;
+        return Ok(then.timestamp_millis());
     }
 
     // Try ISO date format
     if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        let datetime = date.and_hms_opt(0, 0, 0).unwrap();
-        return Ok(datetime.and_utc().timestamp_millis());
+        return local_midnight(date);
     }
 
     // Try full ISO datetime
@@ -189,6 +258,31 @@ pub fn parse_date(s: &str) -> anyhow::Result<i64> {
         "Invalid date format: {}. Use ISO date (2024-01-01), relative (7d), or 'today'",
         s
     )
+}
+
+/// Parse an inclusive upper date bound. Date-only values include the complete
+/// named local calendar day; relative and RFC 3339 values remain exact times.
+pub fn parse_until_date(s: &str) -> anyhow::Result<i64> {
+    let date = if s == "today" {
+        Some(chrono::Local::now().date_naive())
+    } else {
+        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
+    };
+    if let Some(date) = date {
+        let next_day = date
+            .succ_opt()
+            .ok_or_else(|| anyhow::anyhow!("Date is outside the supported range: {s}"))?;
+        return Ok(local_midnight(next_day)?.saturating_sub(1));
+    }
+    parse_date(s)
+}
+
+fn local_midnight(date: chrono::NaiveDate) -> anyhow::Result<i64> {
+    let local = date
+        .and_hms_opt(0, 0, 0)
+        .and_then(|datetime| chrono::Local.from_local_datetime(&datetime).earliest())
+        .ok_or_else(|| anyhow::anyhow!("Could not resolve local midnight for {date}"))?;
+    Ok(local.timestamp_millis())
 }
 
 #[derive(Serialize)]
@@ -350,5 +444,28 @@ mod tests {
             }
             _ => panic!("expected Index"),
         }
+    }
+
+    #[test]
+    fn date_only_bounds_use_local_midnight_and_include_the_until_day() {
+        let start = parse_date("2026-07-16").unwrap();
+        let until = parse_until_date("2026-07-16").unwrap();
+        let local_start = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(start)
+            .unwrap()
+            .with_timezone(&chrono::Local);
+        let local_after_until = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(until + 1)
+            .unwrap()
+            .with_timezone(&chrono::Local);
+
+        assert_eq!(local_start.date_naive().to_string(), "2026-07-16");
+        assert_eq!(local_start.time(), chrono::NaiveTime::MIN);
+        assert_eq!(local_after_until.date_naive().to_string(), "2026-07-17");
+        assert_eq!(local_after_until.time(), chrono::NaiveTime::MIN);
+    }
+
+    #[test]
+    fn relative_dates_reject_negative_and_out_of_range_values() {
+        assert!(parse_date("-1d").is_err());
+        assert!(parse_date("9223372036854775807d").is_err());
     }
 }

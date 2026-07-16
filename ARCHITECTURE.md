@@ -44,13 +44,11 @@ Snapshot date: **2026-02-22**
 ```text
 Agent transcript files (JSON/JSONL)
   ↓ scan + parse per connector
-Conversation / Message normalized model
+Conversation / Message / UsageRecord normalized model
   ↓ upsert
-SQLite (conversations, messages, embeddings, meta)
-  ↓ index docs
-Tantivy index
-  ↓
-CLI search / TUI search thread
+SQLite (conversations, messages, usage_events, embeddings, meta)
+  ├─ derive search docs → Tantivy index → CLI/TUI search
+  └─ aggregate usage_events → terminal / JSON / standalone HTML reports
 ```
 
 Key design choice: **SQLite is source of truth**, Tantivy is a derived search index.
@@ -67,10 +65,12 @@ Key design choice: **SQLite is source of truth**, Tantivy is a derived search in
 │   ├── indexer.rs
 │   ├── main.rs
 │   ├── model.rs
+│   ├── usage.rs
 │   ├── connectors
 │   │   ├── mod.rs
 │   │   ├── claude_code.rs
 │   │   ├── codex.rs
+│   │   ├── hermes.rs
 │   │   ├── opencode.rs
 │   │   └── pi_agent.rs
 │   ├── search
@@ -83,7 +83,8 @@ Key design choice: **SQLite is source of truth**, Tantivy is a derived search in
 │   │   ├── sqlite.rs
 │   │   └── migrations
 │   │       ├── 001_initial.sql
-│   │       └── 002_add_embeddings.sql
+│   │       ├── 002_add_embeddings.sql
+│   │       └── 003_add_usage_events.sql
 │   └── tui
 │       ├── mod.rs
 │       ├── app.rs
@@ -101,6 +102,7 @@ Key design choice: **SQLite is source of truth**, Tantivy is a derived search in
 Normalized domain layer:
 - `Agent`, `Role`
 - `Message`
+- `UsageRecord`
 - `Conversation`
 - `SourceFile`
 - helper functions: title truncation, fingerprints, timestamp parsing
@@ -119,15 +121,20 @@ Important behavior:
 Implemented connectors:
 - `ClaudeCodeConnector`
 - `CodexConnector`
+- `HermesConnector`
 - `OpenCodeConnector`
 - `PiAgentConnector` (also supports shiv/openclaw layouts)
 
-Each connector converts native transcript structures to common `Conversation` + `Message`.
+Each connector converts native transcript structures to common `Conversation`,
+`Message`, and invocation/session-model `UsageRecord` values. Usage stays
+separate from normalized messages because a single provider call may produce
+several searchable message parts, while Hermes can expose model-level session
+aggregates without per-message token counts.
 
 ## 5.3 Storage (`src/storage/sqlite.rs`)
 Responsibilities:
 - migration management
-- upsert conversations/messages
+- upsert conversations/messages/usage events transactionally
 - stale deletion
 - metadata and stats
 - embedding read/write
@@ -135,6 +142,7 @@ Responsibilities:
 Schema tables:
 - `conversations`
 - `messages`
+- `usage_events`
 - `embeddings`
 - `meta`
 - `schema_migrations`
@@ -172,6 +180,14 @@ Coordinates connectors, storage upsert decisions, Tantivy updates, and embedding
 - rendering (`ui.rs`)
 - background search thread (`search.rs`) for responsive interaction
 
+## 5.9 Usage analytics (`src/usage.rs`)
+
+- filters normalized usage rows by harness, provider, model, workspace, and time
+- builds one serializable report with totals, attribution/coverage, breakdowns,
+  costs, and UTC calendar trends
+- renders the same report as compact terminal text or standalone inline-CSS/SVG HTML
+- preserves explicit Unknown groups and reports cost/token attribution coverage
+
 ---
 
 ## 6) Operational Workflows
@@ -198,7 +214,9 @@ Coordinates connectors, storage upsert decisions, Tantivy updates, and embedding
 4. Skip unchanged fingerprints
 5. Upsert/index changed rows
 6. Delete stale conversations (see limitation below)
-7. Commit, then persist connector cursors and update last scan meta
+7. Commit, then persist connector cursors and update last scan meta only for
+   complete connector scans; partial valid rows are retained and an incomplete
+   migration is retried without a time bound on the next refresh
 
 ## 6.4 `sess search`
 1. Build `SearchQuery` from CLI args
@@ -208,6 +226,17 @@ Coordinates connectors, storage upsert decisions, Tantivy updates, and embedding
    - compute semantic nearest neighbors
    - RRF merge into result ranking
 4. Emit human or JSON output
+
+## 6.5 `sess usage`
+
+1. Run the normal initial/stale/connector-migration refresh policy
+2. Load normalized `usage_events` joined to conversation harness/workspace data
+3. Apply report filters and aggregate tokens/API calls/costs once
+4. Emit terminal text, renderer-independent JSON, or a standalone HTML report
+
+Provider/model coverage is weighted by represented API calls. Source-level
+usage aggregates that exceed their event rows are stored as undated residuals,
+so totals stay complete without inventing timeline precision.
 
 ---
 
