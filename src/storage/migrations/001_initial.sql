@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS meta (
 -- Conversations table
 CREATE TABLE IF NOT EXISTS conversations (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    agent       TEXT NOT NULL,           -- 'claude_code', 'codex', 'opencode', 'pi_agent'
+    agent       TEXT NOT NULL,           -- 'claude_code', 'codex', 'hermes', 'opencode', 'pi_agent'
     external_id TEXT,
     title       TEXT,
     workspace   TEXT,

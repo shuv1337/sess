@@ -227,6 +227,7 @@ pub fn execute(query: &SearchQuery, index: &TantivyIndex) -> Result<SearchResult
         let agent = match agent_slug.as_str() {
             "claude_code" => Agent::ClaudeCode,
             "codex" => Agent::Codex,
+            "hermes" => Agent::Hermes,
             "opencode" => Agent::OpenCode,
             "pi_agent" => Agent::PiAgent,
             _ => Agent::ClaudeCode,

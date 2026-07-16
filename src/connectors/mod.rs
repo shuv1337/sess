@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
+use base64::Engine;
 use serde_json::Value;
 
 use crate::model::{Agent, Conversation, Role, SourceFile, parse_timestamp};
@@ -34,6 +35,13 @@ pub trait Connector: Send + Sync {
     /// requests one full source rescan so existing rows can be migrated.
     fn parser_revision(&self) -> Option<&'static str> {
         None
+    }
+
+    /// Check whether an indexed source still exists. File-backed connectors
+    /// use the filesystem directly; database-backed connectors override this
+    /// for their virtual per-session source paths.
+    fn source_exists(&self, path: &Path) -> Result<bool> {
+        Ok(path.try_exists()?)
     }
 
     /// Error handling policy for this connector.
@@ -140,11 +148,45 @@ pub fn home_dir() -> Option<PathBuf> {
     dirs::home_dir()
 }
 
+const DATABASE_SOURCE_MARKER: &str = ".sess-db-sources";
+
+/// Build a stable, unique source key for a conversation stored as one row in a
+/// shared database. The key is intentionally virtual: `Connector::source_exists`
+/// resolves it back to the database and session row.
+pub fn database_source_path(root: &Path, agent: Agent, external_id: &str) -> PathBuf {
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(external_id);
+    root.join(DATABASE_SOURCE_MARKER)
+        .join(agent.slug())
+        .join(encoded)
+}
+
+/// Decode a virtual database source key for the expected agent.
+pub fn parse_database_source_path(path: &Path, agent: Agent) -> Option<(PathBuf, String)> {
+    let components: Vec<_> = path.components().collect();
+    let marker = components
+        .iter()
+        .position(|part| part.as_os_str() == DATABASE_SOURCE_MARKER)?;
+    if components.get(marker + 1)?.as_os_str() != agent.slug() || marker + 3 != components.len() {
+        return None;
+    }
+
+    let mut root = PathBuf::new();
+    for part in &components[..marker] {
+        root.push(part.as_os_str());
+    }
+    let encoded = components[marker + 2].as_os_str().to_str()?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .ok()?;
+    Some((root, String::from_utf8(decoded).ok()?))
+}
+
 /// Return all available connectors.
 pub fn all_connectors() -> Vec<Box<dyn Connector>> {
     vec![
         Box::new(crate::connectors::claude_code::ClaudeCodeConnector::new()),
         Box::new(crate::connectors::codex::CodexConnector::new()),
+        Box::new(crate::connectors::hermes::HermesConnector::new()),
         Box::new(crate::connectors::opencode::OpenCodeConnector::new()),
         Box::new(crate::connectors::pi_agent::PiAgentConnector::new()),
     ]
@@ -152,6 +194,7 @@ pub fn all_connectors() -> Vec<Box<dyn Connector>> {
 
 pub mod claude_code;
 pub mod codex;
+pub mod hermes;
 pub mod opencode;
 pub mod pi_agent;
 
@@ -300,13 +343,14 @@ mod tests {
     // ── all_connectors ─────────────────────────────────────
 
     #[test]
-    fn test_all_connectors_returns_four() {
+    fn test_all_connectors_returns_five() {
         let connectors = all_connectors();
-        assert_eq!(connectors.len(), 4);
+        assert_eq!(connectors.len(), 5);
 
         let agents: Vec<Agent> = connectors.iter().map(|c| c.agent()).collect();
         assert!(agents.contains(&Agent::ClaudeCode));
         assert!(agents.contains(&Agent::Codex));
+        assert!(agents.contains(&Agent::Hermes));
         assert!(agents.contains(&Agent::OpenCode));
         assert!(agents.contains(&Agent::PiAgent));
     }

@@ -613,7 +613,7 @@ fn draw_help(f: &mut Frame, _app: &App) {
     )]));
     help_lines.push(Line::from(vec![
         Span::styled("  Agent:  ", Style::default().fg(C_META)),
-        Span::raw("Claude Code ●  Codex ◆  OpenCode ■  Pi Agent ▲"),
+        Span::raw("Claude Code ●  Codex ◆  Hermes ♦  OpenCode ■  Pi Agent ▲"),
     ]));
     help_lines.push(Line::from(vec![
         Span::styled("  Rank:   ", Style::default().fg(C_META)),

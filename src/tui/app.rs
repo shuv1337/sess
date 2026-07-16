@@ -340,7 +340,8 @@ impl App {
         self.agent_filter = match self.agent_filter {
             None => Some(Agent::ClaudeCode),
             Some(Agent::ClaudeCode) => Some(Agent::Codex),
-            Some(Agent::Codex) => Some(Agent::OpenCode),
+            Some(Agent::Codex) => Some(Agent::Hermes),
+            Some(Agent::Hermes) => Some(Agent::OpenCode),
             Some(Agent::OpenCode) => Some(Agent::PiAgent),
             Some(Agent::PiAgent) => None,
         };

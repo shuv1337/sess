@@ -27,10 +27,13 @@ pub struct StaleDeletionSummary {
     pub uncertain_paths: Vec<(i64, PathBuf, String)>,
 }
 
+pub type MissingSourceClassification = (Vec<MissingSource>, Vec<(i64, PathBuf, String)>);
+
 fn agent_from_slug(slug: &str) -> Agent {
     match slug {
         "claude_code" => Agent::ClaudeCode,
         "codex" => Agent::Codex,
+        "hermes" => Agent::Hermes,
         "opencode" => Agent::OpenCode,
         "pi_agent" => Agent::PiAgent,
         _ => Agent::ClaudeCode,
@@ -323,6 +326,7 @@ impl Storage {
             let agent = match agent_slug.as_str() {
                 "claude_code" => Agent::ClaudeCode,
                 "codex" => Agent::Codex,
+                "hermes" => Agent::Hermes,
                 "opencode" => Agent::OpenCode,
                 "pi_agent" => Agent::PiAgent,
                 _ => Agent::ClaudeCode, // Default
@@ -363,6 +367,7 @@ impl Storage {
                     let agent = match agent_slug.as_str() {
                         "claude_code" => Agent::ClaudeCode,
                         "codex" => Agent::Codex,
+                        "hermes" => Agent::Hermes,
                         "opencode" => Agent::OpenCode,
                         "pi_agent" => Agent::PiAgent,
                         _ => Agent::ClaudeCode,
@@ -463,6 +468,21 @@ impl Storage {
         &self,
         detected_agents: &HashSet<Agent>,
     ) -> Result<Vec<MissingSource>> {
+        let (missing, _) =
+            self.classify_missing_sources(detected_agents, |_, path| Ok(path.try_exists()?))?;
+        Ok(missing)
+    }
+
+    /// Classify stale rows using a connector-aware source existence check.
+    /// Database connectors use this for virtual per-session source paths.
+    pub fn classify_missing_sources<F>(
+        &self,
+        detected_agents: &HashSet<Agent>,
+        source_exists: F,
+    ) -> Result<MissingSourceClassification>
+    where
+        F: Fn(Agent, &Path) -> Result<bool>,
+    {
         let mut stmt = self
             .conn
             .prepare("SELECT id, agent, source_path FROM conversations")?;
@@ -471,24 +491,25 @@ impl Storage {
             .collect::<Result<Vec<_>, _>>()?;
         drop(stmt);
 
-        let mut out = Vec::new();
+        let mut missing = Vec::new();
+        let mut uncertain = Vec::new();
         for (id, agent_slug, path) in rows {
             let agent = agent_from_slug(&agent_slug);
             if !detected_agents.contains(&agent) {
                 continue;
             }
             let p = PathBuf::from(&path);
-            match p.try_exists() {
+            match source_exists(agent, &p) {
                 Ok(true) => {}
-                Ok(false) => out.push(MissingSource {
+                Ok(false) => missing.push(MissingSource {
                     id,
                     agent,
                     source_path: p,
                 }),
-                Err(_) => {} // uncertain -> keep, surfaced separately by delete_missing_sources
+                Err(error) => uncertain.push((id, p, error.to_string())),
             }
         }
-        Ok(out)
+        Ok((missing, uncertain))
     }
 
     /// Delete DB rows whose backing source file is confirmed missing on disk.
@@ -506,29 +527,20 @@ impl Storage {
         &mut self,
         detected_agents: &HashSet<Agent>,
     ) -> Result<StaleDeletionSummary> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, agent, source_path FROM conversations")?;
-        let rows: Vec<(i64, String, String)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(stmt);
+        self.delete_missing_sources_with(detected_agents, |_, path| Ok(path.try_exists()?))
+    }
 
-        let mut to_delete: Vec<(i64, PathBuf)> = Vec::new();
-        let mut uncertain: Vec<(i64, PathBuf, String)> = Vec::new();
-
-        for (id, agent_slug, path) in rows {
-            let agent = agent_from_slug(&agent_slug);
-            if !detected_agents.contains(&agent) {
-                continue;
-            }
-            let p = PathBuf::from(&path);
-            match p.try_exists() {
-                Ok(true) => {}
-                Ok(false) => to_delete.push((id, p)),
-                Err(e) => uncertain.push((id, p, e.to_string())),
-            }
-        }
+    /// Delete stale rows using a connector-aware source existence check.
+    pub fn delete_missing_sources_with<F>(
+        &mut self,
+        detected_agents: &HashSet<Agent>,
+        source_exists: F,
+    ) -> Result<StaleDeletionSummary>
+    where
+        F: Fn(Agent, &Path) -> Result<bool>,
+    {
+        let (to_delete, uncertain) =
+            self.classify_missing_sources(detected_agents, source_exists)?;
 
         let mut summary = StaleDeletionSummary {
             uncertain_paths: uncertain,
@@ -540,10 +552,10 @@ impl Storage {
         }
 
         let tx = self.conn.transaction()?;
-        for (id, path) in &to_delete {
-            tx.execute("DELETE FROM conversations WHERE id = ?", [*id])?;
-            summary.deleted_ids.push(*id);
-            summary.deleted_paths.push(path.clone());
+        for missing in &to_delete {
+            tx.execute("DELETE FROM conversations WHERE id = ?", [missing.id])?;
+            summary.deleted_ids.push(missing.id);
+            summary.deleted_paths.push(missing.source_path.clone());
         }
         tx.commit()?;
 
@@ -586,6 +598,7 @@ impl Storage {
             let agent = match agent_slug.as_str() {
                 "claude_code" => Agent::ClaudeCode,
                 "codex" => Agent::Codex,
+                "hermes" => Agent::Hermes,
                 "opencode" => Agent::OpenCode,
                 "pi_agent" => Agent::PiAgent,
                 _ => Agent::ClaudeCode,

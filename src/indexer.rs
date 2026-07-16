@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -120,7 +120,7 @@ impl Indexer {
         }
 
         // Existence-based stale deletion (DB + Tantivy together).
-        let summary = self.delete_missing(&detected_agents)?;
+        let summary = self.delete_missing(&connectors, &detected_agents)?;
         Self::log_stale_summary("full", &summary);
 
         // Commit changes
@@ -219,7 +219,7 @@ impl Indexer {
         // honor `since_ts`, that meant every agent whose files were unmodified
         // since the last scan had ALL of its rows wiped on the next
         // incremental run. See PLAN-stale-index.md Bug A.
-        let summary = self.delete_missing(&detected_agents)?;
+        let summary = self.delete_missing(&connectors, &detected_agents)?;
         Self::log_stale_summary("incremental", &summary);
 
         // Commit changes
@@ -453,23 +453,11 @@ impl Indexer {
         }
 
         // Stale deletion preview (read-only).
-        let mut would_delete = Vec::new();
-        let mut uncertain = Vec::new();
-        let rows = self.storage.list_all_source_rows()?;
-        for (id, agent, path) in rows {
-            if !detected_agents.contains(&agent) {
-                continue;
-            }
-            match path.try_exists() {
-                Ok(true) => {}
-                Ok(false) => would_delete.push(MissingSource {
-                    id,
-                    agent,
-                    source_path: path,
-                }),
-                Err(e) => uncertain.push((id, path, e.to_string())),
-            }
-        }
+        let (would_delete, uncertain) = self
+            .storage
+            .classify_missing_sources(&detected_agents, |agent, path| {
+                Self::connector_source_exists(&connectors, agent, path)
+            })?;
         report.would_delete = would_delete;
         report.uncertain_paths = uncertain;
 
@@ -536,7 +524,7 @@ impl Indexer {
         // even when the files it contains predate the global last_scan_ts.
         let mut discovered_roots: Vec<Vec<u8>> = roots
             .iter()
-            .filter(|root| root.is_dir())
+            .filter(|root| root.exists())
             .map(|root| root.canonicalize().unwrap_or_else(|_| root.clone()))
             .map(|root| root.as_os_str().as_encoded_bytes().to_vec())
             .collect();
@@ -561,8 +549,28 @@ impl Indexer {
         self.storage.set_meta(&key, fingerprint)
     }
 
-    fn delete_missing(&mut self, detected_agents: &HashSet<Agent>) -> Result<StaleDeletionSummary> {
-        let summary = self.storage.delete_missing_sources(detected_agents)?;
+    fn connector_source_exists(
+        connectors: &[Box<dyn Connector>],
+        agent: Agent,
+        path: &Path,
+    ) -> Result<bool> {
+        let connector = connectors
+            .iter()
+            .find(|connector| connector.agent() == agent)
+            .ok_or_else(|| anyhow::anyhow!("No connector registered for {}", agent))?;
+        connector.source_exists(path)
+    }
+
+    fn delete_missing(
+        &mut self,
+        connectors: &[Box<dyn Connector>],
+        detected_agents: &HashSet<Agent>,
+    ) -> Result<StaleDeletionSummary> {
+        let summary = self
+            .storage
+            .delete_missing_sources_with(detected_agents, |agent, path| {
+                Self::connector_source_exists(connectors, agent, path)
+            })?;
         if !summary.deleted_ids.is_empty() {
             self.tantivy.delete_conversations(&summary.deleted_ids)?;
         }

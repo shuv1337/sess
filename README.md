@@ -3,7 +3,7 @@
 > Search coding-agent transcripts from one local index.
 
 `sess` is a local-first Rust CLI and terminal UI for people who work across
-Claude Code, Codex CLI, OpenCode, and Pi Agent sessions. It normalizes local
+Claude Code, Codex CLI, Hermes Agent, OpenCode, and Pi Agent sessions. It normalizes local
 transcripts into SQLite, derives a Tantivy keyword index, and can add optional
 FastEmbed-powered semantic ranking.
 
@@ -73,7 +73,8 @@ without writing.
 |---|---|---|
 | Claude Code | `~/.claude/projects` | — |
 | Codex CLI | `~/.codex/sessions`, `~/.codex/archived_sessions` | `CODEX_HOME` |
-| OpenCode | `~/.local/share/opencode/storage` | `OPENCODE_STORAGE_ROOT` |
+| Hermes Agent | `~/.hermes/state.db`, `~/.hermes/profiles/*/state.db` | `HERMES_HOME` |
+| OpenCode / shuvcode | `~/.local/share/opencode/storage`, `~/.local/share/opencode/*.db` | `OPENCODE_STORAGE_ROOT`, `OPENCODE_DB` |
 | Pi Agent and compatible layouts | `~/.pi/agent`, `~/.shuvhelm/pi-agent`, `~/.shuvhelm/mate`, `~/.local/share/shiv`, `~/.openclaw` | `SESS_PI_AGENT_DIRS`, `PI_CODING_AGENT_DIR`, `SHIV_AGENT_DIR`, `OPENCLAW_HOME` |
 
 `SESS_PI_AGENT_DIRS` accepts a platform path list (`:`-separated on Unix) for

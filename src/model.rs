@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 pub enum Agent {
     ClaudeCode,
     Codex,
+    Hermes,
     OpenCode,
     PiAgent,
 }
@@ -18,6 +19,7 @@ impl Agent {
         match self {
             Agent::ClaudeCode => "claude_code",
             Agent::Codex => "codex",
+            Agent::Hermes => "hermes",
             Agent::OpenCode => "opencode",
             Agent::PiAgent => "pi_agent",
         }
@@ -27,6 +29,7 @@ impl Agent {
         match self {
             Agent::ClaudeCode => "Claude Code",
             Agent::Codex => "Codex",
+            Agent::Hermes => "Hermes Agent",
             Agent::OpenCode => "OpenCode",
             Agent::PiAgent => "Pi Agent",
         }
@@ -36,6 +39,7 @@ impl Agent {
         match self {
             Agent::ClaudeCode => "●",
             Agent::Codex => "◆",
+            Agent::Hermes => "♦",
             Agent::OpenCode => "■",
             Agent::PiAgent => "▲",
         }
@@ -45,6 +49,7 @@ impl Agent {
         match self {
             Agent::ClaudeCode => (147, 112, 219), // Purple
             Agent::Codex => (50, 205, 50),        // Green
+            Agent::Hermes => (0, 206, 209),       // Dark turquoise
             Agent::OpenCode => (30, 144, 255),    // Blue
             Agent::PiAgent => (255, 165, 0),      // Orange
         }
@@ -64,6 +69,7 @@ impl std::str::FromStr for Agent {
         match s.to_lowercase().as_str() {
             "claude_code" | "claude" | "claudecode" => Ok(Agent::ClaudeCode),
             "codex" => Ok(Agent::Codex),
+            "hermes" | "hermes_agent" | "hermesagent" => Ok(Agent::Hermes),
             "opencode" | "open_code" => Ok(Agent::OpenCode),
             "pi_agent" | "piagent" | "pi" => Ok(Agent::PiAgent),
             _ => anyhow::bail!("Unknown agent: {}", s),
@@ -318,6 +324,7 @@ mod tests {
     fn test_agent_slug() {
         assert_eq!(Agent::ClaudeCode.slug(), "claude_code");
         assert_eq!(Agent::Codex.slug(), "codex");
+        assert_eq!(Agent::Hermes.slug(), "hermes");
         assert_eq!(Agent::OpenCode.slug(), "opencode");
         assert_eq!(Agent::PiAgent.slug(), "pi_agent");
     }
@@ -326,6 +333,7 @@ mod tests {
     fn test_agent_display_name() {
         assert_eq!(Agent::ClaudeCode.display_name(), "Claude Code");
         assert_eq!(Agent::Codex.display_name(), "Codex");
+        assert_eq!(Agent::Hermes.display_name(), "Hermes Agent");
         assert_eq!(Agent::OpenCode.display_name(), "OpenCode");
         assert_eq!(Agent::PiAgent.display_name(), "Pi Agent");
     }
@@ -342,6 +350,8 @@ mod tests {
         assert_eq!("claude".parse::<Agent>().unwrap(), Agent::ClaudeCode);
         assert_eq!("claudecode".parse::<Agent>().unwrap(), Agent::ClaudeCode);
         assert_eq!("codex".parse::<Agent>().unwrap(), Agent::Codex);
+        assert_eq!("hermes".parse::<Agent>().unwrap(), Agent::Hermes);
+        assert_eq!("hermes_agent".parse::<Agent>().unwrap(), Agent::Hermes);
         assert_eq!("opencode".parse::<Agent>().unwrap(), Agent::OpenCode);
         assert_eq!("open_code".parse::<Agent>().unwrap(), Agent::OpenCode);
         assert_eq!("pi_agent".parse::<Agent>().unwrap(), Agent::PiAgent);
@@ -360,13 +370,14 @@ mod tests {
         let icons: Vec<&str> = [
             Agent::ClaudeCode,
             Agent::Codex,
+            Agent::Hermes,
             Agent::OpenCode,
             Agent::PiAgent,
         ]
         .iter()
         .map(|a| a.icon())
         .collect();
-        assert_eq!(icons.len(), 4);
+        assert_eq!(icons.len(), 5);
         for i in 0..icons.len() {
             for j in (i + 1)..icons.len() {
                 assert_ne!(icons[i], icons[j]);
@@ -377,6 +388,7 @@ mod tests {
         let colors: Vec<(u8, u8, u8)> = [
             Agent::ClaudeCode,
             Agent::Codex,
+            Agent::Hermes,
             Agent::OpenCode,
             Agent::PiAgent,
         ]
