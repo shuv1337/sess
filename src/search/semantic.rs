@@ -1,5 +1,8 @@
 use anyhow::{Context, Result};
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use std::path::{Path, PathBuf};
+
+const FASTEMBED_CACHE_DIR: &str = "fastembed";
 
 /// Semantic index using FastEmbed
 pub struct SemanticIndex {
@@ -9,9 +12,8 @@ pub struct SemanticIndex {
 
 impl SemanticIndex {
     /// Create a new semantic index with the default model (AllMiniLML6V2, 384-dim)
-    pub fn new() -> Result<Self> {
-        let options =
-            InitOptions::new(EmbeddingModel::AllMiniLML6V2).with_show_download_progress(true);
+    pub fn new(data_dir: &Path) -> Result<Self> {
+        let options = Self::init_options(data_dir);
 
         let model = TextEmbedding::try_new(options)
             .context("Failed to initialize FastEmbed. Use --no-semantic to skip.")?;
@@ -20,6 +22,16 @@ impl SemanticIndex {
             embedder: model,
             dimension: 384,
         })
+    }
+
+    fn init_options(data_dir: &Path) -> InitOptions {
+        InitOptions::new(EmbeddingModel::AllMiniLML6V2)
+            .with_cache_dir(Self::cache_dir(data_dir))
+            .with_show_download_progress(true)
+    }
+
+    fn cache_dir(data_dir: &Path) -> PathBuf {
+        data_dir.join(FASTEMBED_CACHE_DIR)
     }
 
     /// Generate embedding for text
@@ -82,6 +94,15 @@ impl SemanticIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_fastembed_cache_is_scoped_to_sess_data_dir() {
+        let data_dir = TempDir::new().unwrap();
+        let options = SemanticIndex::init_options(data_dir.path());
+
+        assert_eq!(options.cache_dir, data_dir.path().join("fastembed"));
+    }
 
     #[test]
     fn test_cosine_similarity_identical() {

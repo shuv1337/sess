@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -14,6 +16,16 @@ pub struct PiAgentConnector {
     home_dir: Option<PathBuf>,
 }
 
+fn push_unique_root(roots: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, root: PathBuf) {
+    if !root.as_os_str().is_empty() && seen.insert(path_identity(&root)) {
+        roots.push(root);
+    }
+}
+
+fn path_identity(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
 impl PiAgentConnector {
     pub fn new() -> Self {
         Self {
@@ -21,21 +33,37 @@ impl PiAgentConnector {
         }
     }
 
-    fn sessions_dir(&self) -> Option<PathBuf> {
-        // Check PI_CODING_AGENT_DIR env var first
-        if let Ok(pi_dir) = std::env::var("PI_CODING_AGENT_DIR") {
-            return Some(PathBuf::from(pi_dir).join("sessions"));
-        }
-        self.home_dir
-            .as_ref()
-            .map(|h| h.join(".pi").join("agent").join("sessions"))
+    fn pi_dirs(&self) -> Vec<PathBuf> {
+        let legacy_dir = std::env::var_os("PI_CODING_AGENT_DIR").map(PathBuf::from);
+        let additional_dirs = std::env::var_os("SESS_PI_AGENT_DIRS");
+        Self::pi_dirs_for(self.home_dir.as_deref(), legacy_dir, additional_dirs)
     }
 
-    fn pi_dir(&self) -> Option<PathBuf> {
-        if let Ok(pi_dir) = std::env::var("PI_CODING_AGENT_DIR") {
-            return Some(PathBuf::from(pi_dir));
+    fn pi_dirs_for(
+        home_dir: Option<&Path>,
+        legacy_dir: Option<PathBuf>,
+        additional_dirs: Option<OsString>,
+    ) -> Vec<PathBuf> {
+        let mut roots = Vec::new();
+        let mut seen = HashSet::new();
+
+        if let Some(root) = legacy_dir {
+            push_unique_root(&mut roots, &mut seen, root);
         }
-        self.home_dir.as_ref().map(|h| h.join(".pi").join("agent"))
+        if let Some(paths) = additional_dirs {
+            for root in std::env::split_paths(&paths) {
+                push_unique_root(&mut roots, &mut seen, root);
+            }
+        }
+        if let Some(home) = home_dir {
+            // Keep the user's personal Pi sessions even when an override is set,
+            // then add the two standard shuvhelm agent roots.
+            push_unique_root(&mut roots, &mut seen, home.join(".pi/agent"));
+            push_unique_root(&mut roots, &mut seen, home.join(".shuvhelm/pi-agent"));
+            push_unique_root(&mut roots, &mut seen, home.join(".shuvhelm/mate"));
+        }
+
+        roots
     }
 
     fn shiv_dir(&self) -> Option<PathBuf> {
@@ -91,40 +119,32 @@ impl Connector for PiAgentConnector {
     }
 
     fn detect(&self) -> bool {
-        self.sessions_dir().map(|p| p.exists()).unwrap_or(false)
-            || self
-                .shiv_dir()
-                .map(|p| p.join("sessions").exists())
-                .unwrap_or(false)
-            || self
-                .openclaw_dir()
-                .map(|p| p.join("agents").exists())
-                .unwrap_or(false)
+        self.default_roots()
+            .iter()
+            .any(|root| !self.session_roots_for(root).is_empty())
     }
 
     fn default_roots(&self) -> Vec<PathBuf> {
-        let mut roots = Vec::new();
-        if let Some(pi) = self.pi_dir() {
-            roots.push(pi);
-        }
+        let mut roots = self.pi_dirs();
+        let mut seen: HashSet<PathBuf> = roots.iter().map(|root| path_identity(root)).collect();
         if let Some(shiv) = self.shiv_dir() {
-            if !roots.contains(&shiv) {
-                roots.push(shiv);
-            }
+            push_unique_root(&mut roots, &mut seen, shiv);
         }
         if let Some(openclaw) = self.openclaw_dir() {
-            if !roots.contains(&openclaw) {
-                roots.push(openclaw);
-            }
+            push_unique_root(&mut roots, &mut seen, openclaw);
         }
         roots
     }
 
     fn scan(&self, roots: &[PathBuf], since_ts: Option<i64>) -> Result<Vec<Conversation>> {
         let mut conversations = Vec::new();
+        let mut seen_session_roots = HashSet::new();
 
         for root in roots {
             for sessions_root in self.session_roots_for(root) {
+                if !seen_session_roots.insert(path_identity(&sessions_root)) {
+                    continue;
+                }
                 // Walk session directories
                 for entry in WalkDir::new(&sessions_root)
                     .follow_links(true)
@@ -640,9 +660,114 @@ mod tests {
 
         let roots = connector.default_roots();
         assert!(roots.contains(&home.path().join(".pi/agent")));
+        assert!(roots.contains(&home.path().join(".shuvhelm/pi-agent")));
+        assert!(roots.contains(&home.path().join(".shuvhelm/mate")));
         assert!(roots.contains(&home.path().join(".local/share/shiv")));
         assert!(roots.contains(&home.path().join(".openclaw")));
         assert!(connector.detect());
+    }
+
+    #[test]
+    fn test_pi_dirs_are_additive_and_deduplicated() {
+        let home = TempDir::new().unwrap();
+        let personal = home.path().join(".pi/agent");
+        let extra = home.path().join("extra-agent");
+        let path_list =
+            std::env::join_paths([personal.as_path(), extra.as_path(), extra.as_path()]).unwrap();
+
+        let roots = PiAgentConnector::pi_dirs_for(
+            Some(home.path()),
+            Some(personal.clone()),
+            Some(path_list),
+        );
+
+        assert_eq!(roots.iter().filter(|root| **root == personal).count(), 1);
+        assert_eq!(roots.iter().filter(|root| **root == extra).count(), 1);
+        assert!(roots.contains(&home.path().join(".shuvhelm/pi-agent")));
+        assert!(roots.contains(&home.path().join(".shuvhelm/mate")));
+    }
+
+    #[test]
+    fn test_pi_connector_scans_multiple_roots_once() {
+        let temp = TempDir::new().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        std::fs::create_dir_all(first.join("sessions")).unwrap();
+        std::fs::create_dir_all(second.join("sessions")).unwrap();
+        std::fs::write(
+            first.join("sessions/2026-07-16T00-00-00-000Z_first.jsonl"),
+            r#"{"type":"session","id":"first","cwd":"/first","modelId":"m1"}
+{"type":"message","timestamp":"2026-07-16T00:00:00Z","message":{"role":"user","content":"first"}}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            second.join("sessions/2026-07-16T00-00-01-000Z_second.jsonl"),
+            r#"{"type":"session","id":"second","cwd":"/second","modelId":"m1"}
+{"type":"message","timestamp":"2026-07-16T00:00:01Z","message":{"role":"user","content":"second"}}
+"#,
+        )
+        .unwrap();
+
+        let connector = PiAgentConnector {
+            home_dir: Some(temp.path().to_path_buf()),
+        };
+        let conversations = connector
+            .scan(&[first.clone(), second, first], None)
+            .unwrap();
+
+        assert_eq!(conversations.len(), 2);
+        assert!(
+            conversations
+                .iter()
+                .any(|conversation| conversation.external_id.as_deref() == Some("first"))
+        );
+        assert!(
+            conversations
+                .iter()
+                .any(|conversation| conversation.external_id.as_deref() == Some("second"))
+        );
+    }
+
+    #[test]
+    fn test_pi_connector_scans_shuvhelm_fleet_and_mate_layouts() {
+        let home = TempDir::new().unwrap();
+        let fleet = home.path().join(".shuvhelm/pi-agent");
+        let mate = home.path().join(".shuvhelm/mate");
+        std::fs::create_dir_all(fleet.join("sessions/--crew--")).unwrap();
+        std::fs::create_dir_all(mate.join("sessions")).unwrap();
+        std::fs::write(
+            fleet.join("sessions/--crew--/2026-07-16T00-00-00-000Z_fleet.jsonl"),
+            r#"{"type":"session","id":"fleet","cwd":"/fleet","modelId":"m1"}
+{"type":"message","timestamp":"2026-07-16T00:00:00Z","message":{"role":"user","content":"fleet"}}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            mate.join("sessions/2026-07-16T00-00-01-000Z_mate.jsonl"),
+            r#"{"type":"session","id":"mate","cwd":"/mate","modelId":"m1"}
+{"type":"message","timestamp":"2026-07-16T00:00:01Z","message":{"role":"user","content":"mate"}}
+"#,
+        )
+        .unwrap();
+
+        let connector = PiAgentConnector {
+            home_dir: Some(home.path().to_path_buf()),
+        };
+        let roots = PiAgentConnector::pi_dirs_for(Some(home.path()), None, None);
+        let conversations = connector.scan(&roots, None).unwrap();
+
+        assert_eq!(conversations.len(), 2);
+        assert!(
+            conversations
+                .iter()
+                .any(|conversation| conversation.external_id.as_deref() == Some("fleet"))
+        );
+        assert!(
+            conversations
+                .iter()
+                .any(|conversation| conversation.external_id.as_deref() == Some("mate"))
+        );
     }
 
     #[test]

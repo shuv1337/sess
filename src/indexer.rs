@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -30,6 +30,12 @@ pub struct IndexStats {
     pub time_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConnectorScanPlan {
+    since_ts: Option<i64>,
+    root_fingerprint: String,
+}
+
 /// Main indexer that orchestrates scanning and indexing
 pub struct Indexer {
     storage: Storage,
@@ -50,7 +56,7 @@ impl Indexer {
         let tantivy = TantivyIndex::open_or_create(&tantivy_path)?;
 
         let semantic = if enable_semantic {
-            match SemanticIndex::new() {
+            match SemanticIndex::new(data_dir) {
                 Ok(idx) => {
                     tracing::info!("Semantic search enabled");
                     Some(idx)
@@ -89,9 +95,12 @@ impl Indexer {
             .filter(|c| c.detect())
             .map(|c| c.agent())
             .collect();
+        let mut observed_root_fingerprints = HashMap::new();
 
         for connector in &connectors {
-            if !connector.detect() {
+            if !detected_agents.contains(&connector.agent()) {
+                observed_root_fingerprints
+                    .insert(connector.agent(), Self::discovered_root_fingerprint(&[]));
                 tracing::debug!("Agent {} not detected, skipping", connector.agent());
                 continue;
             }
@@ -99,6 +108,8 @@ impl Indexer {
             tracing::info!("Scanning {} sessions...", connector.agent());
 
             let roots = connector.default_roots();
+            observed_root_fingerprints
+                .insert(connector.agent(), Self::discovered_root_fingerprint(&roots));
             let conversations = connector.scan(&roots, None)?;
 
             stats.files_scanned += conversations.len();
@@ -118,6 +129,12 @@ impl Indexer {
             if detected_agents.contains(&connector.agent()) {
                 self.record_connector_parser_revision(connector.as_ref())?;
             }
+            self.record_connector_root_fingerprint(
+                connector.as_ref(),
+                observed_root_fingerprints
+                    .get(&connector.agent())
+                    .expect("every connector root set is observed before commit"),
+            )?;
         }
 
         // Store embeddings if semantic search is enabled
@@ -165,15 +182,20 @@ impl Indexer {
             .filter(|c| c.detect())
             .map(|c| c.agent())
             .collect();
+        let mut observed_root_fingerprints = HashMap::new();
 
         for connector in &connectors {
-            if !connector.detect() {
+            if !detected_agents.contains(&connector.agent()) {
+                observed_root_fingerprints
+                    .insert(connector.agent(), Self::discovered_root_fingerprint(&[]));
                 continue;
             }
 
             let roots = connector.default_roots();
-            let connector_since = self.connector_scan_since(connector.as_ref(), since_ts)?;
-            let conversations = connector.scan(&roots, connector_since)?;
+            let scan_plan = self.connector_scan_plan(connector.as_ref(), &roots, since_ts)?;
+            observed_root_fingerprints
+                .insert(connector.agent(), scan_plan.root_fingerprint.clone());
+            let conversations = connector.scan(&roots, scan_plan.since_ts)?;
 
             stats.files_scanned += conversations.len();
 
@@ -206,6 +228,12 @@ impl Indexer {
             if detected_agents.contains(&connector.agent()) {
                 self.record_connector_parser_revision(connector.as_ref())?;
             }
+            self.record_connector_root_fingerprint(
+                connector.as_ref(),
+                observed_root_fingerprints
+                    .get(&connector.agent())
+                    .expect("every connector root set is observed before commit"),
+            )?;
         }
 
         // Update embeddings for changed conversations
@@ -397,12 +425,12 @@ impl Indexer {
             .collect();
 
         for connector in &connectors {
-            if !connector.detect() {
+            if !detected_agents.contains(&connector.agent()) {
                 continue;
             }
             let roots = connector.default_roots();
-            let connector_since = self.connector_scan_since(connector.as_ref(), since_ts)?;
-            let conversations = connector.scan(&roots, connector_since)?;
+            let scan_plan = self.connector_scan_plan(connector.as_ref(), &roots, since_ts)?;
+            let conversations = connector.scan(&roots, scan_plan.since_ts)?;
             let agent = connector.agent();
             *report.would_scan_by_agent.entry(agent).or_insert(0) += conversations.len();
             for conv in conversations {
@@ -448,28 +476,49 @@ impl Indexer {
         Ok(report)
     }
 
-    fn connector_scan_since(
+    fn connector_scan_plan(
         &self,
         connector: &dyn Connector,
+        roots: &[PathBuf],
         since_ts: Option<i64>,
-    ) -> Result<Option<i64>> {
-        let Some(revision) = connector.parser_revision() else {
-            return Ok(since_ts);
-        };
+    ) -> Result<ConnectorScanPlan> {
+        let mut requires_unbounded_scan = false;
 
-        let key = format!("connector_parser_revision_{}", connector.agent().slug());
-        let indexed_revision = self.storage.get_meta(&key)?;
-        if indexed_revision.as_deref() == Some(revision) {
-            return Ok(since_ts);
+        if let Some(revision) = connector.parser_revision() {
+            let key = format!("connector_parser_revision_{}", connector.agent().slug());
+            let indexed_revision = self.storage.get_meta(&key)?;
+            if indexed_revision.as_deref() != Some(revision) {
+                tracing::info!(
+                    agent = connector.agent().slug(),
+                    parser_revision = revision,
+                    previous_revision = indexed_revision.as_deref().unwrap_or("none"),
+                    "Connector parser revision changed; performing full source rescan"
+                );
+                requires_unbounded_scan = true;
+            }
         }
 
-        tracing::info!(
-            agent = connector.agent().slug(),
-            parser_revision = revision,
-            previous_revision = indexed_revision.as_deref().unwrap_or("none"),
-            "Connector parser revision changed; performing full source rescan"
-        );
-        Ok(None)
+        let root_fingerprint = Self::discovered_root_fingerprint(roots);
+        let key = format!("connector_root_fingerprint_{}", connector.agent().slug());
+        let indexed_root_fingerprint = self.storage.get_meta(&key)?;
+        if indexed_root_fingerprint.as_deref() != Some(root_fingerprint.as_str()) {
+            tracing::info!(
+                agent = connector.agent().slug(),
+                root_fingerprint,
+                previous_root_fingerprint = indexed_root_fingerprint.as_deref().unwrap_or("none"),
+                "Connector discovered root set changed; performing full source rescan"
+            );
+            requires_unbounded_scan = true;
+        }
+
+        Ok(ConnectorScanPlan {
+            since_ts: if requires_unbounded_scan {
+                None
+            } else {
+                since_ts
+            },
+            root_fingerprint,
+        })
     }
 
     fn record_connector_parser_revision(&self, connector: &dyn Connector) -> Result<()> {
@@ -479,6 +528,37 @@ impl Indexer {
 
         let key = format!("connector_parser_revision_{}", connector.agent().slug());
         self.storage.set_meta(&key, revision)
+    }
+
+    fn discovered_root_fingerprint(roots: &[PathBuf]) -> String {
+        // Only hash roots that currently exist. A configured/default root that
+        // appears later then changes the cursor and gets one unbounded scan,
+        // even when the files it contains predate the global last_scan_ts.
+        let mut discovered_roots: Vec<Vec<u8>> = roots
+            .iter()
+            .filter(|root| root.is_dir())
+            .map(|root| root.canonicalize().unwrap_or_else(|_| root.clone()))
+            .map(|root| root.as_os_str().as_encoded_bytes().to_vec())
+            .collect();
+        discovered_roots.sort();
+        discovered_roots.dedup();
+
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"sess-connector-roots-v1\0");
+        for root in discovered_roots {
+            hasher.update(&(root.len() as u64).to_le_bytes());
+            hasher.update(&root);
+        }
+        format!("v1:{}", hasher.finalize().to_hex())
+    }
+
+    fn record_connector_root_fingerprint(
+        &self,
+        connector: &dyn Connector,
+        fingerprint: &str,
+    ) -> Result<()> {
+        let key = format!("connector_root_fingerprint_{}", connector.agent().slug());
+        self.storage.set_meta(&key, fingerprint)
     }
 
     fn delete_missing(&mut self, detected_agents: &HashSet<Agent>) -> Result<StaleDeletionSummary> {
@@ -541,12 +621,21 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let indexer = Indexer::new(&temp_dir.path().to_path_buf(), false).unwrap();
         let connector = crate::connectors::codex::CodexConnector::new();
+        let roots = vec![temp_dir.path().join("codex")];
+        std::fs::create_dir_all(&roots[0]).unwrap();
+        let root_fingerprint = Indexer::discovered_root_fingerprint(&roots);
+        indexer
+            .record_connector_root_fingerprint(&connector, &root_fingerprint)
+            .unwrap();
 
         assert_eq!(
             indexer
-                .connector_scan_since(&connector, Some(1234))
+                .connector_scan_plan(&connector, &roots, Some(1234))
                 .unwrap(),
-            None
+            ConnectorScanPlan {
+                since_ts: None,
+                root_fingerprint: root_fingerprint.clone(),
+            }
         );
 
         indexer
@@ -554,10 +643,82 @@ mod tests {
             .unwrap();
         assert_eq!(
             indexer
-                .connector_scan_since(&connector, Some(1234))
+                .connector_scan_plan(&connector, &roots, Some(1234))
                 .unwrap(),
-            Some(1234)
+            ConnectorScanPlan {
+                since_ts: Some(1234),
+                root_fingerprint,
+            }
         );
+    }
+
+    #[test]
+    fn test_unchanged_connector_roots_keep_incremental_since_timestamp() {
+        let temp_dir = TempDir::new().unwrap();
+        let indexer = Indexer::new(&temp_dir.path().to_path_buf(), false).unwrap();
+        let connector = crate::connectors::pi_agent::PiAgentConnector::new();
+        let roots = vec![temp_dir.path().join("pi-agent")];
+        std::fs::create_dir_all(&roots[0]).unwrap();
+
+        let first_plan = indexer
+            .connector_scan_plan(&connector, &roots, Some(1234))
+            .unwrap();
+        assert_eq!(first_plan.since_ts, None);
+        indexer
+            .record_connector_root_fingerprint(&connector, &first_plan.root_fingerprint)
+            .unwrap();
+
+        let unchanged_plan = indexer
+            .connector_scan_plan(&connector, &roots, Some(1234))
+            .unwrap();
+        assert_eq!(unchanged_plan.since_ts, Some(1234));
+        assert_eq!(unchanged_plan.root_fingerprint, first_plan.root_fingerprint);
+    }
+
+    #[test]
+    fn test_changed_connector_roots_force_unbounded_scan() {
+        let temp_dir = TempDir::new().unwrap();
+        let indexer = Indexer::new(&temp_dir.path().to_path_buf(), false).unwrap();
+        let connector = crate::connectors::pi_agent::PiAgentConnector::new();
+        let first_root = temp_dir.path().join("pi-agent");
+        let additional_root = temp_dir.path().join("fleet-agent");
+        std::fs::create_dir_all(&first_root).unwrap();
+        std::fs::create_dir_all(&additional_root).unwrap();
+
+        let initial_fingerprint =
+            Indexer::discovered_root_fingerprint(std::slice::from_ref(&first_root));
+        indexer
+            .record_connector_root_fingerprint(&connector, &initial_fingerprint)
+            .unwrap();
+
+        let changed_plan = indexer
+            .connector_scan_plan(&connector, &[first_root, additional_root], Some(1234))
+            .unwrap();
+        assert_eq!(changed_plan.since_ts, None);
+        assert_ne!(changed_plan.root_fingerprint, initial_fingerprint);
+    }
+
+    #[test]
+    fn test_late_discovered_connector_root_forces_unbounded_scan() {
+        let temp_dir = TempDir::new().unwrap();
+        let indexer = Indexer::new(&temp_dir.path().to_path_buf(), false).unwrap();
+        let connector = crate::connectors::pi_agent::PiAgentConnector::new();
+        let first_root = temp_dir.path().join("pi-agent");
+        let late_root = temp_dir.path().join("later-fleet-agent");
+        std::fs::create_dir_all(&first_root).unwrap();
+        let configured_roots = vec![first_root, late_root.clone()];
+
+        let before_discovery = Indexer::discovered_root_fingerprint(&configured_roots);
+        indexer
+            .record_connector_root_fingerprint(&connector, &before_discovery)
+            .unwrap();
+        std::fs::create_dir_all(late_root).unwrap();
+
+        let discovered_plan = indexer
+            .connector_scan_plan(&connector, &configured_roots, Some(1234))
+            .unwrap();
+        assert_eq!(discovered_plan.since_ts, None);
+        assert_ne!(discovered_plan.root_fingerprint, before_discovery);
     }
 
     #[test]

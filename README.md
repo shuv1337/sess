@@ -74,7 +74,12 @@ without writing.
 | Claude Code | `~/.claude/projects` | — |
 | Codex CLI | `~/.codex/sessions`, `~/.codex/archived_sessions` | `CODEX_HOME` |
 | OpenCode | `~/.local/share/opencode/storage` | `OPENCODE_STORAGE_ROOT` |
-| Pi Agent and compatible layouts | `~/.pi/agent`, `~/.local/share/shiv`, `~/.openclaw` | `PI_CODING_AGENT_DIR`, `SHIV_AGENT_DIR`, `OPENCLAW_HOME` |
+| Pi Agent and compatible layouts | `~/.pi/agent`, `~/.shuvhelm/pi-agent`, `~/.shuvhelm/mate`, `~/.local/share/shiv`, `~/.openclaw` | `SESS_PI_AGENT_DIRS`, `PI_CODING_AGENT_DIR`, `SHIV_AGENT_DIR`, `OPENCLAW_HOME` |
+
+`SESS_PI_AGENT_DIRS` accepts a platform path list (`:`-separated on Unix) for
+additional Pi-compatible agent roots. The legacy single-root
+`PI_CODING_AGENT_DIR` remains supported. Both are additive: they do not hide
+the personal Pi root or the standard shuvhelm fleet and mate roots.
 
 ## Background refresh
 
@@ -82,6 +87,8 @@ For an unattended local index, optional integrations are provided for
 [systemd user units](./contrib/systemd/README.md) and
 [oxmgr](./contrib/oxmgr/README.md). The systemd service disables semantic
 embeddings by default; the oxmgr loop enables them unless configured otherwise.
+When enabled, FastEmbed's downloaded model cache lives under the sess data
+directory at `<data-dir>/fastembed`.
 
 ## Development
 

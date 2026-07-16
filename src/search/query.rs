@@ -5,7 +5,7 @@ use anyhow::Result;
 use tantivy::{
     Order, Term,
     collector::{Count, TopDocs},
-    query::{AllQuery, BooleanQuery, Occur, RangeQuery, TermQuery},
+    query::{AllQuery, BooleanQuery, Occur, PhraseQuery, Query, RangeQuery, TermQuery},
     schema::{IndexRecordOption, Value as TantivyValue},
 };
 
@@ -307,11 +307,7 @@ fn parse_text_query(
 
     if terms.len() == 1 && fields.len() == 1 {
         // Single term, single field
-        let term = Term::from_field_text(fields[0], terms[0]);
-        return Ok(Box::new(TermQuery::new(
-            term,
-            IndexRecordOption::WithFreqsAndPositions,
-        )));
+        return Ok(lexical_term_query(fields[0], terms[0]));
     }
 
     // Multi-field OR query
@@ -320,19 +316,51 @@ fn parse_text_query(
     for field in fields {
         let mut term_queries: Vec<(Occur, Box<dyn tantivy::query::Query>)> = Vec::new();
         for term_str in &terms {
-            let term = Term::from_field_text(field, term_str);
-            term_queries.push((
-                Occur::Should,
-                Box::new(TermQuery::new(
-                    term,
-                    IndexRecordOption::WithFreqsAndPositions,
-                )),
-            ));
+            term_queries.push((Occur::Should, lexical_term_query(field, term_str)));
         }
         field_queries.push((Occur::Should, Box::new(BooleanQuery::new(term_queries))));
     }
 
     Ok(Box::new(BooleanQuery::new(field_queries)))
+}
+
+/// Build a literal term query, with one narrow compatibility path for
+/// underscore-delimited identifiers. Tantivy's default text tokenizer indexes
+/// `t_mrmy2fpm3jzp` as adjacent `t` and `mrmy2fpm3jzp` tokens, while a raw
+/// `TermQuery` looks for the unsplit spelling and cannot match it.
+///
+/// Keep the literal query and OR it with an adjacent-token phrase over the
+/// underscore components. This is deliberately separator-equivalent rather
+/// than delimiter-exact (`t-foo` can match a query for `t_foo`), but requiring
+/// adjacency avoids a broad match for components that occur elsewhere.
+fn lexical_term_query(field: tantivy::schema::Field, text: &str) -> Box<dyn Query> {
+    let literal_query: Box<dyn Query> = Box::new(TermQuery::new(
+        Term::from_field_text(field, text),
+        IndexRecordOption::WithFreqsAndPositions,
+    ));
+    let components: Vec<&str> = text
+        .split('_')
+        .filter(|component| !component.is_empty())
+        .collect();
+
+    if components.len() < 2
+        || !components
+            .iter()
+            .all(|component| component.chars().all(|ch| ch.is_alphanumeric()))
+    {
+        return literal_query;
+    }
+
+    let phrase_terms = components
+        .into_iter()
+        .map(|component| Term::from_field_text(field, &component.to_lowercase()))
+        .collect();
+    let phrase_query: Box<dyn Query> = Box::new(PhraseQuery::new(phrase_terms));
+
+    Box::new(BooleanQuery::new(vec![
+        (Occur::Should, literal_query),
+        (Occur::Should, phrase_query),
+    ]))
 }
 
 fn calculate_recency_score(timestamp: i64) -> f32 {
@@ -430,6 +458,7 @@ pub fn rrf_fusion(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -693,6 +722,82 @@ mod tests {
         assert!(results.total_hits >= 1);
         assert_eq!(results.hits[0].conversation_id, 1);
         assert_eq!(results.hits[0].agent, Agent::ClaudeCode);
+    }
+
+    #[test]
+    fn test_execute_matches_underscore_identifier_as_adjacent_tokens() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut index = TantivyIndex::open_or_create(temp_dir.path()).unwrap();
+        index.start_writer().unwrap();
+
+        let make_conversation = |title: &str, source: &str| crate::model::Conversation {
+            agent: Agent::PiAgent,
+            external_id: None,
+            title: Some(title.to_string()),
+            workspace: None,
+            source_path: PathBuf::from(source),
+            source_files: vec![],
+            source_fingerprint: source.to_string(),
+            started_at: Some(1705312800000),
+            ended_at: None,
+            messages: vec![],
+        };
+
+        index
+            .add_conversation(
+                &make_conversation(
+                    "Crew task t_mrmy2fpm3jzp finalization",
+                    "/test/matching.jsonl",
+                ),
+                1,
+            )
+            .unwrap();
+        index
+            .add_conversation(
+                &make_conversation(
+                    "Crew task t-mrmy2fpm3jzp used another separator",
+                    "/test/separator-equivalent.jsonl",
+                ),
+                2,
+            )
+            .unwrap();
+        index
+            .add_conversation(
+                &make_conversation(
+                    "The t stage mentions mrmy2fpm3jzp elsewhere",
+                    "/test/non-adjacent.jsonl",
+                ),
+                3,
+            )
+            .unwrap();
+        index
+            .add_conversation(
+                &make_conversation("Task mrmy2fpm3jzp", "/test/suffix-only.jsonl"),
+                4,
+            )
+            .unwrap();
+        index.commit().unwrap();
+
+        let typed_identifier = SearchQuery {
+            text: "t_mrmy2fpm3jzp".to_string(),
+            ..Default::default()
+        };
+        let results = execute(&typed_identifier, &index).unwrap();
+
+        assert_eq!(results.total_hits, 2);
+        let matched_ids: HashSet<i64> = results
+            .hits
+            .iter()
+            .map(|result| result.conversation_id)
+            .collect();
+        assert_eq!(matched_ids, HashSet::from([1, 2]));
+
+        // Preserve the existing ability to search the distinctive component.
+        let suffix = SearchQuery {
+            text: "mrmy2fpm3jzp".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(execute(&suffix, &index).unwrap().total_hits, 4);
     }
 
     #[test]

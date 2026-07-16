@@ -155,6 +155,7 @@ Tantivy wrapper:
 
 ## 5.6 Semantic (`src/search/semantic.rs`)
 - embedding generation via FastEmbed
+- model cache scoped to `<data-dir>/fastembed`
 - cosine similarity search over stored vectors
 - used as optional augmentation path in CLI search
 
@@ -191,11 +192,13 @@ Coordinates connectors, storage upsert decisions, Tantivy updates, and embedding
 
 ## 6.3 `sess index` (incremental)
 1. Read `last_scan_ts` from meta
-2. Scan only files modified since timestamp
-3. Skip unchanged fingerprints
-4. Upsert/index changed rows
-5. Delete stale conversations (see limitation below)
-6. Commit + update last scan meta
+2. Compare each connector's discovered-root fingerprint and parser revision
+3. Scan only files modified since the timestamp, or scan that connector without
+   a time bound when either cursor changed
+4. Skip unchanged fingerprints
+5. Upsert/index changed rows
+6. Delete stale conversations (see limitation below)
+7. Commit, then persist connector cursors and update last scan meta
 
 ## 6.4 `sess search`
 1. Build `SearchQuery` from CLI args
