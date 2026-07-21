@@ -27,6 +27,7 @@ The repository currently emits pre-existing compiler and Clippy warnings; do not
 ## Operations
 
 - Build: `cargo build --release`
+- ONNX Runtime is loaded dynamically through FastEmbed's `ort-load-dynamic` feature. On Linux it resolves `libonnxruntime.so` at semantic initialization, avoiding startup-time ELF symbol-version coupling to a particular distro package release.
 - Full re-index: `sess --no-semantic index --full`
 - Inspect detection/stats: `sess agents --json`; `sess stats --json`
 - Default index data is under the platform local-data directory, commonly `~/.local/share/sess` on Linux.

@@ -42,7 +42,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Semantic
-fastembed = { version = "4", default-features = false, features = ["ort-download-binaries", "hf-hub"] }
+fastembed = { version = "4", default-features = false, features = ["ort-load-dynamic", "hf-hub"] }
 
 # TUI (phase 2)
 ratatui = "0.29"
