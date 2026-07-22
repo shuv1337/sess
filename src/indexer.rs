@@ -128,8 +128,9 @@ impl Indexer {
             }
         }
 
-        // Existence-based stale deletion (DB + Tantivy together).
-        let summary = self.delete_missing(&connectors, &detected_agents)?;
+        // Only a complete connector inventory can prove that a retained row's
+        // source disappeared. Partial scans keep their existing rows intact.
+        let summary = self.delete_missing(&connectors, &completed_agents)?;
         Self::log_stale_summary("full", &summary);
 
         // Commit changes
@@ -217,7 +218,22 @@ impl Indexer {
             observed_root_fingerprints
                 .insert(connector.agent(), scan_plan.root_fingerprint.clone());
             let scan = connector.scan(&roots, scan_plan.since_ts)?;
-            if scan.complete {
+            let mut scan_complete = scan.complete;
+            let mut conversations = scan.conversations;
+
+            // A rollout moved from the active tree into an archive can retain
+            // an mtime older than `last_scan_ts`. Give connectors a cheap
+            // inventory backstop so unknown paths are not skipped forever.
+            if scan_plan.since_ts.is_some() {
+                let recovered =
+                    connector.scan_unindexed_sources(&roots, scan_plan.since_ts, &|path| {
+                        self.storage.has_source_path(path)
+                    })?;
+                scan_complete &= recovered.complete;
+                conversations.extend(recovered.conversations);
+            }
+
+            if scan_complete {
                 completed_agents.insert(connector.agent());
             } else {
                 tracing::warn!(
@@ -226,9 +242,9 @@ impl Indexer {
                 );
             }
 
-            stats.files_scanned += scan.len();
+            stats.files_scanned += conversations.len();
 
-            for conv in scan {
+            for conv in conversations {
                 // Check if we need to reindex
                 if !self
                     .storage
@@ -248,7 +264,9 @@ impl Indexer {
         // honor `since_ts`, that meant every agent whose files were unmodified
         // since the last scan had ALL of its rows wiped on the next
         // incremental run. See PLAN-stale-index.md Bug A.
-        let summary = self.delete_missing(&connectors, &detected_agents)?;
+        // An incomplete connector scan is not authoritative evidence that a
+        // source disappeared, so only completed agents participate.
+        let summary = self.delete_missing(&connectors, &completed_agents)?;
         Self::log_stale_summary("incremental", &summary);
 
         // Commit changes
@@ -463,15 +481,22 @@ impl Indexer {
         Ok(false)
     }
 
-    /// Read-only dry-run: classify what an incremental index *would* do without
-    /// touching SQLite or Tantivy.
-    pub fn incremental_index_dry_run(&mut self) -> Result<IndexDryRunReport> {
+    /// Open only the existing SQLite source of truth, read-only, and preview an
+    /// index run without constructing Tantivy or semantic state. A missing
+    /// database is treated as an empty index and is not created.
+    pub fn index_dry_run_from(data_dir: &Path, full: bool) -> Result<IndexDryRunReport> {
+        let db_path = data_dir.join("sess.db");
+        let storage = Storage::open_read_only(&db_path)?;
+        Self::index_dry_run_with_storage(storage.as_ref(), full)
+    }
+
+    fn index_dry_run_with_storage(
+        storage: Option<&Storage>,
+        full: bool,
+    ) -> Result<IndexDryRunReport> {
         let mut report = IndexDryRunReport::default();
 
-        let since_ts = self
-            .storage
-            .get_meta("last_scan_ts")?
-            .and_then(|s| s.parse().ok());
+        let since_ts = Self::dry_run_since_ts_from(storage, full)?;
 
         let connectors = all_connectors();
         let detected_agents: HashSet<Agent> = connectors
@@ -479,23 +504,46 @@ impl Indexer {
             .filter(|c| c.detect())
             .map(|c| c.agent())
             .collect();
+        let mut completed_agents = HashSet::new();
 
         for connector in &connectors {
             if !detected_agents.contains(&connector.agent()) {
                 continue;
             }
             let roots = connector.default_roots();
-            let scan_plan = self.connector_scan_plan(connector.as_ref(), &roots, since_ts)?;
-            let conversations = connector.scan(&roots, scan_plan.since_ts)?;
+            let scan_since_ts = if full {
+                None
+            } else {
+                Self::connector_scan_plan_from(storage, connector.as_ref(), &roots, since_ts)?
+                    .since_ts
+            };
+            let scan = connector.scan(&roots, scan_since_ts)?;
+            let mut scan_complete = scan.complete;
+            let mut conversations = scan.conversations;
+
+            if !full && scan_since_ts.is_some() {
+                let recovered =
+                    connector.scan_unindexed_sources(&roots, scan_since_ts, &|path| {
+                        storage.map_or(Ok(false), |storage| storage.has_source_path(path))
+                    })?;
+                scan_complete &= recovered.complete;
+                conversations.extend(recovered.conversations);
+            }
+            if scan_complete {
+                completed_agents.insert(connector.agent());
+            }
+
             let agent = connector.agent();
             *report.would_scan_by_agent.entry(agent).or_insert(0) += conversations.len();
             for conv in conversations {
-                let exists_in_db = self
-                    .storage
-                    .needs_reindex(&conv.source_path, &conv.source_fingerprint)?;
+                let exists_in_db = storage.map_or(Ok(true), |storage| {
+                    storage.needs_reindex(&conv.source_path, &conv.source_fingerprint)
+                })?;
                 // needs_reindex returns true for both "new" and "changed" rows.
                 // Distinguish via a fingerprint lookup.
-                let already_present = self.storage.has_source_path(&conv.source_path)?;
+                let already_present = storage.map_or(Ok(false), |storage| {
+                    storage.has_source_path(&conv.source_path)
+                })?;
                 if !exists_in_db {
                     // already up-to-date
                     continue;
@@ -509,15 +557,27 @@ impl Indexer {
         }
 
         // Stale deletion preview (read-only).
-        let (would_delete, uncertain) = self
-            .storage
-            .classify_missing_sources(&detected_agents, |agent, path| {
-                Self::connector_source_exists(&connectors, agent, path)
-            })?;
-        report.would_delete = would_delete;
-        report.uncertain_paths = uncertain;
+        if let Some(storage) = storage {
+            let (would_delete, uncertain) = storage
+                .classify_missing_sources(&completed_agents, |agent, path| {
+                    Self::connector_source_exists(&connectors, agent, path)
+                })?;
+            report.would_delete = would_delete;
+            report.uncertain_paths = uncertain;
+        }
 
         Ok(report)
+    }
+
+    fn dry_run_since_ts_from(storage: Option<&Storage>, full: bool) -> Result<Option<i64>> {
+        if full {
+            return Ok(None);
+        }
+        Ok(storage
+            .map(|storage| storage.get_meta("last_scan_ts"))
+            .transpose()?
+            .flatten()
+            .and_then(|value| value.parse().ok()))
     }
 
     fn connector_scan_plan(
@@ -526,11 +586,23 @@ impl Indexer {
         roots: &[PathBuf],
         since_ts: Option<i64>,
     ) -> Result<ConnectorScanPlan> {
+        Self::connector_scan_plan_from(Some(&self.storage), connector, roots, since_ts)
+    }
+
+    fn connector_scan_plan_from(
+        storage: Option<&Storage>,
+        connector: &dyn Connector,
+        roots: &[PathBuf],
+        since_ts: Option<i64>,
+    ) -> Result<ConnectorScanPlan> {
         let mut requires_unbounded_scan = false;
 
         if let Some(revision) = connector.parser_revision() {
             let key = format!("connector_parser_revision_{}", connector.agent().slug());
-            let indexed_revision = self.storage.get_meta(&key)?;
+            let indexed_revision = storage
+                .map(|storage| storage.get_meta(&key))
+                .transpose()?
+                .flatten();
             if indexed_revision.as_deref() != Some(revision) {
                 tracing::info!(
                     agent = connector.agent().slug(),
@@ -544,7 +616,10 @@ impl Indexer {
 
         let root_fingerprint = Self::discovered_root_fingerprint(roots);
         let key = format!("connector_root_fingerprint_{}", connector.agent().slug());
-        let indexed_root_fingerprint = self.storage.get_meta(&key)?;
+        let indexed_root_fingerprint = storage
+            .map(|storage| storage.get_meta(&key))
+            .transpose()?
+            .flatten();
         if indexed_root_fingerprint.as_deref() != Some(root_fingerprint.as_str()) {
             tracing::info!(
                 agent = connector.agent().slug(),
@@ -625,11 +700,11 @@ impl Indexer {
     fn delete_missing(
         &mut self,
         connectors: &[Box<dyn Connector>],
-        detected_agents: &HashSet<Agent>,
+        completed_agents: &HashSet<Agent>,
     ) -> Result<StaleDeletionSummary> {
         let summary = self
             .storage
-            .delete_missing_sources_with(detected_agents, |agent, path| {
+            .delete_missing_sources_with(completed_agents, |agent, path| {
                 Self::connector_source_exists(connectors, agent, path)
             })?;
         if !summary.deleted_ids.is_empty() {
@@ -718,6 +793,25 @@ mod tests {
                 since_ts: Some(1234),
                 root_fingerprint,
             }
+        );
+    }
+
+    #[test]
+    fn full_dry_run_ignores_incremental_cursor() {
+        let temp_dir = TempDir::new().unwrap();
+        let indexer = Indexer::new(&temp_dir.path().to_path_buf(), false).unwrap();
+        indexer
+            .storage
+            .set_meta("last_scan_ts", "123456789")
+            .unwrap();
+
+        assert_eq!(
+            Indexer::dry_run_since_ts_from(Some(&indexer.storage), false).unwrap(),
+            Some(123456789)
+        );
+        assert_eq!(
+            Indexer::dry_run_since_ts_from(Some(&indexer.storage), true).unwrap(),
+            None
         );
     }
 
@@ -890,6 +984,7 @@ mod tests {
                 model: None,
             }],
             usage: vec![],
+            metadata: Default::default(),
         };
 
         let mut stats = IndexStats::default();
@@ -938,6 +1033,7 @@ mod tests {
                 model: None,
             }],
             usage: vec![],
+            metadata: Default::default(),
         };
 
         // Index twice with same fingerprint

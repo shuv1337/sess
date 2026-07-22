@@ -40,6 +40,7 @@ fn make_conv(agent: Agent, path: &std::path::Path, content: &str, ts: i64) -> Co
             model: None,
         }],
         usage: vec![],
+        metadata: Default::default(),
     }
 }
 

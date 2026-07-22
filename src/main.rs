@@ -95,7 +95,12 @@ fn run() -> Result<()> {
         .or_else(|| dirs::data_local_dir().map(|d| d.join("sess")))
         .context("Could not determine data directory. Use --data-dir or set SESS_DATA_DIR.")?;
 
-    std::fs::create_dir_all(&data_dir)?;
+    // An index preview is the one command with a filesystem read-only
+    // contract. All other commands retain the normal create-on-first-use
+    // behavior for the sess data directory.
+    if !matches!(&cli.command, Some(Commands::Index { dry_run: true, .. })) {
+        std::fs::create_dir_all(&data_dir)?;
+    }
 
     match cli.command {
         None => {
@@ -213,11 +218,10 @@ fn run() -> Result<()> {
             rebuild,
             dry_run,
         }) => {
-            let mut indexer = Indexer::new(&data_dir, !flags.no_semantic)?;
-
             if dry_run {
-                println!("Running dry-run incremental index (no writes)...");
-                let report = indexer.incremental_index_dry_run()?;
+                let kind = if full { "full" } else { "incremental" };
+                println!("Running dry-run {kind} index (no writes)...");
+                let report = Indexer::index_dry_run_from(&data_dir, full)?;
                 let total_scanned: usize = report.would_scan_by_agent.values().sum();
                 println!("Would scan: {} files", total_scanned);
                 for (agent, count) in &report.would_scan_by_agent {
@@ -245,6 +249,8 @@ fn run() -> Result<()> {
                 }
                 return Ok(());
             }
+
+            let mut indexer = Indexer::new(&data_dir, !flags.no_semantic)?;
 
             let stats = if rebuild {
                 println!("Rebuilding index from SQLite...");
@@ -303,7 +309,11 @@ fn run() -> Result<()> {
             agent,
             provider,
             model,
+            variant,
+            task,
             workspace,
+            exclude_synthetic,
+            estimate_list_costs,
             since,
             until,
             bucket,
@@ -311,7 +321,10 @@ fn run() -> Result<()> {
             json,
             html,
         }) => {
-            let mut indexer = Indexer::new(&data_dir, !flags.no_semantic)?;
+            // Usage analytics only reads normalized SQLite data. Avoid loading
+            // the semantic model/ONNX runtime while retaining the same
+            // connector-rescan and freshness behavior below.
+            let mut indexer = Indexer::new(&data_dir, false)?;
             maybe_auto_refresh(&flags, &mut indexer)?;
 
             let agents = agent
@@ -330,6 +343,10 @@ fn run() -> Result<()> {
                 providers: provider,
                 models: model,
                 workspace,
+                variants: variant,
+                tasks: task,
+                exclude_synthetic,
+                estimate_list_costs,
                 since,
                 until,
                 bucket: bucket.into(),

@@ -13,9 +13,16 @@ use crate::connectors::{
     Connector, ConnectorScan, file_modified_since, json_f64, json_u64, normalized_token_total,
     parse_role, source_file,
 };
-use crate::model::{Agent, Conversation, Message, Role, UsageRecord, source_fingerprint};
+use crate::model::{
+    Agent, Conversation, ConversationMetadata, Message, Role, UsageMetadata, UsageRecord,
+    source_fingerprint,
+};
 
-const PARSER_REVISION: &str = "3";
+const PARSER_REVISION: &str = "4";
+
+const PI_STANDARD_TOKEN_SEMANTICS: &str = "pi.reported-total-with-additive-components.v1";
+const PI_CURSOR_TOKEN_SEMANTICS: &str = "pi.cursor-sdk.cumulative-reported-total.v1";
+const PI_GOOGLE_TOKEN_SEMANTICS: &str = "pi.google.input-includes-cache-read.v1";
 
 pub struct PiAgentConnector {
     home_dir: Option<PathBuf>,
@@ -151,6 +158,88 @@ impl PiAgentConnector {
 
         (session_roots, complete)
     }
+
+    fn scan_matching(
+        &self,
+        roots: &[PathBuf],
+        scan_kind: &'static str,
+        should_parse: &dyn Fn(&Path) -> Result<bool>,
+    ) -> Result<ConnectorScan> {
+        let mut conversations = Vec::new();
+        let mut seen_session_roots = HashSet::new();
+        let mut complete = true;
+
+        for root in roots {
+            let (session_roots, roots_complete) = self.session_roots_for_scan(root);
+            complete &= roots_complete;
+            for sessions_root in session_roots {
+                if !seen_session_roots.insert(path_identity(&sessions_root)) {
+                    continue;
+                }
+                for entry in WalkDir::new(&sessions_root).follow_links(true) {
+                    let entry = match entry {
+                        Ok(entry) => entry,
+                        Err(error) => {
+                            complete = false;
+                            tracing::warn!(
+                                agent = Agent::PiAgent.slug(),
+                                root = %sessions_root.display(),
+                                scan_kind,
+                                error = %error,
+                                "Failed to traverse Pi Agent session storage"
+                            );
+                            continue;
+                        }
+                    };
+                    if !entry.file_type().is_file()
+                        || entry
+                            .path()
+                            .extension()
+                            .is_none_or(|extension| extension != "jsonl")
+                    {
+                        continue;
+                    }
+                    let path = entry.path();
+                    let file_name = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("");
+                    if !is_supported_session_filename(file_name) || !should_parse(path)? {
+                        continue;
+                    }
+
+                    match parse_pi_session(path) {
+                        Ok(Some(conv)) => conversations.push(conv),
+                        Ok(None) => {}
+                        Err(error) => {
+                            complete = false;
+                            match self.on_parse_error(path, &error) {
+                                crate::connectors::ErrorAction::Skip => {
+                                    tracing::warn!(
+                                        agent = Agent::PiAgent.slug(),
+                                        source_path = %path.display(),
+                                        scan_kind,
+                                        error = %error,
+                                        "Failed to parse Pi Agent session"
+                                    );
+                                }
+                                crate::connectors::ErrorAction::Fail => return Err(error),
+                                crate::connectors::ErrorAction::SkipAgent => {
+                                    tracing::warn!(
+                                        scan_kind,
+                                        "Skipping remaining Pi Agent files due to error"
+                                    );
+                                    return Ok(ConnectorScan::new(conversations, false));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(ConnectorScan::new(conversations, complete))
+    }
 }
 
 impl Default for PiAgentConnector {
@@ -210,83 +299,27 @@ impl Connector for PiAgentConnector {
     }
 
     fn scan(&self, roots: &[PathBuf], since_ts: Option<i64>) -> Result<ConnectorScan> {
-        let mut conversations = Vec::new();
-        let mut seen_session_roots = HashSet::new();
-        let mut complete = true;
+        self.scan_matching(roots, "mtime", &|path| {
+            Ok(file_modified_since(path, since_ts))
+        })
+    }
 
-        for root in roots {
-            let (session_roots, roots_complete) = self.session_roots_for_scan(root);
-            complete &= roots_complete;
-            for sessions_root in session_roots {
-                if !seen_session_roots.insert(path_identity(&sessions_root)) {
-                    continue;
-                }
-                // Walk session directories
-                for entry in WalkDir::new(&sessions_root).follow_links(true) {
-                    let entry = match entry {
-                        Ok(entry) => entry,
-                        Err(error) => {
-                            complete = false;
-                            tracing::warn!(
-                                agent = Agent::PiAgent.slug(),
-                                root = %sessions_root.display(),
-                                error = %error,
-                                "Failed to traverse Pi Agent session storage"
-                            );
-                            continue;
-                        }
-                    };
-                    if !entry.file_type().is_file()
-                        || entry
-                            .path()
-                            .extension()
-                            .is_none_or(|extension| extension != "jsonl")
-                    {
-                        continue;
-                    }
-                    let path = entry.path();
-                    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    fn scan_unindexed_sources(
+        &self,
+        roots: &[PathBuf],
+        since_ts: Option<i64>,
+        is_indexed: &dyn Fn(&Path) -> Result<bool>,
+    ) -> Result<ConnectorScan> {
+        let Some(_) = since_ts else {
+            return Ok(ConnectorScan::new(Vec::new(), true));
+        };
 
-                    if !is_supported_session_filename(file_name) {
-                        continue;
-                    }
-
-                    // Check if file was modified since the given timestamp
-                    if !file_modified_since(path, since_ts) {
-                        continue;
-                    }
-
-                    match parse_pi_session(path) {
-                        Ok(Some(conv)) => {
-                            conversations.push(conv);
-                        }
-                        Ok(None) => {
-                            // Empty or no messages, skip
-                        }
-                        Err(e) => {
-                            complete = false;
-                            let action = self.on_parse_error(path, &e);
-                            match action {
-                                crate::connectors::ErrorAction::Skip => {
-                                    tracing::warn!("Failed to parse {}: {}", path.display(), e);
-                                }
-                                crate::connectors::ErrorAction::Fail => {
-                                    return Err(e);
-                                }
-                                crate::connectors::ErrorAction::SkipAgent => {
-                                    tracing::warn!(
-                                        "Skipping remaining Pi Agent files due to error"
-                                    );
-                                    return Ok(ConnectorScan::new(conversations, false));
-                                }
-                            }
-                        }
-                    }
-                }
+        self.scan_matching(roots, "unindexed-backstop", &|path| {
+            if file_modified_since(path, since_ts) {
+                return Ok(false);
             }
-        }
-
-        Ok(ConnectorScan::new(conversations, complete))
+            Ok(!is_indexed(path)?)
+        })
     }
 
     fn parser_revision(&self) -> Option<&'static str> {
@@ -315,6 +348,140 @@ fn is_supported_session_filename(file_name: &str) -> bool {
     false
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NormalizedPiUsage {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+    total: u64,
+    reported_total: Option<u64>,
+    component_total: u64,
+    token_semantics: &'static str,
+}
+
+fn optional_json_u64(value: &Value, pointers: &[&str]) -> Option<u64> {
+    pointers.iter().find_map(|pointer| {
+        let value = value.pointer(pointer)?;
+        value
+            .as_u64()
+            .or_else(|| value.as_i64().and_then(|number| number.try_into().ok()))
+    })
+}
+
+/// Normalize the provider-specific token shapes emitted by Pi-compatible
+/// harnesses without overwriting the source-reported total.
+fn normalize_pi_usage(
+    raw_usage: &Value,
+    provider: Option<&str>,
+    api: Option<&str>,
+) -> NormalizedPiUsage {
+    let raw_input = json_u64(raw_usage, &["/input", "/inputTokens"]);
+    let output = json_u64(raw_usage, &["/output", "/outputTokens"]);
+    let cache_read = json_u64(raw_usage, &["/cacheRead", "/cache_read_tokens"]);
+    let cache_write = json_u64(raw_usage, &["/cacheWrite", "/cache_write_tokens"]);
+    let reported_total = optional_json_u64(raw_usage, &["/totalTokens", "/total_tokens"]);
+
+    let provider = provider.unwrap_or_default();
+    let api = api.unwrap_or_default();
+    let cursor_shape =
+        provider.eq_ignore_ascii_case("cursor") || api.eq_ignore_ascii_case("cursor-sdk");
+    let google_shape = (provider.eq_ignore_ascii_case("google")
+        || api.eq_ignore_ascii_case("google-generative-ai"))
+        && cache_read <= raw_input;
+
+    // Google's Pi adapter reports cached prompt tokens inside `input`. Store
+    // non-overlapping categories so input + cache + output reconciles to total.
+    let input = if google_shape {
+        raw_input.saturating_sub(cache_read)
+    } else {
+        raw_input
+    };
+    let component_total = input
+        .saturating_add(output)
+        .saturating_add(cache_read)
+        .saturating_add(cache_write);
+
+    // cursor-sdk's `totalTokens` is a cumulative context counter repeated on
+    // every message. Its component counters are per invocation, so summing the
+    // components is the only additive event total.
+    let total = if cursor_shape {
+        component_total
+    } else {
+        normalized_token_total(
+            reported_total.unwrap_or_default(),
+            input,
+            output,
+            cache_read,
+            cache_write,
+        )
+    };
+    let token_semantics = if cursor_shape {
+        PI_CURSOR_TOKEN_SEMANTICS
+    } else if google_shape {
+        PI_GOOGLE_TOKEN_SEMANTICS
+    } else {
+        PI_STANDARD_TOKEN_SEMANTICS
+    };
+
+    NormalizedPiUsage {
+        input,
+        output,
+        cache_read,
+        cache_write,
+        total,
+        reported_total,
+        component_total,
+        token_semantics,
+    }
+}
+
+fn pi_session_id_from_path(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    let candidate = stem.rsplit_once('_').map(|(_, id)| id).unwrap_or(stem);
+    uuid::Uuid::parse_str(candidate)
+        .ok()
+        .map(|_| candidate.to_string())
+}
+
+fn parent_session_id(raw_parent: &str, source_path: &Path) -> Option<String> {
+    let parent = PathBuf::from(raw_parent);
+    let parent = if parent.is_absolute() {
+        parent
+    } else {
+        source_path.parent().unwrap_or(Path::new(".")).join(parent)
+    };
+    pi_session_id_from_path(&parent).or_else(|| {
+        let file = File::open(parent).ok()?;
+        BufReader::new(file)
+            .lines()
+            .map_while(std::result::Result::ok)
+            .filter(|line| !line.trim().is_empty())
+            .find_map(|line| {
+                let value: Value = serde_json::from_str(&line).ok()?;
+                (value.get("type").and_then(Value::as_str) == Some("session"))
+                    .then(|| value.get("id").and_then(Value::as_str).map(str::to_owned))
+                    .flatten()
+            })
+    })
+}
+
+fn is_temporary_workspace(workspace: Option<&Path>) -> bool {
+    workspace.is_some_and(|workspace| {
+        let workspace = workspace.to_string_lossy();
+        workspace == "/tmp"
+            || workspace.starts_with("/tmp/")
+            || workspace == "/var/tmp"
+            || workspace.starts_with("/var/tmp/")
+            || workspace == "/private/tmp"
+            || workspace.starts_with("/private/tmp/")
+    })
+}
+
+fn path_has_segment(path: &Path, needle: &str) -> bool {
+    path.to_string_lossy().contains(needle)
+}
+
 fn parse_pi_session(path: &Path) -> Result<Option<Conversation>> {
     let file = File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
     let reader = BufReader::new(file);
@@ -328,6 +495,7 @@ fn parse_pi_session(path: &Path) -> Result<Option<Conversation>> {
     let mut timestamps: Vec<i64> = Vec::new();
     let mut current_model: Option<String> = None;
     let mut current_provider: Option<String> = None;
+    let mut parent_external_id: Option<String> = None;
     let mut usage: Vec<UsageRecord> = Vec::new();
 
     for (line_num, line) in reader.lines().enumerate() {
@@ -367,6 +535,9 @@ fn parse_pi_session(path: &Path) -> Result<Option<Conversation>> {
                 }
                 if let Some(provider) = value.get("provider").and_then(Value::as_str) {
                     current_provider = Some(provider.to_string());
+                }
+                if let Some(parent) = value.get("parentSession").and_then(Value::as_str) {
+                    parent_external_id = parent_session_id(parent, path);
                 }
             }
             Some("model_change") => {
@@ -425,38 +596,42 @@ fn parse_pi_session(path: &Path) -> Result<Option<Conversation>> {
                             .and_then(|id| {
                                 timestamp.map(|timestamp| format!("pi-message:{id}:{timestamp}"))
                             });
-                        let input = json_u64(raw_usage, &["/input", "/inputTokens"]);
-                        let output = json_u64(raw_usage, &["/output", "/outputTokens"]);
-                        let cache_read = json_u64(raw_usage, &["/cacheRead", "/cache_read_tokens"]);
-                        let cache_write =
-                            json_u64(raw_usage, &["/cacheWrite", "/cache_write_tokens"]);
-                        let record = UsageRecord {
+                        let api = msg.get("api").and_then(Value::as_str);
+                        let normalized =
+                            normalize_pi_usage(raw_usage, message_provider.as_deref(), api);
+                        let estimated_cost_usd =
+                            json_f64(raw_usage, &["/cost/total", "/costUsd", "/cost_usd"]);
+                        let mut record = UsageRecord {
                             timestamp,
                             provider: message_provider.clone(),
                             model: message_model.clone(),
                             source_event_id,
                             api_calls: 1,
-                            input_tokens: input,
-                            output_tokens: output,
-                            cache_read_tokens: cache_read,
-                            cache_write_tokens: cache_write,
+                            input_tokens: normalized.input,
+                            output_tokens: normalized.output,
+                            cache_read_tokens: normalized.cache_read,
+                            cache_write_tokens: normalized.cache_write,
                             reasoning_tokens: json_u64(
                                 raw_usage,
                                 &["/reasoning", "/reasoningTokens"],
                             ),
-                            total_tokens: normalized_token_total(
-                                json_u64(raw_usage, &["/totalTokens", "/total_tokens"]),
-                                input,
-                                output,
-                                cache_read,
-                                cache_write,
-                            ),
+                            total_tokens: normalized.total,
                             actual_cost_usd: None,
-                            estimated_cost_usd: json_f64(
-                                raw_usage,
-                                &["/cost/total", "/costUsd", "/cost_usd"],
-                            ),
+                            estimated_cost_usd,
+                            metadata: UsageMetadata {
+                                request_attempts: 1,
+                                reported_total_tokens: normalized.reported_total,
+                                component_total_tokens: Some(normalized.component_total),
+                                token_semantics: Some(normalized.token_semantics.to_string()),
+                                cost_status: estimated_cost_usd
+                                    .filter(|cost| cost.abs() <= f64::EPSILON)
+                                    .map(|_| "source_reported_zero".to_string()),
+                                cost_source: estimated_cost_usd
+                                    .map(|_| "pi_usage.cost.total".to_string()),
+                                ..UsageMetadata::default()
+                            },
                         };
+                        record.enrich_metadata();
                         if record.has_usage() {
                             usage.push(record);
                         }
@@ -522,6 +697,35 @@ fn parse_pi_session(path: &Path) -> Result<Option<Conversation>> {
             .map(|s| s.to_string())
     });
 
+    let explicit_faux = current_provider
+        .as_deref()
+        .is_some_and(|provider| provider.eq_ignore_ascii_case("faux"))
+        || current_model
+            .as_deref()
+            .is_some_and(|model| model.eq_ignore_ascii_case("faux") || model.starts_with("faux-"))
+        || usage.iter().any(|record| {
+            record
+                .provider
+                .as_deref()
+                .is_some_and(|provider| provider.eq_ignore_ascii_case("faux"))
+                || record.model.as_deref().is_some_and(|model| {
+                    model.eq_ignore_ascii_case("faux") || model.starts_with("faux-")
+                })
+        });
+    let is_synthetic = explicit_faux || is_temporary_workspace(workspace.as_deref());
+    let hierarchy_child =
+        parent_external_id.is_some() || path_has_segment(path, "/.shuvhelm/mate/");
+    let record_kind = if is_synthetic {
+        "test"
+    } else if hierarchy_child {
+        "child_agent"
+    } else if path_has_segment(path, "/.openclaw/agents/") {
+        "automation"
+    } else {
+        "top_level"
+    };
+    let logical_session_id = parent_external_id.clone().or_else(|| external_id.clone());
+
     Ok(Some(Conversation {
         agent: Agent::PiAgent,
         external_id,
@@ -534,6 +738,12 @@ fn parse_pi_session(path: &Path) -> Result<Option<Conversation>> {
         ended_at,
         messages,
         usage,
+        metadata: ConversationMetadata {
+            logical_session_id,
+            parent_external_id,
+            record_kind: Some(record_kind.to_string()),
+            is_synthetic,
+        },
     }))
 }
 
@@ -598,7 +808,9 @@ fn decode_safe_path(safe_path: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::{FileTimes, OpenOptions};
     use std::io::Write;
+    use std::time::{Duration, SystemTime};
     use tempfile::{NamedTempFile, TempDir};
 
     #[test]
@@ -646,10 +858,128 @@ mod tests {
         assert_eq!(usage.cache_write_tokens, 0);
         assert_eq!(usage.total_tokens, 22_371);
         assert_eq!(usage.estimated_cost_usd, Some(0.026015));
+        assert_eq!(usage.metadata.reported_total_tokens, Some(22_371));
+        assert_eq!(usage.metadata.component_total_tokens, Some(22_371));
+        assert_eq!(
+            usage.metadata.token_semantics.as_deref(),
+            Some(PI_STANDARD_TOKEN_SEMANTICS)
+        );
         assert_eq!(
             usage.source_event_id.as_deref(),
             Some("pi-message:assistant-1:1705312805000")
         );
+    }
+
+    #[test]
+    fn cursor_cumulative_total_uses_per_event_components() {
+        let content = r#"{"type":"session","id":"cursor-session","cwd":"/work","provider":"cursor","modelId":"composer-2-5"}
+{"type":"message","id":"a1","timestamp":"2026-06-16T22:32:20Z","message":{"role":"assistant","api":"cursor-sdk","provider":"cursor","model":"composer-2-5","content":"one","usage":{"input":100,"output":10,"cacheRead":0,"cacheWrite":0,"totalTokens":110}}}
+{"type":"message","id":"a2","timestamp":"2026-06-16T22:32:21Z","message":{"role":"assistant","api":"cursor-sdk","provider":"cursor","model":"composer-2-5","content":"two","usage":{"input":20,"output":5,"cacheRead":0,"cacheWrite":0,"totalTokens":135}}}
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(content.as_bytes()).unwrap();
+
+        let conversation = parse_pi_session(temp_file.path()).unwrap().unwrap();
+        assert_eq!(conversation.usage.len(), 2);
+        assert_eq!(
+            conversation
+                .usage
+                .iter()
+                .map(|record| record.total_tokens)
+                .sum::<u64>(),
+            135
+        );
+        assert_eq!(conversation.usage[1].total_tokens, 25);
+        assert_eq!(
+            conversation.usage[1].metadata.reported_total_tokens,
+            Some(135)
+        );
+        assert_eq!(
+            conversation.usage[1].metadata.component_total_tokens,
+            Some(25)
+        );
+        assert_eq!(
+            conversation.usage[1].metadata.token_semantics.as_deref(),
+            Some(PI_CURSOR_TOKEN_SEMANTICS)
+        );
+    }
+
+    #[test]
+    fn google_input_including_cache_is_split_into_non_overlapping_components() {
+        let content = r#"{"type":"session","id":"google-session","cwd":"/work","provider":"google","modelId":"gemini-3.1-pro-preview-customtools"}
+{"type":"message","id":"a1","timestamp":"2026-02-26T01:29:21Z","message":{"role":"assistant","api":"google-generative-ai","provider":"google","model":"gemini-3.1-pro-preview-customtools","content":"done","usage":{"input":10432,"output":152,"cacheRead":7649,"cacheWrite":0,"totalTokens":10584}}}
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(content.as_bytes()).unwrap();
+
+        let conversation = parse_pi_session(temp_file.path()).unwrap().unwrap();
+        let usage = &conversation.usage[0];
+        assert_eq!(usage.input_tokens, 2_783);
+        assert_eq!(usage.cache_read_tokens, 7_649);
+        assert_eq!(usage.output_tokens, 152);
+        assert_eq!(usage.total_tokens, 10_584);
+        assert_eq!(usage.metadata.component_total_tokens, Some(10_584));
+        assert_eq!(usage.metadata.reported_total_tokens, Some(10_584));
+        assert_eq!(
+            usage.metadata.token_semantics.as_deref(),
+            Some(PI_GOOGLE_TOKEN_SEMANTICS)
+        );
+    }
+
+    #[test]
+    fn faux_or_temporary_pi_sessions_are_explicitly_classified_as_tests() {
+        let content = r#"{"type":"session","id":"synthetic-session","cwd":"/tmp/pi-runtime-test","provider":"faux","modelId":"faux-1"}
+{"type":"message","id":"a1","timestamp":"2026-07-21T20:24:52Z","message":{"role":"assistant","provider":"faux","model":"faux-1","content":"one","usage":{"input":10,"output":1,"cacheWrite":10,"totalTokens":21,"cost":{"total":0}}}}
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(content.as_bytes()).unwrap();
+
+        let conversation = parse_pi_session(temp_file.path()).unwrap().unwrap();
+        assert!(conversation.metadata.is_synthetic);
+        assert_eq!(conversation.metadata.record_kind.as_deref(), Some("test"));
+        // Raw source dimensions stay intact for transparent all-vs-organic views.
+        assert_eq!(conversation.usage[0].provider.as_deref(), Some("faux"));
+        assert_eq!(conversation.usage[0].model.as_deref(), Some("faux-1"));
+        assert_eq!(
+            conversation.usage[0].metadata.cost_status.as_deref(),
+            Some("source_reported_zero")
+        );
+    }
+
+    #[test]
+    fn parent_session_path_preserves_pi_hierarchy() {
+        let directory = TempDir::new().unwrap();
+        let parent_id = "019f865a-47eb-7022-9bed-d17daa6cfdb8";
+        let child_id = "019f865a-4800-7f59-9939-e02050edf589";
+        let parent = directory
+            .path()
+            .join(format!("2026-07-21T20-24-51Z_{parent_id}.jsonl"));
+        let child = directory
+            .path()
+            .join(format!("2026-07-21T20-24-52Z_{child_id}.jsonl"));
+        std::fs::write(
+            &child,
+            format!(
+                "{{\"type\":\"session\",\"id\":\"{child_id}\",\"cwd\":\"/work\",\"parentSession\":{}}}\n{{\"type\":\"message\",\"timestamp\":\"2026-07-21T20:24:52Z\",\"message\":{{\"role\":\"user\",\"content\":\"hello\"}}}}\n",
+                serde_json::to_string(&parent).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let conversation = parse_pi_session(&child).unwrap().unwrap();
+        assert_eq!(
+            conversation.metadata.parent_external_id.as_deref(),
+            Some(parent_id)
+        );
+        assert_eq!(
+            conversation.metadata.logical_session_id.as_deref(),
+            Some(parent_id)
+        );
+        assert_eq!(
+            conversation.metadata.record_kind.as_deref(),
+            Some("child_agent")
+        );
+        assert!(!conversation.metadata.is_synthetic);
     }
 
     #[test]
@@ -1070,5 +1400,46 @@ mod tests {
             .scan(&[PathBuf::from("/nonexistent/root")], None)
             .unwrap();
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn preserved_mtime_import_is_recovered_by_unknown_source_scan() {
+        let root = TempDir::new().unwrap();
+        let sessions = root.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let session_file = sessions.join("2024-01-15T10-00-00Z_imported.jsonl");
+        std::fs::write(
+            &session_file,
+            r#"{"type":"session","id":"imported","cwd":"/work","modelId":"m1"}
+{"type":"message","timestamp":"2024-01-15T10:00:00Z","message":{"role":"user","content":"Imported session"}}
+"#,
+        )
+        .unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&session_file)
+            .unwrap()
+            .set_times(
+                FileTimes::new().set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
+            )
+            .unwrap();
+
+        let connector = PiAgentConnector {
+            home_dir: Some(PathBuf::from("/nonexistent")),
+        };
+        let roots = vec![root.path().to_path_buf()];
+        let since_ts = 20_000;
+        assert!(connector.scan(&roots, Some(since_ts)).unwrap().is_empty());
+
+        let recovered = connector
+            .scan_unindexed_sources(&roots, Some(since_ts), &|_| Ok(false))
+            .unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].source_path, session_file);
+
+        let already_indexed = connector
+            .scan_unindexed_sources(&roots, Some(since_ts), &|_| Ok(true))
+            .unwrap();
+        assert!(already_indexed.is_empty());
     }
 }

@@ -84,7 +84,8 @@ Key design choice: **SQLite is source of truth**, Tantivy is a derived search in
 │   │   └── migrations
 │   │       ├── 001_initial.sql
 │   │       ├── 002_add_embeddings.sql
-│   │       └── 003_add_usage_events.sql
+│   │       ├── 003_add_usage_events.sql
+│   │       └── 004_usage_provenance.sql
 │   └── tui
 │       ├── mod.rs
 │       ├── app.rs
@@ -128,8 +129,16 @@ Implemented connectors:
 Each connector converts native transcript structures to common `Conversation`,
 `Message`, and invocation/session-model `UsageRecord` values. Usage stays
 separate from normalized messages because a single provider call may produce
-several searchable message parts, while Hermes can expose model-level session
-aggregates without per-message token counts.
+several searchable message parts, while Hermes and OpenCode can expose bounded
+session/model aggregates without per-message token counts. Stable source event
+IDs suppress copied invocation rows; explicit event/interval/session grain and
+interval bounds prevent aggregates from masquerading as exact events.
+
+Conversation provenance distinguishes physical transcript records from logical
+sessions, parent/child records, synthetic/test records, and record kind. Usage
+provenance retains raw and canonical provider/model identities, inference
+source/confidence, model variant/task, billing route/mode, request attempts,
+token semantics, component/reported totals, and cost status/source/version.
 
 ## 5.3 Storage (`src/storage/sqlite.rs`)
 Responsibilities:
@@ -182,11 +191,18 @@ Coordinates connectors, storage upsert decisions, Tantivy updates, and embedding
 
 ## 5.9 Usage analytics (`src/usage.rs`)
 
-- filters normalized usage rows by harness, provider, model, workspace, and time
-- builds one serializable report with totals, attribution/coverage, breakdowns,
-  costs, and UTC calendar trends
+- filters normalized usage rows by harness, provider, model, variant, task,
+  workspace, synthetic status, and time
+- builds one serializable report with transcript/logical-session/API-call/
+  attempt totals, raw and canonical attribution, joint provider-model splits,
+  source coverage, hierarchy/grain, deduplication, costs, and UTC calendar trends
 - renders the same report as compact terminal text or standalone inline-CSS/SVG HTML
-- preserves explicit Unknown groups and reports cost/token attribution coverage
+- preserves explicit Unknown groups and reports attribution coverage by both
+  represented calls and tokens
+- keeps source-health coverage explicitly full-corpus/raw because records with
+  assistant output but no usage cannot be filtered by provider/model/time
+- reports token-semantics provenance and reconciles comparable source totals
+  against normalized components without treating non-comparable rows as errors
 
 ---
 
@@ -234,9 +250,14 @@ Coordinates connectors, storage upsert decisions, Tantivy updates, and embedding
 3. Apply report filters and aggregate tokens/API calls/costs once
 4. Emit terminal text, renderer-independent JSON, or a standalone HTML report
 
-Provider/model coverage is weighted by represented API calls. Source-level
-usage aggregates that exceed their event rows are stored as undated residuals,
-so totals stay complete without inventing timeline precision.
+Provider/model coverage is reported by represented API calls and by tokens.
+Aggregate intervals enter a requested range only when fully contained and enter
+a trend bucket only when the entire interval fits; unallocated and excluded
+tokens remain explicit. Actual cost, source estimates, and opt-in versioned
+public-list estimates are never collapsed into one billing-truth field. The
+public-list estimator requires complete components, exact first-party models,
+and an unambiguous direct route; unsupported modifiers, gateways, regional
+pricing, and ambiguous cache-write TTLs remain visibly uncovered.
 
 ---
 

@@ -66,6 +66,23 @@ pub trait Connector: Send + Sync {
     /// `since_ts` is a best-effort incremental hint.
     fn scan(&self, roots: &[PathBuf], since_ts: Option<i64>) -> Result<ConnectorScan>;
 
+    /// Recover source paths that are not yet indexed even when their mtimes
+    /// predate the incremental cursor. File-backed connectors can override
+    /// this to cheaply inventory their roots and parse only unknown sources.
+    ///
+    /// `since_ts` is the same cursor used by the ordinary incremental scan.
+    /// Implementations should ignore paths that the ordinary scan would have
+    /// selected, avoiding duplicate parsing. The callback must be consulted
+    /// using the connector's canonical `Conversation::source_path`.
+    fn scan_unindexed_sources(
+        &self,
+        _roots: &[PathBuf],
+        _since_ts: Option<i64>,
+        _is_indexed: &dyn Fn(&Path) -> Result<bool>,
+    ) -> Result<ConnectorScan> {
+        Ok(ConnectorScan::new(Vec::new(), true))
+    }
+
     /// Revision of the connector's normalized output format. Bumping this
     /// requests one full source rescan so existing rows can be migrated.
     fn parser_revision(&self) -> Option<&'static str> {

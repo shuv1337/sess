@@ -101,15 +101,15 @@ pub enum Commands {
     /// Run indexing
     Index {
         /// Full reindex from scratch
-        #[arg(long)]
+        #[arg(long, conflicts_with = "rebuild")]
         full: bool,
 
         /// Rebuild from SQLite (no rescan)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "full")]
         rebuild: bool,
 
         /// Show what would change without writing to SQLite or Tantivy.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "rebuild")]
         dry_run: bool,
     },
 
@@ -134,9 +134,25 @@ pub enum Commands {
         #[arg(short, long, value_name = "MODEL")]
         model: Vec<String>,
 
+        /// Filter by model variant / reasoning effort (repeatable)
+        #[arg(long, value_name = "VARIANT")]
+        variant: Vec<String>,
+
+        /// Filter by source task such as approval or compression (repeatable)
+        #[arg(long, value_name = "TASK")]
+        task: Vec<String>,
+
         /// Filter by exact workspace path
         #[arg(short, long, value_name = "PATH")]
         workspace: Option<String>,
+
+        /// Exclude synthetic, test, and faux-provider transcript records
+        #[arg(long, visible_alias = "organic")]
+        exclude_synthetic: bool,
+
+        /// Add a versioned public-list estimate for exact supported model routes
+        #[arg(long)]
+        estimate_list_costs: bool,
 
         /// Filter by start date (ISO date, "7d", "30d", "today")
         #[arg(long, value_name = "DATE")]
@@ -150,7 +166,7 @@ pub enum Commands {
         #[arg(long, value_enum, default_value = "auto")]
         bucket: UsageBucketArg,
 
-        /// Maximum displayed rows per breakdown (terminal/HTML; JSON stays complete)
+        /// Top attributed rows per breakdown (Unknown stays visible; JSON stays complete)
         #[arg(long, default_value = "10")]
         top: usize,
 
@@ -444,6 +460,33 @@ mod tests {
             }
             _ => panic!("expected Index"),
         }
+    }
+
+    #[test]
+    fn cli_parses_full_index_dry_run() {
+        let cli = Cli::try_parse_from(["sess", "index", "--full", "--dry-run"]).expect("parse");
+        match cli.command {
+            Some(Commands::Index {
+                dry_run,
+                full,
+                rebuild,
+            }) => {
+                assert!(dry_run);
+                assert!(full);
+                assert!(!rebuild);
+            }
+            _ => panic!("expected Index"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_rebuild_dry_run() {
+        assert!(Cli::try_parse_from(["sess", "index", "--rebuild", "--dry-run"]).is_err());
+    }
+
+    #[test]
+    fn cli_rejects_full_rebuild() {
+        assert!(Cli::try_parse_from(["sess", "index", "--full", "--rebuild"]).is_err());
     }
 
     #[test]

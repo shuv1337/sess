@@ -125,6 +125,75 @@ pub struct Message {
     pub model: Option<String>,  // e.g. "claude-opus-4-5", "gpt-5.1-codex"
 }
 
+/// Temporal meaning of one usage row.
+///
+/// Event rows represent a single provider invocation. Aggregate rows preserve
+/// source totals without pretending that all of their tokens happened at one
+/// instant.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageGrain {
+    #[default]
+    Event,
+    IntervalAggregate,
+    SessionAggregate,
+}
+
+impl UsageGrain {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Event => "event",
+            Self::IntervalAggregate => "interval_aggregate",
+            Self::SessionAggregate => "session_aggregate",
+        }
+    }
+}
+
+impl std::str::FromStr for UsageGrain {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "event" => Ok(Self::Event),
+            "interval_aggregate" => Ok(Self::IntervalAggregate),
+            "session_aggregate" => Ok(Self::SessionAggregate),
+            _ => anyhow::bail!("Unknown usage grain: {value}"),
+        }
+    }
+}
+
+/// Source facts and derived provenance attached to one usage observation.
+///
+/// Raw `provider` and `model` remain on [`UsageRecord`]. These fields add
+/// queryable semantics without overwriting what the harness reported.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct UsageMetadata {
+    /// Inclusive interval covered by an aggregate row, in Unix millis UTC.
+    pub interval_start: Option<i64>,
+    pub interval_end: Option<i64>,
+    pub grain: UsageGrain,
+    pub provider_family: Option<String>,
+    pub provider_inference_source: Option<String>,
+    pub provider_inference_confidence: Option<String>,
+    pub model_family: Option<String>,
+    pub model_variant: Option<String>,
+    pub task: Option<String>,
+    pub billing_base_url: Option<String>,
+    pub billing_mode: Option<String>,
+    /// Request attempts represented by the row, including failed requests.
+    pub request_attempts: u64,
+    /// Total exactly as reported by the source before connector normalization.
+    pub reported_total_tokens: Option<u64>,
+    /// Sum of the normalized non-overlapping token components, when known.
+    pub component_total_tokens: Option<u64>,
+    /// Versioned description of the source token-counter shape.
+    pub token_semantics: Option<String>,
+    pub cost_status: Option<String>,
+    pub cost_source: Option<String>,
+    pub cost_currency: Option<String>,
+    pub pricing_version: Option<String>,
+}
+
 /// Provider-reported usage for one model invocation.
 ///
 /// Token categories preserve the source harness semantics. `total_tokens` is
@@ -149,15 +218,247 @@ pub struct UsageRecord {
     pub total_tokens: u64,
     pub actual_cost_usd: Option<f64>,
     pub estimated_cost_usd: Option<f64>,
+    #[serde(default)]
+    pub metadata: UsageMetadata,
 }
 
 impl UsageRecord {
     pub fn has_usage(&self) -> bool {
         self.api_calls > 0
             || self.total_tokens > 0
+            || self.metadata.request_attempts > 0
             || self.actual_cost_usd.is_some()
             || self.estimated_cost_usd.is_some()
     }
+
+    /// Fill canonical dimensions and token/cost provenance without changing
+    /// the source-reported provider, model, counters, or costs.
+    pub fn enrich_metadata(&mut self) {
+        if self.metadata.provider_family.is_none() {
+            let (family, source, confidence) = canonical_provider_family(
+                self.provider.as_deref(),
+                self.metadata.billing_base_url.as_deref(),
+            );
+            self.metadata.provider_family = family;
+            self.metadata.provider_inference_source = source;
+            self.metadata.provider_inference_confidence = confidence;
+        }
+        if self.metadata.model_family.is_none() {
+            self.metadata.model_family = canonical_model_family(self.model.as_deref());
+        }
+        if self.metadata.request_attempts == 0 && self.api_calls > 0 {
+            self.metadata.request_attempts = self.api_calls;
+        }
+        if self.metadata.component_total_tokens.is_none() {
+            self.metadata.component_total_tokens = Some(
+                self.input_tokens
+                    .saturating_add(self.output_tokens)
+                    .saturating_add(self.cache_read_tokens)
+                    .saturating_add(self.cache_write_tokens),
+            );
+        }
+        let has_positive_actual = self
+            .actual_cost_usd
+            .is_some_and(|cost| cost.is_finite() && cost > 0.0);
+        let has_positive_estimate = self
+            .estimated_cost_usd
+            .is_some_and(|cost| cost.is_finite() && cost > 0.0);
+        let cost_status = self
+            .metadata
+            .cost_status
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let has_explicit_recorded_actual = self
+            .actual_cost_usd
+            .is_some_and(|cost| cost.is_finite() && cost >= 0.0)
+            && matches!(cost_status.as_str(), "actual" | "reported_actual");
+        let has_explicit_recorded_estimate = self
+            .estimated_cost_usd
+            .is_some_and(|cost| cost.is_finite() && cost >= 0.0)
+            && matches!(
+                cost_status.as_str(),
+                "estimated" | "source_estimated" | "source_reported_zero" | "included"
+            );
+        if self.metadata.cost_currency.is_none()
+            && (has_positive_actual
+                || has_positive_estimate
+                || has_explicit_recorded_actual
+                || has_explicit_recorded_estimate)
+        {
+            self.metadata.cost_currency = Some("USD".to_string());
+        }
+        if self.metadata.cost_status.is_none() {
+            self.metadata.cost_status = if has_positive_actual {
+                Some("reported_actual".to_string())
+            } else if has_positive_estimate {
+                Some("source_estimated".to_string())
+            } else {
+                Some("unknown".to_string())
+            };
+        }
+    }
+}
+
+/// Resolve a canonical provider family from explicit routing evidence.
+///
+/// Raw provider identifiers such as adapters and auth routes are preserved on
+/// the record. A base URL wins because it identifies the actual inference
+/// endpoint. With neither signal, the family remains unknown.
+pub fn canonical_provider_family(
+    raw_provider: Option<&str>,
+    billing_base_url: Option<&str>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    if let Some(base_url) = billing_base_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let normalized = base_url.to_ascii_lowercase();
+        let host = route_host(&normalized);
+        let family = [
+            ("fireworks.ai", "fireworks"),
+            ("x.ai", "xai"),
+            ("chatgpt.com", "openai"),
+            ("openai.com", "openai"),
+            ("anthropic.com", "anthropic"),
+            ("googleapis.com", "google"),
+            ("openrouter.ai", "openrouter"),
+            ("mistral.ai", "mistral"),
+            ("deepseek.com", "deepseek"),
+        ]
+        .into_iter()
+        .find_map(|(domain, family)| {
+            host.as_deref()
+                .is_some_and(|host| host == domain || host.ends_with(&format!(".{domain}")))
+                .then_some(family)
+        });
+        if let Some(family) = family {
+            return (
+                Some(family.to_string()),
+                Some("billing_base_url".to_string()),
+                Some("high".to_string()),
+            );
+        }
+        return (
+            None,
+            Some("billing_base_url_unmapped".to_string()),
+            Some("none".to_string()),
+        );
+    }
+
+    let Some(raw) = raw_provider
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return (None, None, None);
+    };
+    let normalized = raw.to_ascii_lowercase();
+    let family = match normalized.as_str() {
+        "openai" | "openai-codex" | "azure-openai" => "openai",
+        "anthropic" | "bedrock-anthropic" | "vertex-anthropic" => "anthropic",
+        "google" | "google-vertex" | "google-antigravity" | "antigravity" | "vertex" => "google",
+        "xai" | "x-ai" | "xai-oauth" => "xai",
+        "fireworks" | "fireworks-ai" => "fireworks",
+        "openrouter" => "openrouter",
+        "cursor" => "cursor",
+        "github-copilot" | "copilot" => "github-copilot",
+        "groq" => "groq",
+        "mistral" => "mistral",
+        "deepseek" => "deepseek",
+        "kimi-coding" | "kimi-for-coding" | "moonshot" | "moonshot-plan" => "moonshot",
+        "zai" | "zhipu" | "zai-coding-plan" => "zai",
+        "minimax" => "minimax",
+        "lmstudio" => "local",
+        "cloudflare-workers-ai" => "cloudflare",
+        "cerebras" => "cerebras",
+        "together" | "together-ai" => "together",
+        "cohere" => "cohere",
+        // Adapter and subscription labels are deliberately not guessed without
+        // route evidence. Raw values remain queryable on UsageRecord.
+        "custom" | "auto" | "faux" | "firepass" | "firepass_chat" | "open-hax" | "proxx"
+        | "opencode" | "opencode-go" | "unknown" => {
+            return (
+                None,
+                Some("raw_provider_unmapped".to_string()),
+                Some("none".to_string()),
+            );
+        }
+        _ => {
+            return (
+                None,
+                Some("raw_provider_unmapped".to_string()),
+                Some("none".to_string()),
+            );
+        }
+    };
+    (
+        Some(family.to_string()),
+        Some("raw_provider".to_string()),
+        Some("high".to_string()),
+    )
+}
+
+/// Coarse, stable model family for cross-version trend grouping.
+pub fn canonical_model_family(raw_model: Option<&str>) -> Option<String> {
+    let raw = raw_model.map(str::trim).filter(|value| !value.is_empty())?;
+    let normalized = raw.to_ascii_lowercase();
+    let family = if normalized.contains("claude") {
+        "claude"
+    } else if normalized.contains("gemini") {
+        "gemini"
+    } else if normalized.contains("grok") {
+        "grok"
+    } else if normalized.contains("llama") {
+        "llama"
+    } else if normalized.contains("deepseek") {
+        "deepseek"
+    } else if normalized.contains("mistral") || normalized.contains("mixtral") {
+        "mistral"
+    } else if normalized.contains("kimi") {
+        "kimi"
+    } else if normalized.contains("minimax") {
+        "minimax"
+    } else if normalized.contains("glm") {
+        "glm"
+    } else if normalized.contains("composer") {
+        "composer"
+    } else if normalized.starts_with("gpt-") || normalized.contains("/gpt-") {
+        "gpt"
+    } else if ["o1", "o3", "o4"]
+        .iter()
+        .any(|prefix| normalized == *prefix || normalized.starts_with(&format!("{prefix}-")))
+    {
+        "openai-o"
+    } else if normalized.contains("qwen") {
+        "qwen"
+    } else if normalized.contains("command-r") {
+        "command-r"
+    } else {
+        return None;
+    };
+    Some(family.to_string())
+}
+
+pub(crate) fn route_host(value: &str) -> Option<String> {
+    let authority_and_path = value
+        .split_once("://")
+        .map(|(_, remainder)| remainder)
+        .unwrap_or(value);
+    let authority = authority_and_path
+        .split(['/', '?', '#'])
+        .next()?
+        .rsplit('@')
+        .next()?;
+    let host = if authority.starts_with('[') {
+        authority
+            .strip_prefix('[')?
+            .split_once(']')
+            .map(|(host, _)| host)?
+    } else {
+        authority.split(':').next()?
+    };
+    (!host.is_empty()).then(|| host.trim_end_matches('.').to_string())
 }
 
 impl Message {
@@ -193,6 +494,20 @@ pub struct Conversation {
     pub messages: Vec<Message>,
     #[serde(default)]
     pub usage: Vec<UsageRecord>,
+    #[serde(default)]
+    pub metadata: ConversationMetadata,
+}
+
+/// Relationship and provenance of one physical transcript record.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationMetadata {
+    /// Stable identity shared by physical transcript records in one logical
+    /// session (for example Claude child-agent files and their parent).
+    pub logical_session_id: Option<String>,
+    pub parent_external_id: Option<String>,
+    /// `top_level`, `child_agent`, `automation`, `test`, or `recovered`.
+    pub record_kind: Option<String>,
+    pub is_synthetic: bool,
 }
 
 impl Conversation {
@@ -511,6 +826,7 @@ mod tests {
             ended_at: None,
             messages,
             usage: vec![],
+            metadata: Default::default(),
         }
     }
 
@@ -670,6 +986,7 @@ mod tests {
             ended_at: None,
             messages: vec![],
             usage: vec![],
+            metadata: Default::default(),
         };
         assert_eq!(conv.source_mtime_max(), 300);
     }
@@ -811,6 +1128,89 @@ mod tests {
         assert!(parse_timestamp(&serde_json::json!(null)).is_none());
         assert!(parse_timestamp(&serde_json::json!(true)).is_none());
         assert!(parse_timestamp(&serde_json::json!("not-a-date")).is_none());
+    }
+
+    #[test]
+    fn canonical_provider_requires_a_known_route_or_provider() {
+        assert_eq!(
+            canonical_provider_family(
+                Some("openai"),
+                Some("https://api.openai.com.example.net/v1")
+            )
+            .0,
+            None
+        );
+        assert_eq!(
+            canonical_provider_family(Some("custom"), Some("https://api.openai.com/v1")).0,
+            Some("openai".to_string())
+        );
+        let unmapped = canonical_provider_family(Some("open-hax"), None);
+        assert_eq!(unmapped.0, None);
+        assert_eq!(unmapped.1.as_deref(), Some("raw_provider_unmapped"));
+    }
+
+    #[test]
+    fn canonical_model_family_does_not_relabel_unknown_ids_as_families() {
+        assert_eq!(
+            canonical_model_family(Some("gpt-5.6-sol")),
+            Some("gpt".to_string())
+        );
+        assert_eq!(canonical_model_family(Some("private-router-model")), None);
+    }
+
+    #[test]
+    fn usage_metadata_only_infers_cost_provenance_from_positive_finite_values() {
+        let mut reported = UsageRecord {
+            actual_cost_usd: Some(1.25),
+            ..UsageRecord::default()
+        };
+        reported.enrich_metadata();
+        assert_eq!(
+            reported.metadata.cost_status.as_deref(),
+            Some("reported_actual")
+        );
+        assert_eq!(reported.metadata.cost_currency.as_deref(), Some("USD"));
+
+        let mut estimated = UsageRecord {
+            estimated_cost_usd: Some(0.75),
+            ..UsageRecord::default()
+        };
+        estimated.enrich_metadata();
+        assert_eq!(
+            estimated.metadata.cost_status.as_deref(),
+            Some("source_estimated")
+        );
+        assert_eq!(estimated.metadata.cost_currency.as_deref(), Some("USD"));
+
+        for invalid in [0.0, -1.0, f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            let mut record = UsageRecord {
+                actual_cost_usd: Some(invalid),
+                ..UsageRecord::default()
+            };
+            record.enrich_metadata();
+            assert_eq!(record.metadata.cost_status.as_deref(), Some("unknown"));
+            assert_eq!(record.metadata.cost_currency, None);
+        }
+    }
+
+    #[test]
+    fn usage_metadata_preserves_explicit_zero_cost_status() {
+        let mut record = UsageRecord {
+            estimated_cost_usd: Some(0.0),
+            metadata: UsageMetadata {
+                cost_status: Some("source_reported_zero".to_string()),
+                ..UsageMetadata::default()
+            },
+            ..UsageRecord::default()
+        };
+
+        record.enrich_metadata();
+
+        assert_eq!(
+            record.metadata.cost_status.as_deref(),
+            Some("source_reported_zero")
+        );
+        assert_eq!(record.metadata.cost_currency.as_deref(), Some("USD"));
     }
 
     // ── flatten_content ────────────────────────────────────

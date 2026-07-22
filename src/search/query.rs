@@ -710,6 +710,7 @@ mod tests {
                 model: None,
             }],
             usage: vec![],
+            metadata: Default::default(),
         };
 
         index.add_conversation(&conv, 1).unwrap();
@@ -744,6 +745,7 @@ mod tests {
             ended_at: None,
             messages: vec![],
             usage: vec![],
+            metadata: Default::default(),
         };
 
         index
@@ -828,6 +830,7 @@ mod tests {
                 model: None,
             }],
             usage: vec![],
+            metadata: Default::default(),
         };
         index.add_conversation(&conv1, 1).unwrap();
 
@@ -850,6 +853,7 @@ mod tests {
                 model: None,
             }],
             usage: vec![],
+            metadata: Default::default(),
         };
         index.add_conversation(&conv2, 2).unwrap();
         index.commit().unwrap();
@@ -889,6 +893,7 @@ mod tests {
                 model: None,
             }],
             usage: vec![],
+            metadata: Default::default(),
         };
         index.add_conversation(&conv, 1).unwrap();
         index.commit().unwrap();
@@ -924,6 +929,7 @@ mod tests {
                 model: None,
             }],
             usage: vec![],
+            metadata: Default::default(),
         };
         index.add_conversation(&conv, 1).unwrap();
         index.commit().unwrap();
@@ -969,6 +975,7 @@ mod tests {
                     model: None,
                 }],
                 usage: vec![],
+                metadata: Default::default(),
             };
             index.add_conversation(&conv, i).unwrap();
         }

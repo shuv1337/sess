@@ -16,10 +16,14 @@ use crate::connectors::{
     json_f64, json_u64, normalized_token_total, parse_database_source_path, source_file,
 };
 use crate::model::{
-    Agent, Conversation, Message, Role, SourceFile, UsageRecord, source_fingerprint,
+    Agent, Conversation, ConversationMetadata, Message, Role, SourceFile, UsageGrain,
+    UsageMetadata, UsageRecord, source_fingerprint,
 };
 
-const PARSER_REVISION: &str = "5";
+const PARSER_REVISION: &str = "7";
+const RECOVER_ORPHANS_ENV: &str = "SESS_OPENCODE_RECOVER_ORPHANS";
+const OPENCODE_EVENT_TOKEN_SEMANTICS: &str = "opencode.non-overlapping-components.v1";
+const OPENCODE_SESSION_TOKEN_SEMANTICS: &str = "opencode.session-aggregate.v1";
 
 /// Progress information for OpenCode scanning.
 #[derive(Debug, Clone)]
@@ -113,13 +117,26 @@ impl Connector for OpenCodeConnector {
         scan_opencode_roots(roots, since_ts)
     }
 
+    fn scan_unindexed_sources(
+        &self,
+        roots: &[PathBuf],
+        since_ts: Option<i64>,
+        is_indexed: &dyn Fn(&Path) -> Result<bool>,
+    ) -> Result<ConnectorScan> {
+        scan_unindexed_opencode_sources(roots, since_ts, is_indexed)
+    }
+
     fn parser_revision(&self) -> Option<&'static str> {
         Some(PARSER_REVISION)
     }
 
     fn source_exists(&self, path: &Path) -> Result<bool> {
         let Some((root, session_id)) = parse_database_source_path(path, Agent::OpenCode) else {
-            return Ok(path.try_exists()?);
+            // OpenCode sessions now use one virtual identity regardless of
+            // whether their payload came from SQLite, legacy JSON, or orphan
+            // recovery. Treat pre-migration physical paths as stale so the
+            // parser-revision rescan cannot leave a duplicate row behind.
+            return Ok(false);
         };
         let mut first_error = None;
         for database in discover_databases(&root) {
@@ -145,6 +162,9 @@ impl Connector for OpenCodeConnector {
                 return Ok(true);
             }
         }
+        if legacy_session_source_exists(&root, &session_id)? {
+            return Ok(true);
+        }
         match first_error {
             Some(error) => Err(error),
             None => Ok(false),
@@ -152,14 +172,14 @@ impl Connector for OpenCodeConnector {
     }
 }
 
-fn scan_opencode_roots(roots: &[PathBuf], since_ts: Option<i64>) -> Result<ConnectorScan> {
-    #[derive(Default)]
-    struct Family {
-        legacy_roots: Vec<PathBuf>,
-        databases: Vec<PathBuf>,
-    }
+#[derive(Default)]
+struct OpenCodeFamily {
+    legacy_roots: Vec<PathBuf>,
+    databases: Vec<PathBuf>,
+}
 
-    let mut families: HashMap<PathBuf, Family> = HashMap::new();
+fn discover_opencode_families(roots: &[PathBuf]) -> Vec<(PathBuf, OpenCodeFamily)> {
+    let mut families: HashMap<PathBuf, OpenCodeFamily> = HashMap::new();
 
     for root in roots {
         let virtual_root = if root.is_file() {
@@ -186,21 +206,30 @@ fn scan_opencode_roots(roots: &[PathBuf], since_ts: Option<i64>) -> Result<Conne
         family.databases.sort();
         family.databases.dedup();
     }
+    families
+}
 
-    let all_legacy_roots = families
-        .iter()
-        .flat_map(|(_, family)| family.legacy_roots.iter().cloned())
-        .collect::<Vec<_>>();
-    let legacy_paths = inventory_legacy_sources(&all_legacy_roots);
+fn scan_opencode_roots(roots: &[PathBuf], since_ts: Option<i64>) -> Result<ConnectorScan> {
+    let families = discover_opencode_families(roots);
+
     let database_count = families
         .iter()
         .map(|(_, family)| family.databases.len())
         .sum::<usize>();
     let mut by_session: HashMap<String, Conversation> = HashMap::new();
     let mut parse_errors = 0usize;
+    let recover_orphans = recover_legacy_orphans_enabled();
+    if recover_orphans {
+        tracing::info!(
+            agent = Agent::OpenCode.slug(),
+            environment = RECOVER_ORPHANS_ENV,
+            "Opt-in recovery of legacy OpenCode message directories is enabled"
+        );
+    }
 
     for (virtual_root, family) in families {
-        let family_changed = since_ts.is_none()
+        let family_changed = recover_orphans
+            || since_ts.is_none()
             || family
                 .legacy_roots
                 .iter()
@@ -214,7 +243,7 @@ fn scan_opencode_roots(roots: &[PathBuf], since_ts: Option<i64>) -> Result<Conne
         }
 
         for storage in &family.legacy_roots {
-            match scan_legacy_storage(storage, None) {
+            match scan_legacy_storage(storage, &virtual_root, None, recover_orphans, None) {
                 Ok((conversations, complete)) => {
                     if !complete {
                         parse_errors += 1;
@@ -237,14 +266,7 @@ fn scan_opencode_roots(roots: &[PathBuf], since_ts: Option<i64>) -> Result<Conne
 
         for database in family.databases {
             match scan_opencode_database(&database, &virtual_root) {
-                Ok(mut conversations) => {
-                    for conversation in &mut conversations {
-                        if let Some(id) = &conversation.external_id
-                            && let Some(path) = legacy_paths.get(id)
-                        {
-                            conversation.source_path = path.clone();
-                        }
-                    }
+                Ok(conversations) => {
                     for conversation in conversations {
                         merge_conversation(&mut by_session, conversation);
                     }
@@ -274,6 +296,146 @@ fn scan_opencode_roots(roots: &[PathBuf], since_ts: Option<i64>) -> Result<Conne
         "Completed OpenCode session scan"
     );
     Ok(ConnectorScan::new(conversations, parse_errors == 0))
+}
+
+fn scan_unindexed_opencode_sources(
+    roots: &[PathBuf],
+    since_ts: Option<i64>,
+    is_indexed: &dyn Fn(&Path) -> Result<bool>,
+) -> Result<ConnectorScan> {
+    let Some(_) = since_ts else {
+        return Ok(ConnectorScan::new(Vec::new(), true));
+    };
+
+    let recover_orphans = recover_legacy_orphans_enabled();
+    let mut by_session: HashMap<String, Conversation> = HashMap::new();
+    let mut complete = true;
+
+    for (virtual_root, family) in discover_opencode_families(roots) {
+        // The ordinary incremental scan parses every representation in a
+        // changed family. Inventory only unchanged families so this backstop
+        // never duplicates that work.
+        let family_changed = recover_orphans
+            || family
+                .legacy_roots
+                .iter()
+                .any(|storage| legacy_storage_modified_since(storage, since_ts))
+            || family
+                .databases
+                .iter()
+                .any(|database| database_modified_since(database, since_ts));
+        if family_changed {
+            continue;
+        }
+
+        let mut legacy_inventories = Vec::new();
+        let mut database_inventories = Vec::new();
+        let mut discovered_ids = HashSet::new();
+
+        for storage in &family.legacy_roots {
+            match inventory_legacy_session_ids(storage) {
+                Ok((ids, inventory_complete)) => {
+                    complete &= inventory_complete;
+                    discovered_ids.extend(ids.iter().cloned());
+                    legacy_inventories.push((storage.clone(), ids));
+                }
+                Err(error) => {
+                    complete = false;
+                    tracing::warn!(
+                        agent = Agent::OpenCode.slug(),
+                        root = %storage.display(),
+                        error = %error,
+                        "Failed to inventory legacy OpenCode sessions"
+                    );
+                }
+            }
+        }
+        for database in &family.databases {
+            match inventory_database_session_ids(database) {
+                Ok(ids) => {
+                    discovered_ids.extend(ids.iter().cloned());
+                    database_inventories.push((database.clone(), ids));
+                }
+                Err(error) => {
+                    complete = false;
+                    tracing::debug!(
+                        agent = Agent::OpenCode.slug(),
+                        database = %database.display(),
+                        error = %error,
+                        "Failed to inventory an OpenCode database"
+                    );
+                }
+            }
+        }
+
+        let mut unknown_ids = HashSet::new();
+        for session_id in discovered_ids {
+            let source = database_source_path(&virtual_root, Agent::OpenCode, &session_id);
+            if !is_indexed(&source)? {
+                unknown_ids.insert(session_id);
+            }
+        }
+        if unknown_ids.is_empty() {
+            continue;
+        }
+
+        for (storage, ids) in legacy_inventories {
+            if ids.is_disjoint(&unknown_ids) {
+                continue;
+            }
+            match scan_legacy_storage(&storage, &virtual_root, None, false, Some(&unknown_ids)) {
+                Ok((conversations, scan_complete)) => {
+                    complete &= scan_complete;
+                    for conversation in conversations {
+                        merge_conversation(&mut by_session, conversation);
+                    }
+                }
+                Err(error) => {
+                    complete = false;
+                    tracing::warn!(
+                        agent = Agent::OpenCode.slug(),
+                        root = %storage.display(),
+                        error = %error,
+                        "Failed to recover unindexed legacy OpenCode sessions"
+                    );
+                }
+            }
+        }
+        for (database, ids) in database_inventories {
+            if ids.is_disjoint(&unknown_ids) {
+                continue;
+            }
+            match scan_opencode_database_matching(&database, &virtual_root, Some(&unknown_ids)) {
+                Ok(conversations) => {
+                    for conversation in conversations {
+                        merge_conversation(&mut by_session, conversation);
+                    }
+                }
+                Err(error) => {
+                    complete = false;
+                    tracing::debug!(
+                        agent = Agent::OpenCode.slug(),
+                        database = %database.display(),
+                        error = %error,
+                        "Failed to recover unindexed OpenCode database sessions"
+                    );
+                }
+            }
+        }
+    }
+
+    let mut conversations = by_session.into_values().collect::<Vec<_>>();
+    conversations.sort_by(|left, right| left.source_path.cmp(&right.source_path));
+    Ok(ConnectorScan::new(conversations, complete))
+}
+
+fn recover_legacy_orphans_enabled() -> bool {
+    std::env::var_os(RECOVER_ORPHANS_ENV).is_some_and(|value| {
+        matches!(
+            value.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 fn legacy_storage_modified_since(storage: &Path, since_ts: Option<i64>) -> bool {
@@ -313,12 +475,55 @@ fn merge_conversation(conversations: &mut HashMap<String, Conversation>, candida
     };
     existing.title = preferred_text(existing.title.take(), candidate.title);
     existing.workspace = preferred_path(existing.workspace.take(), candidate.workspace);
+    let candidate_logical_session_id = candidate.metadata.logical_session_id;
+    existing.metadata.parent_external_id = preferred_text(
+        existing.metadata.parent_external_id.take(),
+        candidate.metadata.parent_external_id,
+    );
+    existing.metadata.logical_session_id =
+        if let Some(parent) = existing.metadata.parent_external_id.clone() {
+            [
+                existing.metadata.logical_session_id.take(),
+                candidate_logical_session_id,
+            ]
+            .into_iter()
+            .flatten()
+            .find(|logical| logical != &id)
+            .or(Some(parent))
+        } else {
+            preferred_text(
+                existing.metadata.logical_session_id.take(),
+                candidate_logical_session_id,
+            )
+        };
+    existing.metadata.record_kind = preferred_record_kind(
+        existing.metadata.record_kind.take(),
+        candidate.metadata.record_kind,
+    );
+    existing.metadata.is_synthetic |= candidate.metadata.is_synthetic;
 
     existing.messages.extend(candidate.messages);
     normalize_messages(&mut existing.messages);
     existing.usage.extend(candidate.usage);
     normalize_usage(&mut existing.usage);
     existing.source_fingerprint = conversation_fingerprint(existing);
+}
+
+fn preferred_record_kind(left: Option<String>, right: Option<String>) -> Option<String> {
+    fn rank(value: &str) -> u8 {
+        match value {
+            "test" => 5,
+            "child_agent" => 4,
+            "fork" => 3,
+            "top_level" => 2,
+            "recovered" => 1,
+            _ => 0,
+        }
+    }
+    [left, right]
+        .into_iter()
+        .flatten()
+        .max_by(|left, right| rank(left).cmp(&rank(right)).then_with(|| left.cmp(right)))
 }
 
 fn canonical_source_path(left: &Path, right: &Path) -> PathBuf {
@@ -410,6 +615,9 @@ fn normalize_usage(usage: &mut Vec<UsageRecord>) {
 }
 
 fn merge_duplicate_usage(existing: &mut UsageRecord, candidate: &UsageRecord) {
+    if usage_grain_rank(candidate.metadata.grain) > usage_grain_rank(existing.metadata.grain) {
+        existing.metadata.grain = candidate.metadata.grain;
+    }
     existing.timestamp = match (existing.timestamp, candidate.timestamp) {
         (Some(left), Some(right)) => Some(left.min(right)),
         (left, right) => left.or(right),
@@ -436,6 +644,94 @@ fn merge_duplicate_usage(existing: &mut UsageRecord, candidate: &UsageRecord) {
     existing.actual_cost_usd = preferred_cost(existing.actual_cost_usd, candidate.actual_cost_usd);
     existing.estimated_cost_usd =
         preferred_cost(existing.estimated_cost_usd, candidate.estimated_cost_usd);
+    existing.metadata.interval_start = match (
+        existing.metadata.interval_start,
+        candidate.metadata.interval_start,
+    ) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (left, right) => left.or(right),
+    };
+    existing.metadata.interval_end = match (
+        existing.metadata.interval_end,
+        candidate.metadata.interval_end,
+    ) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (left, right) => left.or(right),
+    };
+    existing.metadata.provider_family = preferred_text(
+        existing.metadata.provider_family.take(),
+        candidate.metadata.provider_family.clone(),
+    );
+    existing.metadata.provider_inference_source = preferred_text(
+        existing.metadata.provider_inference_source.take(),
+        candidate.metadata.provider_inference_source.clone(),
+    );
+    existing.metadata.provider_inference_confidence = preferred_text(
+        existing.metadata.provider_inference_confidence.take(),
+        candidate.metadata.provider_inference_confidence.clone(),
+    );
+    existing.metadata.model_family = preferred_text(
+        existing.metadata.model_family.take(),
+        candidate.metadata.model_family.clone(),
+    );
+    existing.metadata.model_variant = preferred_text(
+        existing.metadata.model_variant.take(),
+        candidate.metadata.model_variant.clone(),
+    );
+    existing.metadata.task = preferred_text(
+        existing.metadata.task.take(),
+        candidate.metadata.task.clone(),
+    );
+    existing.metadata.billing_base_url = preferred_text(
+        existing.metadata.billing_base_url.take(),
+        candidate.metadata.billing_base_url.clone(),
+    );
+    existing.metadata.billing_mode = preferred_text(
+        existing.metadata.billing_mode.take(),
+        candidate.metadata.billing_mode.clone(),
+    );
+    existing.metadata.request_attempts = existing
+        .metadata
+        .request_attempts
+        .max(candidate.metadata.request_attempts);
+    existing.metadata.reported_total_tokens = existing
+        .metadata
+        .reported_total_tokens
+        .max(candidate.metadata.reported_total_tokens);
+    existing.metadata.component_total_tokens = existing
+        .metadata
+        .component_total_tokens
+        .max(candidate.metadata.component_total_tokens)
+        .or(Some(merged_component_total));
+    existing.metadata.token_semantics = preferred_text(
+        existing.metadata.token_semantics.take(),
+        candidate.metadata.token_semantics.clone(),
+    );
+    existing.metadata.cost_status = preferred_text(
+        existing.metadata.cost_status.take(),
+        candidate.metadata.cost_status.clone(),
+    );
+    existing.metadata.cost_source = preferred_text(
+        existing.metadata.cost_source.take(),
+        candidate.metadata.cost_source.clone(),
+    );
+    existing.metadata.cost_currency = preferred_text(
+        existing.metadata.cost_currency.take(),
+        candidate.metadata.cost_currency.clone(),
+    );
+    existing.metadata.pricing_version = preferred_text(
+        existing.metadata.pricing_version.take(),
+        candidate.metadata.pricing_version.clone(),
+    );
+    existing.enrich_metadata();
+}
+
+fn usage_grain_rank(grain: UsageGrain) -> u8 {
+    match grain {
+        UsageGrain::Event => 0,
+        UsageGrain::SessionAggregate => 1,
+        UsageGrain::IntervalAggregate => 2,
+    }
 }
 
 fn preferred_cost(left: Option<f64>, right: Option<f64>) -> Option<f64> {
@@ -462,6 +758,7 @@ fn usage_equal(left: &UsageRecord, right: &UsageRecord) -> bool {
         && left.total_tokens == right.total_tokens
         && option_f64_bits(left.actual_cost_usd) == option_f64_bits(right.actual_cost_usd)
         && option_f64_bits(left.estimated_cost_usd) == option_f64_bits(right.estimated_cost_usd)
+        && left.metadata == right.metadata
 }
 
 fn option_f64_bits(value: Option<f64>) -> Option<u64> {
@@ -469,7 +766,7 @@ fn option_f64_bits(value: Option<f64>) -> Option<u64> {
 }
 
 fn usage_cmp(left: &UsageRecord, right: &UsageRecord) -> std::cmp::Ordering {
-    (
+    let ordering = (
         (left.timestamp.is_none(), left.timestamp.unwrap_or_default()),
         left.source_event_id.as_deref(),
         left.provider.as_deref(),
@@ -505,7 +802,15 @@ fn usage_cmp(left: &UsageRecord, right: &UsageRecord) -> std::cmp::Ordering {
             ),
             option_f64_bits(right.actual_cost_usd),
             option_f64_bits(right.estimated_cost_usd),
-        ))
+        ));
+    ordering.then_with(|| {
+        serde_json::to_string(&left.metadata)
+            .expect("OpenCode usage metadata is serializable")
+            .cmp(
+                &serde_json::to_string(&right.metadata)
+                    .expect("OpenCode usage metadata is serializable"),
+            )
+    })
 }
 
 fn conversation_fingerprint(conversation: &Conversation) -> String {
@@ -520,6 +825,7 @@ fn conversation_fingerprint(conversation: &Conversation) -> String {
             conversation.ended_at,
             &conversation.messages,
             &conversation.usage,
+            &conversation.metadata,
         ))
         .expect("OpenCode normalized conversations are serializable"),
     );
@@ -527,50 +833,99 @@ fn conversation_fingerprint(conversation: &Conversation) -> String {
 }
 
 fn legacy_storage_root(root: &Path) -> Option<PathBuf> {
-    if root.join("session").is_dir() {
+    let eligible = |storage: &Path| {
+        storage.join("session").is_dir()
+            || (recover_legacy_orphans_enabled() && storage.join("message").is_dir())
+    };
+    if eligible(root) {
         Some(root.to_path_buf())
-    } else if root.join("storage/session").is_dir() {
+    } else if eligible(&root.join("storage")) {
         Some(root.join("storage"))
     } else {
         None
     }
 }
 
-fn inventory_legacy_sources(roots: &[PathBuf]) -> HashMap<String, PathBuf> {
-    let mut sources = HashMap::new();
-    for root in roots {
-        let session_dir = root.join("session");
-        for entry in WalkDir::new(session_dir)
-            .follow_links(true)
-            .into_iter()
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| {
-                entry.file_type().is_file()
-                    && entry
-                        .path()
-                        .extension()
-                        .is_some_and(|extension| extension == "json")
-            })
-        {
-            if let Some(id) = entry.path().file_stem().and_then(|stem| stem.to_str()) {
-                sources
-                    .entry(id.to_string())
-                    .or_insert_with(|| entry.path().to_path_buf());
+fn legacy_storage_candidates(root: &Path) -> Vec<PathBuf> {
+    let mut candidates = [root.to_path_buf(), root.join("storage")]
+        .into_iter()
+        .filter(|storage| storage.join("session").is_dir() || storage.join("message").is_dir())
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+fn legacy_session_source_exists(root: &Path, session_id: &str) -> Result<bool> {
+    for storage in legacy_storage_candidates(root) {
+        // Orphan recovery has no session metadata file, so its durable source
+        // is the per-session message directory.
+        if storage.join("message").join(session_id).is_dir() {
+            return Ok(true);
+        }
+
+        let session_dir = storage.join("session");
+        if !session_dir.is_dir() {
+            continue;
+        }
+        for entry in WalkDir::new(session_dir).follow_links(true) {
+            let entry = entry?;
+            if entry.file_type().is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+                && entry
+                    .path()
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .is_some_and(|stem| stem == session_id)
+            {
+                return Ok(true);
             }
         }
     }
-    sources
+    Ok(false)
+}
+
+fn inventory_legacy_session_ids(storage_root: &Path) -> Result<(HashSet<String>, bool)> {
+    let (sessions, complete) = load_sessions_with_status(&storage_root.join("session"), None)?;
+    Ok((sessions.into_keys().collect(), complete))
 }
 
 fn scan_legacy_storage(
     storage_root: &Path,
+    virtual_root: &Path,
     since_ts: Option<i64>,
+    recover_orphans: bool,
+    session_filter: Option<&HashSet<String>>,
 ) -> Result<(Vec<Conversation>, bool)> {
     let session_dir = storage_root.join("session");
-    if !session_dir.is_dir() {
+    if !session_dir.is_dir() && !recover_orphans {
         return Ok((Vec::new(), true));
     }
-    let (sessions, sessions_complete) = load_sessions_with_status(&session_dir, since_ts)?;
+    let (mut sessions, mut sessions_complete) = load_sessions_with_status(&session_dir, since_ts)?;
+    if recover_orphans {
+        let (recovered, recovery_complete) =
+            recover_orphan_sessions(&storage_root.join("message"), &sessions)?;
+        sessions_complete &= recovery_complete;
+        if !recovered.is_empty() {
+            tracing::info!(
+                agent = Agent::OpenCode.slug(),
+                root = %storage_root.display(),
+                recovered = recovered.len(),
+                environment = RECOVER_ORPHANS_ENV,
+                "Recovered orphaned legacy OpenCode message directories"
+            );
+        }
+        for session in recovered {
+            sessions.insert(session.id.clone(), session);
+        }
+    }
+    let logical_session_ids = resolve_legacy_logical_session_ids(&sessions);
+    if let Some(session_filter) = session_filter {
+        sessions.retain(|session_id, _| session_filter.contains(session_id));
+    }
     if sessions.is_empty() {
         return Ok((Vec::new(), sessions_complete));
     }
@@ -676,16 +1031,40 @@ fn scan_legacy_storage(
                 Ok((
                     Some(Conversation {
                         agent: Agent::OpenCode,
-                        external_id: Some(session_id),
+                        external_id: Some(session_id.clone()),
                         title,
                         workspace: session.directory,
-                        source_path: session.source_file.path,
+                        source_path: database_source_path(
+                            virtual_root,
+                            Agent::OpenCode,
+                            &session_id,
+                        ),
                         source_files: all_source_files,
                         source_fingerprint: fingerprint,
                         started_at,
                         ended_at,
                         messages,
                         usage,
+                        metadata: ConversationMetadata {
+                            logical_session_id: logical_session_ids
+                                .get(&session_id)
+                                .cloned()
+                                .or_else(|| Some(session_id.clone())),
+                            parent_external_id: session.parent_id.clone(),
+                            record_kind: Some(if session.recovered {
+                                "recovered".to_string()
+                            } else if session.parent_id.is_some() {
+                                "child_agent".to_string()
+                            } else {
+                                "top_level".to_string()
+                            }),
+                            // Recovery is deliberately opt-in because these
+                            // message-only rows have no authoritative session
+                            // parent. Keep them visible, but classify them as
+                            // synthetic so `sess usage --exclude-synthetic`
+                            // retains its organic-only contract.
+                            is_synthetic: session.recovered,
+                        },
                     }),
                     complete,
                 ))
@@ -702,6 +1081,127 @@ fn scan_legacy_storage(
             .collect(),
         complete,
     ))
+}
+
+fn resolve_legacy_logical_session_ids(
+    sessions: &HashMap<String, SessionMeta>,
+) -> HashMap<String, String> {
+    sessions
+        .keys()
+        .map(|session_id| {
+            let mut current = session_id.as_str();
+            let mut logical = session_id.clone();
+            let mut seen = HashSet::new();
+            while seen.insert(current.to_string()) {
+                let Some(parent) = sessions
+                    .get(current)
+                    .and_then(|session| session.parent_id.as_deref())
+                else {
+                    break;
+                };
+                logical = parent.to_string();
+                current = parent;
+            }
+            (session_id.clone(), logical)
+        })
+        .collect()
+}
+
+fn recover_orphan_sessions(
+    message_root: &Path,
+    known_sessions: &HashMap<String, SessionMeta>,
+) -> Result<(Vec<SessionMeta>, bool)> {
+    if !message_root.is_dir() {
+        return Ok((Vec::new(), true));
+    }
+    let mut recovered = Vec::new();
+    let mut complete = true;
+    let mut entries = match fs::read_dir(message_root) {
+        Ok(entries) => entries
+            .filter_map(std::result::Result::ok)
+            .collect::<Vec<_>>(),
+        Err(error) => return Err(error.into()),
+    };
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        let directory = entry.path();
+        if !directory.is_dir() {
+            continue;
+        }
+        let Some(directory_id) = directory.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if known_sessions.contains_key(directory_id) {
+            continue;
+        }
+
+        let mut message_paths = match fs::read_dir(&directory) {
+            Ok(entries) => entries
+                .filter_map(std::result::Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.is_file()
+                        && path
+                            .extension()
+                            .is_some_and(|extension| extension == "json")
+                })
+                .collect::<Vec<_>>(),
+            Err(error) => {
+                complete = false;
+                tracing::warn!(
+                    agent = Agent::OpenCode.slug(),
+                    root = %directory.display(),
+                    error = %error,
+                    "Failed to inventory an orphaned OpenCode message directory"
+                );
+                continue;
+            }
+        };
+        message_paths.sort();
+        let mut session_id = None;
+        let mut created_at: Option<i64> = None;
+        let mut updated_at: Option<i64> = None;
+        for path in message_paths {
+            match parse_message_file(&path) {
+                Ok(Some(message)) if message.session_id == directory_id => {
+                    session_id.get_or_insert(message.session_id);
+                    if let Some(timestamp) = message.created_at {
+                        created_at = Some(created_at.map_or(timestamp, |left| left.min(timestamp)));
+                        updated_at = Some(updated_at.map_or(timestamp, |left| left.max(timestamp)));
+                    }
+                }
+                Ok(Some(_)) | Ok(None) => {}
+                Err(error) => {
+                    complete = false;
+                    tracing::warn!(
+                        agent = Agent::OpenCode.slug(),
+                        path = %path.display(),
+                        error = %error,
+                        "Failed to parse a message while recovering an orphaned OpenCode session"
+                    );
+                }
+            }
+        }
+        let Some(session_id) = session_id else {
+            continue;
+        };
+        let Some(directory_source) = source_file(&directory) else {
+            complete = false;
+            continue;
+        };
+        recovered.push(SessionMeta {
+            id: session_id.clone(),
+            project_id: "recovered".to_string(),
+            directory: None,
+            title: Some(format!("Recovered OpenCode session {session_id}")),
+            created_at,
+            updated_at,
+            parent_id: None,
+            recovered: true,
+            source_file: directory_source,
+        });
+    }
+    Ok((recovered, complete))
 }
 
 fn discover_databases(root: &Path) -> Vec<PathBuf> {
@@ -784,7 +1284,30 @@ fn optional_table_column<'a>(columns: &HashSet<String>, name: &'a str) -> &'a st
     if columns.contains(name) { name } else { "NULL" }
 }
 
+fn inventory_database_session_ids(database: &Path) -> Result<HashSet<String>> {
+    let connection = open_read_only(database)?;
+    if !table_exists(&connection, "session")? {
+        anyhow::bail!("missing session table");
+    }
+    let columns = table_columns(&connection, "session")?;
+    if !columns.contains("id") {
+        anyhow::bail!("unsupported session schema: missing id");
+    }
+    let mut statement = connection.prepare("SELECT id FROM session")?;
+    Ok(statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<HashSet<_>, _>>()?)
+}
+
 fn scan_opencode_database(database: &Path, virtual_root: &Path) -> Result<Vec<Conversation>> {
+    scan_opencode_database_matching(database, virtual_root, None)
+}
+
+fn scan_opencode_database_matching(
+    database: &Path,
+    virtual_root: &Path,
+    session_filter: Option<&HashSet<String>>,
+) -> Result<Vec<Conversation>> {
     let connection = open_read_only(database)?;
     if !table_exists(&connection, "session")? {
         anyhow::bail!("missing session table");
@@ -800,6 +1323,9 @@ fn scan_opencode_database(database: &Path, virtual_root: &Path) -> Result<Vec<Co
     } else {
         "NULL"
     };
+    let parent_id = optional_table_column(&columns, "parent_id");
+    let fork_session_id = optional_table_column(&columns, "fork_session_id");
+    let agent = optional_table_column(&columns, "agent");
     let cost = optional_table_column(&columns, "cost");
     let tokens_input = optional_table_column(&columns, "tokens_input");
     let tokens_output = optional_table_column(&columns, "tokens_output");
@@ -808,6 +1334,7 @@ fn scan_opencode_database(database: &Path, virtual_root: &Path) -> Result<Vec<Co
     let tokens_cache_write = optional_table_column(&columns, "tokens_cache_write");
     let query = format!(
         "SELECT id, directory, title, time_created, time_updated, {model}, \
+                {parent_id}, {fork_session_id}, {agent}, \
                 {cost}, {tokens_input}, {tokens_output}, {tokens_reasoning}, \
                 {tokens_cache_read}, {tokens_cache_write} \
          FROM session ORDER BY time_created, id"
@@ -816,26 +1343,35 @@ fn scan_opencode_database(database: &Path, virtual_root: &Path) -> Result<Vec<Co
     let has_v2 = table_exists(&connection, "session_message")?;
     let source_files = database_source_files(database)?;
     let mut statement = connection.prepare(&query)?;
-    let rows = statement.query_map([], |row| {
-        Ok(DatabaseSession {
-            id: row.get(0)?,
-            directory: row.get(1)?,
-            title: row.get(2)?,
-            created_at: row.get(3)?,
-            updated_at: row.get(4)?,
-            model: row.get(5)?,
-            cost: row.get(6)?,
-            input_tokens: row.get(7)?,
-            output_tokens: row.get(8)?,
-            reasoning_tokens: row.get(9)?,
-            cache_read_tokens: row.get(10)?,
-            cache_write_tokens: row.get(11)?,
-        })
-    })?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(DatabaseSession {
+                id: row.get(0)?,
+                directory: row.get(1)?,
+                title: row.get(2)?,
+                created_at: row.get(3)?,
+                updated_at: row.get(4)?,
+                model: row.get(5)?,
+                parent_id: row.get(6)?,
+                fork_session_id: row.get(7)?,
+                agent: row.get(8)?,
+                cost: row.get(9)?,
+                input_tokens: row.get(10)?,
+                output_tokens: row.get(11)?,
+                reasoning_tokens: row.get(12)?,
+                cache_read_tokens: row.get(13)?,
+                cache_write_tokens: row.get(14)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let logical_session_ids = resolve_database_logical_session_ids(&rows);
 
     let mut conversations = Vec::new();
     for row in rows {
-        let session = row?;
+        let session = row;
+        if session_filter.is_some_and(|filter| !filter.contains(&session.id)) {
+            continue;
+        }
         let mut messages = Vec::new();
         let mut usage = Vec::new();
         if has_v1 {
@@ -875,6 +1411,24 @@ fn scan_opencode_database(database: &Path, virtual_root: &Path) -> Result<Vec<Co
             ended_at,
             &messages,
             &usage,
+            &ConversationMetadata {
+                logical_session_id: logical_session_ids
+                    .get(&session.id)
+                    .cloned()
+                    .or_else(|| Some(session.id.clone())),
+                parent_external_id: session
+                    .parent_id
+                    .clone()
+                    .or_else(|| session.fork_session_id.clone()),
+                record_kind: Some(if session.parent_id.is_some() {
+                    "child_agent".to_string()
+                } else if session.fork_session_id.is_some() {
+                    "fork".to_string()
+                } else {
+                    "top_level".to_string()
+                }),
+                is_synthetic: false,
+            },
         )?;
         conversations.push(Conversation {
             agent: Agent::OpenCode,
@@ -888,6 +1442,24 @@ fn scan_opencode_database(database: &Path, virtual_root: &Path) -> Result<Vec<Co
             ended_at,
             messages,
             usage,
+            metadata: ConversationMetadata {
+                logical_session_id: logical_session_ids
+                    .get(&session.id)
+                    .cloned()
+                    .or_else(|| Some(session.id.clone())),
+                parent_external_id: session
+                    .parent_id
+                    .clone()
+                    .or_else(|| session.fork_session_id.clone()),
+                record_kind: Some(if session.parent_id.is_some() {
+                    "child_agent".to_string()
+                } else if session.fork_session_id.is_some() {
+                    "fork".to_string()
+                } else {
+                    "top_level".to_string()
+                }),
+                is_synthetic: false,
+            },
         });
     }
     Ok(conversations)
@@ -900,12 +1472,46 @@ struct DatabaseSession {
     created_at: i64,
     updated_at: i64,
     model: Option<String>,
+    parent_id: Option<String>,
+    fork_session_id: Option<String>,
+    agent: Option<String>,
     cost: Option<f64>,
     input_tokens: Option<i64>,
     output_tokens: Option<i64>,
     reasoning_tokens: Option<i64>,
     cache_read_tokens: Option<i64>,
     cache_write_tokens: Option<i64>,
+}
+
+fn resolve_database_logical_session_ids(sessions: &[DatabaseSession]) -> HashMap<String, String> {
+    let parents = sessions
+        .iter()
+        .map(|session| {
+            (
+                session.id.as_str(),
+                session
+                    .parent_id
+                    .as_deref()
+                    .or(session.fork_session_id.as_deref()),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    sessions
+        .iter()
+        .map(|session| {
+            let mut current = session.id.as_str();
+            let mut logical = session.id.clone();
+            let mut seen = HashSet::new();
+            while seen.insert(current) {
+                let Some(parent) = parents.get(current).copied().flatten() else {
+                    break;
+                };
+                logical = parent.to_string();
+                current = parent;
+            }
+            (session.id.clone(), logical)
+        })
+        .collect()
 }
 
 fn append_session_usage_residual(session: &DatabaseSession, usage: &mut Vec<UsageRecord>) {
@@ -945,7 +1551,8 @@ fn append_session_usage_residual(session: &DatabaseSession, usage: &mut Vec<Usag
     let residual_cost = aggregate_cost
         .map(|cost| (cost - projected_cost).max(0.0))
         .filter(|cost| *cost > f64::EPSILON);
-    let residual = UsageRecord {
+    let residual_total = aggregate_total.saturating_sub(projected_total);
+    let mut residual = UsageRecord {
         // These are authoritative session aggregates, not event-exact rows.
         timestamp: None,
         provider: parse_provider(session.model.as_deref()),
@@ -957,10 +1564,23 @@ fn append_session_usage_residual(session: &DatabaseSession, usage: &mut Vec<Usag
         cache_read_tokens: cache_read.saturating_sub(projected_cache_read),
         cache_write_tokens: cache_write.saturating_sub(projected_cache_write),
         reasoning_tokens: reasoning.saturating_sub(projected_reasoning),
-        total_tokens: aggregate_total.saturating_sub(projected_total),
+        total_tokens: residual_total,
         actual_cost_usd: None,
         estimated_cost_usd: residual_cost,
+        metadata: UsageMetadata {
+            interval_start: Some(session.created_at),
+            interval_end: Some(session.updated_at),
+            grain: UsageGrain::SessionAggregate,
+            model_variant: parse_model_variant(session.model.as_deref()),
+            task: session.agent.clone(),
+            reported_total_tokens: Some(aggregate_total),
+            component_total_tokens: Some(residual_total),
+            token_semantics: Some(OPENCODE_SESSION_TOKEN_SEMANTICS.to_string()),
+            cost_source: residual_cost.map(|_| "opencode.session.cost".to_string()),
+            ..UsageMetadata::default()
+        },
     };
+    residual.enrich_metadata();
     if residual.has_usage() {
         usage.push(residual);
     }
@@ -985,6 +1605,7 @@ fn load_v1_messages(
     })?;
     let fallback_model = parse_model(session.model.as_deref());
     let fallback_provider = parse_provider(session.model.as_deref());
+    let fallback_variant = parse_model_variant(session.model.as_deref());
     let mut messages = Vec::new();
     let mut usage = Vec::new();
     let mut usage_messages = HashSet::new();
@@ -1008,6 +1629,8 @@ fn load_v1_messages(
                 timestamp,
                 fallback_provider.clone(),
                 fallback_model.clone(),
+                fallback_variant.clone(),
+                session.agent.clone(),
                 Some(opencode_usage_event_id(&session.id, &message_id)),
             )
         {
@@ -1065,6 +1688,7 @@ fn load_v2_messages(
     })?;
     let fallback_model = parse_model(session.model.as_deref());
     let fallback_provider = parse_provider(session.model.as_deref());
+    let fallback_variant = parse_model_variant(session.model.as_deref());
     let mut messages = Vec::new();
     let mut usage = Vec::new();
     for row in rows {
@@ -1142,6 +1766,18 @@ fn load_v2_messages(
                     timestamp,
                     fallback_provider.clone(),
                     fallback_model.clone(),
+                    fallback_variant.clone(),
+                    session.agent.clone(),
+                    Some(opencode_usage_event_id(&session.id, &message_id)),
+                ) {
+                    usage.push(record);
+                } else if let Some(record) = opencode_failed_request_record(
+                    &data,
+                    timestamp,
+                    fallback_provider.clone(),
+                    fallback_model.clone(),
+                    fallback_variant.clone(),
+                    session.agent.clone(),
                     Some(opencode_usage_event_id(&session.id, &message_id)),
                 ) {
                     usage.push(record);
@@ -1339,6 +1975,8 @@ fn opencode_usage_record(
     timestamp: Option<i64>,
     fallback_provider: Option<String>,
     fallback_model: Option<String>,
+    fallback_variant: Option<String>,
+    fallback_task: Option<String>,
     source_event_id: Option<String>,
 ) -> Option<UsageRecord> {
     let tokens = data.get("tokens").or_else(|| data.get("usage"))?;
@@ -1348,7 +1986,13 @@ fn opencode_usage_record(
     let output = visible_output.saturating_add(reasoning);
     let cache_read = json_u64(tokens, &["/cache/read", "/cacheRead"]);
     let cache_write = json_u64(tokens, &["/cache/write", "/cacheWrite"]);
-    let record = UsageRecord {
+    let reported_total = optional_json_token_total(tokens);
+    let estimated_cost_usd = json_f64(data, &["/cost", "/cost/total", "/cost_usd"]);
+    let component_total = input
+        .saturating_add(output)
+        .saturating_add(cache_read)
+        .saturating_add(cache_write);
+    let mut record = UsageRecord {
         timestamp,
         provider: data
             .pointer("/model/providerID")
@@ -1365,16 +2009,84 @@ fn opencode_usage_record(
         cache_write_tokens: cache_write,
         reasoning_tokens: reasoning,
         total_tokens: normalized_token_total(
-            json_u64(tokens, &["/total", "/totalTokens", "/total_tokens"]),
+            reported_total.unwrap_or_default(),
             input,
             output,
             cache_read,
             cache_write,
         ),
         actual_cost_usd: None,
-        estimated_cost_usd: json_f64(data, &["/cost", "/cost/total", "/cost_usd"]),
+        estimated_cost_usd,
+        metadata: UsageMetadata {
+            model_variant: message_model_variant(data).or(fallback_variant),
+            task: data
+                .get("agent")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or(fallback_task),
+            request_attempts: 1,
+            reported_total_tokens: reported_total,
+            component_total_tokens: Some(component_total),
+            token_semantics: Some(OPENCODE_EVENT_TOKEN_SEMANTICS.to_string()),
+            cost_status: estimated_cost_usd
+                .filter(|cost| cost.abs() <= f64::EPSILON)
+                .map(|_| "source_reported_zero".to_string()),
+            cost_source: estimated_cost_usd.map(|_| "opencode.message.cost".to_string()),
+            ..UsageMetadata::default()
+        },
     };
+    record.enrich_metadata();
     record.has_usage().then_some(record)
+}
+
+fn opencode_failed_request_record(
+    data: &Value,
+    timestamp: Option<i64>,
+    fallback_provider: Option<String>,
+    fallback_model: Option<String>,
+    fallback_variant: Option<String>,
+    fallback_task: Option<String>,
+    source_event_id: Option<String>,
+) -> Option<UsageRecord> {
+    data.get("error").filter(|error| !error.is_null())?;
+    let mut record = UsageRecord {
+        timestamp,
+        provider: data
+            .pointer("/model/providerID")
+            .or_else(|| data.get("providerID"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or(fallback_provider),
+        model: message_model(data).or(fallback_model),
+        source_event_id,
+        metadata: UsageMetadata {
+            model_variant: message_model_variant(data).or(fallback_variant),
+            task: data
+                .get("agent")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or(fallback_task),
+            request_attempts: 1,
+            component_total_tokens: Some(0),
+            token_semantics: Some(OPENCODE_EVENT_TOKEN_SEMANTICS.to_string()),
+            cost_status: Some("unknown".to_string()),
+            ..UsageMetadata::default()
+        },
+        ..UsageRecord::default()
+    };
+    record.enrich_metadata();
+    Some(record)
+}
+
+fn optional_json_token_total(tokens: &Value) -> Option<u64> {
+    ["/total", "/totalTokens", "/total_tokens"]
+        .into_iter()
+        .find_map(|pointer| {
+            let value = tokens.pointer(pointer)?;
+            value
+                .as_u64()
+                .or_else(|| value.as_i64().and_then(|number| number.try_into().ok()))
+        })
 }
 
 fn opencode_usage_event_id(session_id: &str, message_id: &str) -> String {
@@ -1406,12 +2118,29 @@ fn parse_provider(raw: Option<&str>) -> Option<String> {
     })
 }
 
+fn parse_model_variant(raw: Option<&str>) -> Option<String> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    serde_json::from_str::<Value>(raw)
+        .ok()
+        .and_then(|value| message_model_variant(&value))
+}
+
 fn message_model(data: &Value) -> Option<String> {
     data.pointer("/model/id")
         .or_else(|| data.pointer("/model/modelID"))
         .or_else(|| data.get("modelID"))
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
+}
+
+fn message_model_variant(data: &Value) -> Option<String> {
+    data.pointer("/model/variant")
+        .or_else(|| data.get("variant"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 fn derive_title(messages: &[Message]) -> Option<String> {
@@ -1433,6 +2162,7 @@ fn database_fingerprint(
     ended_at: Option<i64>,
     messages: &[Message],
     usage: &[UsageRecord],
+    metadata: &ConversationMetadata,
 ) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(format!("opencode:{PARSER_REVISION}\0").as_bytes());
@@ -1445,6 +2175,7 @@ fn database_fingerprint(
             ended_at,
             messages,
             usage,
+            metadata,
         ))?
         .as_bytes(),
     );
@@ -1459,6 +2190,8 @@ struct SessionMeta {
     title: Option<String>,
     created_at: Option<i64>,
     updated_at: Option<i64>,
+    parent_id: Option<String>,
+    recovered: bool,
     source_file: SourceFile,
 }
 
@@ -1496,6 +2229,10 @@ fn load_sessions_with_status(
 ) -> Result<(HashMap<String, SessionMeta>, bool)> {
     let mut sessions = HashMap::new();
     let mut complete = true;
+
+    if !session_dir.is_dir() {
+        return Ok((sessions, true));
+    }
 
     for entry in WalkDir::new(session_dir).follow_links(true) {
         let entry = match entry {
@@ -1550,6 +2287,8 @@ struct SessionJson {
     title: Option<String>,
     #[serde(default)]
     time: Option<SessionTime>,
+    #[serde(default, rename = "parentID")]
+    parent_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1577,6 +2316,8 @@ fn parse_session_file(path: &Path) -> Result<Option<SessionMeta>> {
         title: data.title,
         created_at: data.time.as_ref().and_then(|t| t.created),
         updated_at: data.time.as_ref().and_then(|t| t.updated),
+        parent_id: data.parent_id,
+        recovered: false,
         source_file,
     }))
 }
@@ -1676,6 +2417,8 @@ fn parse_message_file(path: &Path) -> Result<Option<MessageMeta>> {
                 timestamp,
                 None,
                 model.clone(),
+                None,
+                None,
                 Some(opencode_usage_event_id(&data.session_id, &data.id)),
             )
         })
@@ -1903,6 +2646,7 @@ mod tests {
                 "projectID": "proj1",
                 "directory": "/test/project",
                 "title": "My Session",
+                "parentID": "parent-session",
                 "time": {"created": 1705312800000, "updated": 1705312900000}
             }"#,
         )
@@ -1915,6 +2659,8 @@ mod tests {
         assert_eq!(session.title, Some("My Session".to_string()));
         assert_eq!(session.created_at, Some(1705312800000));
         assert_eq!(session.updated_at, Some(1705312900000));
+        assert_eq!(session.parent_id.as_deref(), Some("parent-session"));
+        assert!(!session.recovered);
     }
 
     #[test]
@@ -2330,7 +3076,7 @@ mod tests {
                 INSERT INTO session_message VALUES
                     ('u1', 'sqlite-v2', 'user', 1, 1000, 1000, '{"time":{"created":1000},"text":"v2 user text","files":[{"name":"brief.txt","mime":"text/plain","data":"YXR0YWNobWVudCB0ZXh0"}]}'),
                     ('a1', 'sqlite-v2', 'assistant', 2, 2000, 3000,
-                     '{"time":{"created":2000},"model":{"id":"gpt-v2","providerID":"test"},"tokens":{"input":100,"output":20,"reasoning":5,"cache":{"read":30,"write":10},"total":165},"cost":0.125,"content":[{"type":"text","text":"v2 assistant text"},{"type":"reasoning","text":"hidden"},{"type":"tool","name":"shell","state":{"status":"completed","input":{"command":"pwd"},"output":"/tmp/v2"}}]}');"#,
+                     '{"time":{"created":2000},"agent":"build","model":{"id":"gpt-v2","providerID":"test","variant":"xhigh"},"tokens":{"input":100,"output":20,"reasoning":5,"cache":{"read":30,"write":10},"total":165},"cost":0.125,"content":[{"type":"text","text":"v2 assistant text"},{"type":"reasoning","text":"hidden"},{"type":"tool","name":"shell","state":{"status":"completed","input":{"command":"pwd"},"output":"/tmp/v2"}}]}');"#,
             )
             .unwrap();
         drop(connection);
@@ -2358,6 +3104,15 @@ mod tests {
         assert_eq!(usage.reasoning_tokens, 5);
         assert_eq!(usage.total_tokens, 165);
         assert_eq!(usage.estimated_cost_usd, Some(0.125));
+        assert_eq!(usage.metadata.model_variant.as_deref(), Some("xhigh"));
+        assert_eq!(usage.metadata.task.as_deref(), Some("build"));
+        assert_eq!(usage.metadata.request_attempts, 1);
+        assert_eq!(usage.metadata.reported_total_tokens, Some(165));
+        assert_eq!(usage.metadata.component_total_tokens, Some(165));
+        assert_eq!(
+            usage.metadata.token_semantics.as_deref(),
+            Some(OPENCODE_EVENT_TOKEN_SEMANTICS)
+        );
     }
 
     #[test]
@@ -2394,6 +3149,283 @@ mod tests {
         assert!(conversations[0].messages.is_empty());
         assert_eq!(conversations[0].usage.len(), 1);
         assert_eq!(conversations[0].usage[0].total_tokens, 15);
+    }
+
+    #[test]
+    fn v2_failed_assistant_request_is_an_attempt_not_a_usage_call() {
+        let root = TempDir::new().unwrap();
+        let connection = Connection::open(root.path().join("failed.db")).unwrap();
+        connection
+            .execute_batch(
+                r#"CREATE TABLE session (
+                    id TEXT PRIMARY KEY, directory TEXT NOT NULL, title TEXT NOT NULL,
+                    time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, model TEXT
+                );
+                CREATE TABLE session_message (
+                    id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL,
+                    seq INTEGER NOT NULL, time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL, data TEXT NOT NULL
+                );
+                INSERT INTO session VALUES
+                    ('failed', '/work', 'Failed request', 1000, 2000, NULL);
+                INSERT INTO session_message VALUES
+                    ('a1', 'failed', 'assistant', 1, 1000, 2000,
+                     '{"time":{"created":1000},"agent":"explore","model":{"id":"gpt-5.6-sol","providerID":"openai","variant":"medium"},"finish":"error","error":{"type":"provider.auth","message":"denied"},"content":[]}');"#,
+            )
+            .unwrap();
+        drop(connection);
+
+        let conversations =
+            scan_opencode_database(&root.path().join("failed.db"), root.path()).unwrap();
+        assert_eq!(conversations.len(), 1);
+        let usage = &conversations[0].usage;
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].api_calls, 0);
+        assert_eq!(usage[0].total_tokens, 0);
+        assert_eq!(usage[0].metadata.request_attempts, 1);
+        assert_eq!(usage[0].metadata.model_variant.as_deref(), Some("medium"));
+        assert_eq!(usage[0].metadata.task.as_deref(), Some("explore"));
+        assert_eq!(usage[0].provider.as_deref(), Some("openai"));
+        assert_eq!(usage[0].model.as_deref(), Some("gpt-5.6-sol"));
+    }
+
+    #[test]
+    fn sqlite_parent_id_groups_child_with_logical_root() {
+        let root = TempDir::new().unwrap();
+        let database = root.path().join("hierarchy.db");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                r#"CREATE TABLE session (
+                    id TEXT PRIMARY KEY, directory TEXT NOT NULL, title TEXT NOT NULL,
+                    time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, model TEXT,
+                    parent_id TEXT
+                );
+                CREATE TABLE session_message (
+                    id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL,
+                    seq INTEGER NOT NULL, time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL, data TEXT NOT NULL
+                );
+                INSERT INTO session VALUES
+                    ('parent', '/work', 'Parent', 1000, 3000, NULL, NULL),
+                    ('child', '/work', 'Child', 2000, 3000, NULL, 'parent');
+                INSERT INTO session_message VALUES
+                    ('u1', 'child', 'user', 1, 2000, 2000,
+                     '{"time":{"created":2000},"text":"inspect this"}');"#,
+            )
+            .unwrap();
+        drop(connection);
+
+        let conversations = scan_opencode_database(&database, root.path()).unwrap();
+        assert_eq!(conversations.len(), 1);
+        let child = &conversations[0];
+        assert_eq!(child.external_id.as_deref(), Some("child"));
+        assert_eq!(child.metadata.parent_external_id.as_deref(), Some("parent"));
+        assert_eq!(child.metadata.logical_session_id.as_deref(), Some("parent"));
+        assert_eq!(child.metadata.record_kind.as_deref(), Some("child_agent"));
+    }
+
+    #[test]
+    fn legacy_orphan_recovery_is_explicit_and_preserves_provenance() {
+        let storage = TempDir::new().unwrap();
+        let orphan_id = "orphan-session";
+        let message_dir = storage.path().join("message").join(orphan_id);
+        fs::create_dir_all(&message_dir).unwrap();
+        fs::write(
+            message_dir.join("msg1.json"),
+            r#"{"id":"msg1","sessionID":"orphan-session","role":"assistant","time":{"created":1705312800000},"model":{"providerID":"openrouter","modelID":"gpt-test","variant":"high"},"tokens":{"input":100,"output":20,"total":120}}"#,
+        )
+        .unwrap();
+
+        let (default_scan, complete) =
+            scan_legacy_storage(storage.path(), storage.path(), None, false, None).unwrap();
+        assert!(complete);
+        assert!(default_scan.is_empty());
+
+        let (recovered, complete) =
+            scan_legacy_storage(storage.path(), storage.path(), None, true, None).unwrap();
+        assert!(complete);
+        assert_eq!(recovered.len(), 1);
+        let conversation = &recovered[0];
+        assert_eq!(conversation.external_id.as_deref(), Some(orphan_id));
+        assert_eq!(
+            conversation.metadata.record_kind.as_deref(),
+            Some("recovered")
+        );
+        assert_eq!(
+            conversation.metadata.logical_session_id.as_deref(),
+            Some(orphan_id)
+        );
+        assert!(conversation.metadata.is_synthetic);
+        assert_eq!(
+            conversation.source_path,
+            database_source_path(storage.path(), Agent::OpenCode, orphan_id)
+        );
+        assert_eq!(conversation.usage.len(), 1);
+        assert_eq!(conversation.usage[0].total_tokens, 120);
+        assert_eq!(
+            conversation.usage[0].metadata.model_variant.as_deref(),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn source_path_is_stable_across_database_legacy_and_recovered_storage() {
+        let root = TempDir::new().unwrap();
+        let storage = root.path().join("storage");
+        create_opencode_tree(&storage);
+        let expected = database_source_path(root.path(), Agent::OpenCode, "sess1");
+
+        let (legacy, complete) =
+            scan_legacy_storage(&storage, root.path(), None, false, None).unwrap();
+        assert!(complete);
+        assert_eq!(legacy.len(), 1);
+        assert_eq!(legacy[0].source_path, expected);
+
+        let database = root.path().join("opencode.db");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                r#"CREATE TABLE session (
+                    id TEXT PRIMARY KEY, directory TEXT NOT NULL, title TEXT NOT NULL,
+                    time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, model TEXT
+                );
+                CREATE TABLE session_message (
+                    id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL,
+                    seq INTEGER NOT NULL, time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL, data TEXT NOT NULL
+                );
+                INSERT INTO session VALUES
+                    ('sess1', '/tmp/db', 'DB copy', 1000, 2000, NULL);
+                INSERT INTO session_message VALUES
+                    ('db-a1', 'sess1', 'assistant', 1, 2000, 2000,
+                     '{"time":{"created":2000},"content":[{"type":"text","text":"database copy"}]}');"#,
+            )
+            .unwrap();
+        drop(connection);
+
+        let database_conversation = scan_opencode_database(&database, root.path())
+            .unwrap()
+            .remove(0);
+        assert_eq!(database_conversation.source_path, expected);
+
+        let legacy_session_path = storage.join("session/proj1/sess1.json");
+        fs::remove_file(&legacy_session_path).unwrap();
+        let (recovered, complete) =
+            scan_legacy_storage(&storage, root.path(), None, true, None).unwrap();
+        assert!(complete);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].source_path, expected);
+        assert_eq!(
+            recovered[0].metadata.record_kind.as_deref(),
+            Some("recovered")
+        );
+
+        fs::remove_file(database).unwrap();
+        let connector = OpenCodeConnector {
+            storage_root: Some(storage),
+            data_root: Some(root.path().to_path_buf()),
+            db_override: None,
+        };
+        assert!(connector.source_exists(&expected).unwrap());
+        assert!(!connector.source_exists(&legacy_session_path).unwrap());
+    }
+
+    #[test]
+    fn preserved_mtime_database_import_recovers_only_unknown_sessions() {
+        let root = TempDir::new().unwrap();
+        let database = root.path().join("imported.db");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                r#"CREATE TABLE session (
+                    id TEXT PRIMARY KEY, directory TEXT NOT NULL, title TEXT NOT NULL,
+                    time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, model TEXT
+                );
+                CREATE TABLE session_message (
+                    id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL,
+                    seq INTEGER NOT NULL, time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL, data TEXT NOT NULL
+                );
+                INSERT INTO session VALUES
+                    ('known', '/work', 'Known', 1000, 2000, NULL),
+                    ('imported', '/work', 'Imported', 1000, 2000, NULL);
+                INSERT INTO session_message VALUES
+                    ('known-u1', 'known', 'user', 1, 1000, 1000,
+                     '{"time":{"created":1000},"text":"known"}'),
+                    ('imported-u1', 'imported', 'user', 1, 1000, 1000,
+                     '{"time":{"created":1000},"text":"imported"}');"#,
+            )
+            .unwrap();
+        drop(connection);
+        std::fs::File::open(&database)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(10)),
+            )
+            .unwrap();
+
+        let connector = OpenCodeConnector {
+            storage_root: None,
+            data_root: Some(root.path().to_path_buf()),
+            db_override: None,
+        };
+        let roots = connector.default_roots();
+        let since_ts = 20_000;
+        assert!(connector.scan(&roots, Some(since_ts)).unwrap().is_empty());
+
+        let known_source = database_source_path(root.path(), Agent::OpenCode, "known");
+        let recovered = connector
+            .scan_unindexed_sources(&roots, Some(since_ts), &|path| {
+                Ok(path == known_source.as_path())
+            })
+            .unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].external_id.as_deref(), Some("imported"));
+        assert_eq!(
+            recovered[0].source_path,
+            database_source_path(root.path(), Agent::OpenCode, "imported")
+        );
+
+        let already_indexed = connector
+            .scan_unindexed_sources(&roots, Some(since_ts), &|_| Ok(true))
+            .unwrap();
+        assert!(already_indexed.is_empty());
+    }
+
+    #[test]
+    fn preserved_mtime_legacy_import_is_recovered_by_session_inventory() {
+        let root = TempDir::new().unwrap();
+        let storage = root.path().join("storage");
+        create_opencode_tree(&storage);
+        let old_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(10);
+        for entry in WalkDir::new(&storage) {
+            let entry = entry.unwrap();
+            std::fs::File::open(entry.path())
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(old_time))
+                .unwrap();
+        }
+
+        let connector = OpenCodeConnector {
+            storage_root: Some(storage),
+            data_root: Some(root.path().to_path_buf()),
+            db_override: None,
+        };
+        let roots = connector.default_roots();
+        let since_ts = 20_000;
+        assert!(connector.scan(&roots, Some(since_ts)).unwrap().is_empty());
+
+        let recovered = connector
+            .scan_unindexed_sources(&roots, Some(since_ts), &|_| Ok(false))
+            .unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].external_id.as_deref(), Some("sess1"));
+        assert_eq!(
+            recovered[0].source_path,
+            database_source_path(root.path(), Agent::OpenCode, "sess1")
+        );
     }
 
     #[test]
@@ -2657,7 +3689,7 @@ mod tests {
         );
         assert_eq!(
             scan.conversations[0].source_path,
-            storage.join("session/proj1/sess1.json")
+            database_source_path(root.path(), Agent::OpenCode, "sess1")
         );
     }
 

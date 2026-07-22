@@ -59,10 +59,11 @@ are available. `view` accepts either a conversation ID or its source path.
 
 ### Usage analytics
 
-`sess usage` summarizes provider-reported API calls and tokens by harness,
-provider, and model. The terminal report is the default; the same normalized
-report is available as JSON or as a standalone, responsive HTML dashboard with
-inline SVG charts and no remote assets.
+`sess usage` summarizes provider-reported API calls, request attempts, and
+tokens by harness, provider route/family, model ID/family, and provider-model
+pair. The terminal report is the default; the same normalized report is
+available as JSON or as a standalone, responsive HTML dashboard with inline
+SVG charts and no remote assets.
 
 ```bash
 # Terminal summary across all indexed usage
@@ -71,24 +72,52 @@ inline SVG charts and no remote assets.
 # Filters repeat within a dimension; --harness is an alias for --agent
 ./target/release/sess usage --harness codex --provider openai --since 30d
 
+# Separate organic work, model variants, and task kinds
+./target/release/sess usage --exclude-synthetic --variant high --task coding
+
 # Machine-readable data or a shareable local visual report
 ./target/release/sess usage --bucket week --json
 ./target/release/sess usage --since 90d --html ./usage-report.html
+
+# Opt in to the bundled, versioned public list-price estimator
+./target/release/sess usage --estimate-list-costs
 ```
 
 Usage rows are read from the original source stores during indexing. Existing
 indexes receive a one-time connector migration scan so historical rows gain
-usage data. The report keeps unknown provider/model buckets visible instead of
-guessing attribution. Token totals remain source-reported when available;
-reasoning is shown as a subset of output, and cache reads/writes stay separate.
-Costs are included only when a source records an actual or estimated value, so
-cost coverage is shown explicitly and estimates should not be treated as a
-bill. Session/model aggregates without event-exact timing contribute to
-all-time totals but not date-filtered reports or trend charts. Provider and
-model coverage percentages are weighted by represented API calls. `--top`
-limits only the terminal and HTML breakdowns; JSON always contains every group.
-Extremely wide explicit timelines omit zero-only gaps instead of truncating
-late usage; the terminal, JSON, and HTML outputs mark those timelines as sparse.
+usage data. Transcript records, logical sessions, usage records, represented
+API calls, and failed/retried attempts are distinct metrics. Raw provider/model
+values are retained while canonical families carry their inference provenance;
+unknown buckets remain visible instead of being guessed away. Source coverage
+also shows assistant-bearing transcript records that have no normalized usage.
+Because those records cannot be filtered by provider/model/time, the source
+coverage table is explicitly full-corpus, unfiltered, and pre-report-dedup; its
+scope is machine-readable as `full_corpus_raw_pre_report_dedup`.
+
+The report also separates source completeness from analytical quality. It
+shows provider/model attribution, token-semantics provenance, component-total
+reconciliation, and mismatch rates by both represented API calls and tokens.
+
+Token totals remain source-reported when available. Fresh input, cache reads,
+cache writes, output, and the reasoning subset are kept separate, and source
+component totals are retained for reconciliation. Duplicate invocation IDs are
+removed across copied/archived transcripts and the removed rows/tokens are
+reported. Session/model aggregates contribute to all-time totals; a date range
+includes an aggregate only when its complete interval is contained, and a trend
+bucket receives it only when the interval fits that one bucket. Unallocated and
+excluded tokens are disclosed rather than assigned invented timing.
+
+Actual cost, source estimates, and the optional public-list estimate are
+separate fields with explicit coverage. The bundled estimator only prices exact
+first-party model matches when complete token components and an unambiguous
+direct route are available. Known long-context tiers are applied; regional,
+gateway, contract, batch, priority/flex, and ambiguous cache-write TTL cases
+remain unpriced. Its versioned base-list output is a comparison aid, not a bill.
+Provider/model coverage is reported both by represented API calls and by
+tokens. `--top` limits attributed terminal and HTML rows while keeping Unknown
+buckets visible; JSON always contains every group. Extremely wide explicit
+timelines omit zero-only gaps instead of truncating late usage and are marked as
+sparse.
 
 ### Index behavior
 
@@ -99,10 +128,12 @@ not elapsed. `--no-refresh` disables only the age-based refresh;
 `--no-auto-index` disables automatic indexing entirely.
 `--max-age` accepts values such as `5m`, `1h`, and `2h30m`.
 
-Use `index --full` to rescan all supported transcript roots. Use `index
+Use `index --full` to rescan all supported transcript roots, or combine it with
+`--dry-run` to inspect the full prospective update without creating files,
+running migrations, or mutating SQLite, Tantivy, or embeddings. Use `index
 --rebuild` to derive Tantivy from the SQLite database without rescanning source
-files, and `index --dry-run` to inspect a prospective incremental update
-without writing.
+files. Full and rebuild are distinct modes, and rebuild and dry-run are
+intentionally mutually exclusive.
 
 ### Supported sources
 
@@ -119,6 +150,13 @@ additional Pi-compatible agent roots. The legacy single-root
 `PI_CODING_AGENT_DIR` remains supported. Both are additive: they do not hide
 the personal Pi root, Codex external-runtime Pi root, or the standard shuvhelm
 fleet and mate roots.
+
+OpenCode discovery reads both legacy file storage and every top-level SQLite
+store, including late-v1 and v2/shuvcode layouts, and merges duplicate sessions
+deterministically. Rows whose parent session cannot be found are excluded by
+default; set `SESS_OPENCODE_RECOVER_ORPHANS=1` for a deliberate recovery scan
+that indexes those rows as synthetic orphan records instead of silently mixing
+them into normal usage.
 
 ## Background refresh
 

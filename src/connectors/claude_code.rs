@@ -11,9 +11,12 @@ use crate::connectors::{
     Connector, ConnectorScan, file_modified_since, flatten_json_content, json_u64,
     normalized_token_total, parse_role, source_file,
 };
-use crate::model::{Agent, Conversation, Message, Role, UsageRecord, source_fingerprint};
+use crate::model::{
+    Agent, Conversation, ConversationMetadata, Message, Role, UsageMetadata, UsageRecord,
+    source_fingerprint,
+};
 
-const PARSER_REVISION: &str = "2";
+const PARSER_REVISION: &str = "3";
 
 pub struct ClaudeCodeConnector {
     home_dir: Option<PathBuf>,
@@ -30,6 +33,80 @@ impl ClaudeCodeConnector {
         self.home_dir
             .as_ref()
             .map(|h| h.join(".claude").join("projects"))
+    }
+
+    fn scan_matching(
+        &self,
+        roots: &[PathBuf],
+        scan_kind: &'static str,
+        should_parse: &dyn Fn(&Path) -> Result<bool>,
+    ) -> Result<ConnectorScan> {
+        let mut conversations = Vec::new();
+        let mut complete = true;
+
+        for root in roots {
+            if !root.exists() {
+                continue;
+            }
+
+            for entry in WalkDir::new(root).follow_links(true) {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        complete = false;
+                        tracing::warn!(
+                            agent = Agent::ClaudeCode.slug(),
+                            root = %root.display(),
+                            scan_kind,
+                            error = %error,
+                            "Failed to traverse Claude Code session storage"
+                        );
+                        continue;
+                    }
+                };
+                if !entry.file_type().is_file()
+                    || entry
+                        .path()
+                        .extension()
+                        .is_none_or(|extension| extension != "jsonl")
+                {
+                    continue;
+                }
+                let path = entry.path();
+                if !should_parse(path)? {
+                    continue;
+                }
+
+                match parse_claude_session(path) {
+                    Ok(Some(conv)) => conversations.push(conv),
+                    Ok(None) => {}
+                    Err(error) => {
+                        complete = false;
+                        match self.on_parse_error(path, &error) {
+                            crate::connectors::ErrorAction::Skip => {
+                                tracing::warn!(
+                                    agent = Agent::ClaudeCode.slug(),
+                                    source_path = %path.display(),
+                                    scan_kind,
+                                    error = %error,
+                                    "Failed to parse Claude Code session"
+                                );
+                            }
+                            crate::connectors::ErrorAction::Fail => return Err(error),
+                            crate::connectors::ErrorAction::SkipAgent => {
+                                tracing::warn!(
+                                    scan_kind,
+                                    "Skipping remaining Claude Code files due to error"
+                                );
+                                return Ok(ConnectorScan::new(conversations, false));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(ConnectorScan::new(conversations, complete))
     }
 }
 
@@ -53,71 +130,27 @@ impl Connector for ClaudeCodeConnector {
     }
 
     fn scan(&self, roots: &[PathBuf], since_ts: Option<i64>) -> Result<ConnectorScan> {
-        let mut conversations = Vec::new();
-        let mut complete = true;
+        self.scan_matching(roots, "mtime", &|path| {
+            Ok(file_modified_since(path, since_ts))
+        })
+    }
 
-        for root in roots {
-            if !root.exists() {
-                continue;
+    fn scan_unindexed_sources(
+        &self,
+        roots: &[PathBuf],
+        since_ts: Option<i64>,
+        is_indexed: &dyn Fn(&Path) -> Result<bool>,
+    ) -> Result<ConnectorScan> {
+        let Some(_) = since_ts else {
+            return Ok(ConnectorScan::new(Vec::new(), true));
+        };
+
+        self.scan_matching(roots, "unindexed-backstop", &|path| {
+            if file_modified_since(path, since_ts) {
+                return Ok(false);
             }
-
-            for entry in WalkDir::new(root).follow_links(true) {
-                let entry = match entry {
-                    Ok(entry) => entry,
-                    Err(error) => {
-                        complete = false;
-                        tracing::warn!(
-                            agent = Agent::ClaudeCode.slug(),
-                            root = %root.display(),
-                            error = %error,
-                            "Failed to traverse Claude Code session storage"
-                        );
-                        continue;
-                    }
-                };
-                if !entry.file_type().is_file()
-                    || entry
-                        .path()
-                        .extension()
-                        .is_none_or(|extension| extension != "jsonl")
-                {
-                    continue;
-                }
-                let path = entry.path();
-
-                // Check if file was modified since the given timestamp
-                if !file_modified_since(path, since_ts) {
-                    continue;
-                }
-
-                match parse_claude_session(path) {
-                    Ok(Some(conv)) => {
-                        conversations.push(conv);
-                    }
-                    Ok(None) => {
-                        // Empty or no messages, skip
-                    }
-                    Err(e) => {
-                        complete = false;
-                        let action = self.on_parse_error(path, &e);
-                        match action {
-                            crate::connectors::ErrorAction::Skip => {
-                                tracing::warn!("Failed to parse {}: {}", path.display(), e);
-                            }
-                            crate::connectors::ErrorAction::Fail => {
-                                return Err(e);
-                            }
-                            crate::connectors::ErrorAction::SkipAgent => {
-                                tracing::warn!("Skipping remaining Claude Code files due to error");
-                                return Ok(ConnectorScan::new(conversations, false));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(ConnectorScan::new(conversations, complete))
+            Ok(!is_indexed(path)?)
+        })
     }
 
     fn parser_revision(&self) -> Option<&'static str> {
@@ -246,7 +279,7 @@ fn parse_claude_session(path: &Path) -> Result<Option<Conversation>> {
                                 .and_then(Value::as_str)
                                 .map(|id| format!("request:{id}"))
                         });
-                    let record = UsageRecord {
+                    let mut record = UsageRecord {
                         timestamp: timestamps.last().copied(),
                         provider: message
                             .get("provider")
@@ -263,7 +296,13 @@ fn parse_claude_session(path: &Path) -> Result<Option<Conversation>> {
                         total_tokens: total,
                         actual_cost_usd: None,
                         estimated_cost_usd: None,
+                        metadata: UsageMetadata {
+                            reported_total_tokens: Some(total),
+                            token_semantics: Some("claude-message-v1".to_string()),
+                            ..Default::default()
+                        },
                     };
+                    record.enrich_metadata();
                     let synthetic_zero = record.total_tokens == 0
                         && record.reasoning_tokens == 0
                         && record.model.as_deref().is_some_and(|model| {
@@ -334,6 +373,10 @@ fn parse_claude_session(path: &Path) -> Result<Option<Conversation>> {
             .then_with(|| left.output_tokens.cmp(&right.output_tokens))
     });
 
+    let is_child = path
+        .components()
+        .any(|component| component.as_os_str() == "subagents");
+    let logical_session_id = external_id.clone();
     Ok(Some(Conversation {
         agent: Agent::ClaudeCode,
         external_id,
@@ -346,13 +389,25 @@ fn parse_claude_session(path: &Path) -> Result<Option<Conversation>> {
         ended_at,
         messages,
         usage,
+        metadata: ConversationMetadata {
+            logical_session_id: logical_session_id.clone(),
+            parent_external_id: is_child.then_some(logical_session_id).flatten(),
+            record_kind: Some(if is_child {
+                "child_agent".to_string()
+            } else {
+                "top_level".to_string()
+            }),
+            is_synthetic: false,
+        },
     }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::{FileTimes, OpenOptions};
     use std::io::Write;
+    use std::time::{Duration, SystemTime};
     use tempfile::{NamedTempFile, TempDir};
 
     #[test]
@@ -556,5 +611,43 @@ mod tests {
             .scan(&[dir.path().to_path_buf()], Some(future_ts))
             .unwrap();
         assert!(conversations.is_empty());
+    }
+
+    #[test]
+    fn preserved_mtime_import_is_recovered_by_unknown_source_scan() {
+        let dir = TempDir::new().unwrap();
+        let session_file = dir.path().join("imported.jsonl");
+        std::fs::write(
+            &session_file,
+            r#"{"type":"user","sessionId":"imported","cwd":"/test","message":{"role":"user","content":"Imported session"},"timestamp":"2024-01-15T10:00:00Z"}
+"#,
+        )
+        .unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&session_file)
+            .unwrap()
+            .set_times(
+                FileTimes::new().set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
+            )
+            .unwrap();
+
+        let connector = ClaudeCodeConnector {
+            home_dir: Some(PathBuf::from("/nonexistent")),
+        };
+        let roots = vec![dir.path().to_path_buf()];
+        let since_ts = 20_000;
+        assert!(connector.scan(&roots, Some(since_ts)).unwrap().is_empty());
+
+        let recovered = connector
+            .scan_unindexed_sources(&roots, Some(since_ts), &|_| Ok(false))
+            .unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].source_path, session_file);
+
+        let already_indexed = connector
+            .scan_unindexed_sources(&roots, Some(since_ts), &|_| Ok(true))
+            .unwrap();
+        assert!(already_indexed.is_empty());
     }
 }

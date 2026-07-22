@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use assert_cmd::Command;
 use serde_json::Value;
@@ -75,7 +76,9 @@ fn make_conversation(
             total_tokens: input + output,
             actual_cost_usd: None,
             estimated_cost_usd: estimate,
+            metadata: Default::default(),
         }],
+        metadata: Default::default(),
     }
 }
 
@@ -187,6 +190,65 @@ fn run_usage_json(data_dir: &Path, args: &[&str]) -> Value {
     let assert = cmd.assert().success();
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8 stdout");
     serde_json::from_str(&stdout).expect("json output")
+}
+
+fn isolated_index_command(data_dir: &Path, home_dir: &Path) -> Command {
+    let mut cmd = Command::cargo_bin("sess").expect("sess binary");
+    cmd.env("HOME", home_dir)
+        .env("CODEX_HOME", home_dir.join(".codex"))
+        .env("XDG_DATA_HOME", home_dir.join(".local/share"))
+        .env_remove("HERMES_HOME")
+        .env_remove("OPENCODE_DB")
+        .env_remove("OPENCODE_STORAGE_ROOT")
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("SESS_PI_AGENT_DIRS")
+        .env_remove("SHIV_AGENT_DIR")
+        .env_remove("OPENCLAW_HOME")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .arg("--no-semantic")
+        .arg("index");
+    cmd
+}
+
+fn run_index_with_codex_scan(scan_contents: &str, args: &[&str]) -> (String, usize) {
+    let tmp = TempDir::new().expect("tempdir");
+    let data_dir = tmp.path().join("data");
+    let home_dir = tmp.path().join("home");
+    let sessions_dir = home_dir.join(".codex/sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("sessions dir");
+    std::fs::write(
+        sessions_dir.join("rollout-scan-fixture.jsonl"),
+        scan_contents,
+    )
+    .expect("scan fixture");
+
+    let missing_path = sessions_dir.join("rollout-retained.jsonl");
+    let mut storage = Storage::new(&data_dir.join("sess.db")).expect("storage");
+    storage
+        .upsert_conversation(&make_conversation(
+            Agent::Codex,
+            "/project",
+            missing_path.to_string_lossy().as_ref(),
+            "Retained after partial scan",
+            "This indexed row must survive an incomplete connector inventory.",
+            1_000,
+        ))
+        .expect("seed retained row");
+    drop(storage);
+
+    let mut command = isolated_index_command(&data_dir, &home_dir);
+    for arg in args {
+        command.arg(arg);
+    }
+    let assert = command.assert().success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8 stdout");
+    let retained = Storage::new(&data_dir.join("sess.db"))
+        .expect("storage after index")
+        .stats()
+        .expect("stats")
+        .total_conversations;
+    (stdout, retained)
 }
 
 #[test]
@@ -407,4 +469,172 @@ fn cli_usage_rejects_reversed_date_ranges() {
         .stderr(predicates::str::contains(
             "--since must not be later than --until",
         ));
+}
+
+#[test]
+fn cli_full_dry_run_routes_to_unbounded_read_only_preview() {
+    let tmp = TempDir::new().expect("tempdir");
+    let data_dir = tmp.path().join("data");
+    let home_dir = tmp.path().join("home");
+    std::fs::create_dir_all(&home_dir).expect("home");
+
+    let mut cmd = isolated_index_command(&data_dir, &home_dir);
+    let assert = cmd.arg("--full").arg("--dry-run").assert().success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8 stdout");
+    assert!(stdout.contains("Running dry-run full index (no writes)..."));
+    assert!(
+        !data_dir.exists(),
+        "dry-run must not create its data directory"
+    );
+}
+
+#[test]
+fn cli_dry_run_does_not_migrate_or_create_index_files() {
+    let tmp = TempDir::new().expect("tempdir");
+    let data_dir = tmp.path().join("data");
+    let home_dir = tmp.path().join("home");
+    std::fs::create_dir_all(&data_dir).expect("data dir");
+    std::fs::create_dir_all(&home_dir).expect("home dir");
+    let db_path = data_dir.join("sess.db");
+
+    let connection = rusqlite::Connection::open(&db_path).expect("legacy database");
+    connection
+        .execute_batch(
+            "CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at INTEGER NOT NULL
+            );",
+        )
+        .expect("migration table");
+    for migration in session_search::storage::sqlite::MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version <= 3)
+    {
+        connection
+            .execute_batch(migration.sql)
+            .expect("legacy migration");
+        connection
+            .execute(
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (?, 0)",
+                [migration.version],
+            )
+            .expect("migration marker");
+    }
+    drop(connection);
+    let before = std::fs::read(&db_path).expect("database snapshot");
+
+    isolated_index_command(&data_dir, &home_dir)
+        .arg("--full")
+        .arg("--dry-run")
+        .assert()
+        .success();
+
+    assert_eq!(
+        std::fs::read(&db_path).expect("database after dry-run"),
+        before
+    );
+    assert!(!data_dir.join("tantivy").exists());
+    let mut entries = std::fs::read_dir(&data_dir)
+        .expect("data directory")
+        .map(|entry| {
+            entry
+                .expect("data directory entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+    entries.sort();
+    assert_eq!(entries, ["sess.db"]);
+    let connection =
+        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("read legacy database");
+    let latest: u32 = connection
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .expect("latest migration");
+    assert_eq!(latest, 3);
+}
+
+#[test]
+fn cli_rejects_conflicting_full_and_rebuild_modes() {
+    let tmp = TempDir::new().expect("tempdir");
+    isolated_index_command(&tmp.path().join("data"), &tmp.path().join("home"))
+        .arg("--full")
+        .arg("--rebuild")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("cannot be used with"));
+}
+
+#[test]
+fn full_index_preserves_rows_for_an_incomplete_connector_scan() {
+    let (_, retained) = run_index_with_codex_scan("not json\n", &["--full"]);
+    assert_eq!(retained, 1);
+}
+
+#[test]
+fn incremental_index_preserves_rows_for_an_incomplete_connector_scan() {
+    let (_, retained) = run_index_with_codex_scan("not json\n", &[]);
+    assert_eq!(retained, 1);
+}
+
+#[test]
+fn dry_run_does_not_preview_deletion_for_an_incomplete_connector_scan() {
+    let (stdout, retained) = run_index_with_codex_scan("not json\n", &["--full", "--dry-run"]);
+    assert!(stdout.contains("Would delete: 0"));
+    assert_eq!(retained, 1);
+}
+
+#[test]
+fn completed_connector_scan_still_deletes_confirmed_missing_rows() {
+    let valid_empty_rollout = r#"{"type":"session_meta","payload":{"id":"empty","cwd":"/project"}}
+"#;
+    let (_, retained) = run_index_with_codex_scan(valid_empty_rollout, &["--full"]);
+    assert_eq!(retained, 0);
+}
+
+#[test]
+fn incremental_index_recovers_preserved_mtime_archive_move() {
+    let tmp = TempDir::new().expect("tempdir");
+    let data_dir = tmp.path().join("data");
+    let home_dir = tmp.path().join("home");
+    let active_root = home_dir.join(".codex/sessions");
+    let archive_root = home_dir.join(".codex/archived_sessions");
+    std::fs::create_dir_all(&active_root).expect("active root");
+    std::fs::create_dir_all(&archive_root).expect("archive root");
+
+    let active_path = active_root.join("rollout-preserved.jsonl");
+    let archived_path = archive_root.join("rollout-preserved.jsonl");
+    std::fs::write(
+        &active_path,
+        r#"{"type":"session_meta","payload":{"id":"archive-move","cwd":"/project"}}
+{"type":"event_msg","timestamp":1705312800.5,"payload":{"type":"user_message","message":"Preserved archive"}}
+"#,
+    )
+    .expect("rollout");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&active_path)
+        .expect("open rollout")
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
+        )
+        .expect("old mtime");
+
+    isolated_index_command(&data_dir, &home_dir)
+        .arg("--full")
+        .assert()
+        .success();
+    std::fs::rename(&active_path, &archived_path).expect("archive move");
+    isolated_index_command(&data_dir, &home_dir)
+        .assert()
+        .success();
+
+    let storage = Storage::new(&data_dir.join("sess.db")).expect("storage");
+    let conversations = storage.get_all_conversations().expect("conversations");
+    assert_eq!(conversations.len(), 1);
+    assert_eq!(conversations[0].source_path, archived_path);
 }

@@ -338,6 +338,7 @@ mod tests {
                 model: None,
             }],
             usage: vec![],
+            metadata: Default::default(),
         }
     }
 
@@ -499,6 +500,10 @@ mod tests {
                     started_at: Some(1000),
                     ended_at: Some(2000),
                     source_fingerprint: "fp1".to_string(),
+                    logical_session_id: Some("s1".to_string()),
+                    parent_external_id: None,
+                    record_kind: "top_level".to_string(),
+                    is_synthetic: false,
                 },
                 "[user] Hello\n[assistant] World".to_string(),
             ),
@@ -513,6 +518,10 @@ mod tests {
                     started_at: None,
                     ended_at: None,
                     source_fingerprint: "fp2".to_string(),
+                    logical_session_id: None,
+                    parent_external_id: None,
+                    record_kind: "top_level".to_string(),
+                    is_synthetic: false,
                 },
                 "[user] Code review".to_string(),
             ),

@@ -625,6 +625,7 @@ mod tests {
                 },
             ],
             usage: vec![],
+            metadata: Default::default(),
         };
 
         let upsert = storage.upsert_conversation(&conv).unwrap();

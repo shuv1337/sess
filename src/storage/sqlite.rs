@@ -3,10 +3,19 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, Transaction, types::Value as SqliteValue};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
+    types::Type as SqliteType,
+};
 
-use crate::model::{Agent, Conversation, Message, Role, SourceFile, UsageRecord};
-use crate::usage::{TokenCounts, UsageDataset, UsageEventRow};
+#[cfg(test)]
+use rusqlite::types::Value as SqliteValue;
+
+use crate::model::{
+    Agent, Conversation, ConversationMetadata, Message, Role, SourceFile, UsageGrain,
+    UsageMetadata, UsageRecord,
+};
+use crate::usage::{SourceCoverage, TokenCounts, UsageDataset, UsageEventRow};
 
 /// A DB row whose backing source file is missing on disk.
 #[derive(Debug, Clone)]
@@ -30,15 +39,104 @@ pub struct StaleDeletionSummary {
 
 pub type MissingSourceClassification = (Vec<MissingSource>, Vec<(i64, PathBuf, String)>);
 
-fn agent_from_slug(slug: &str) -> Agent {
+fn invalid_persisted_enum(column: usize, kind: &str, value: &str) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        column,
+        SqliteType::Text,
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Unknown persisted {kind}: {value}"),
+        )),
+    )
+}
+
+fn agent_from_slug(slug: &str, column: usize) -> rusqlite::Result<Agent> {
     match slug {
-        "claude_code" => Agent::ClaudeCode,
-        "codex" => Agent::Codex,
-        "hermes" => Agent::Hermes,
-        "opencode" => Agent::OpenCode,
-        "pi_agent" => Agent::PiAgent,
-        _ => Agent::ClaudeCode,
+        "claude_code" => Ok(Agent::ClaudeCode),
+        "codex" => Ok(Agent::Codex),
+        "hermes" => Ok(Agent::Hermes),
+        "opencode" => Ok(Agent::OpenCode),
+        "pi_agent" => Ok(Agent::PiAgent),
+        _ => Err(invalid_persisted_enum(column, "agent", slug)),
     }
+}
+
+fn role_from_slug(slug: &str, column: usize) -> rusqlite::Result<Role> {
+    match slug {
+        "user" => Ok(Role::User),
+        "assistant" => Ok(Role::Assistant),
+        "tool" => Ok(Role::Tool),
+        "system" => Ok(Role::System),
+        _ => Err(invalid_persisted_enum(column, "message role", slug)),
+    }
+}
+
+fn usage_grain_from_slug(slug: &str, column: usize) -> rusqlite::Result<UsageGrain> {
+    match slug {
+        "event" => Ok(UsageGrain::Event),
+        "interval_aggregate" => Ok(UsageGrain::IntervalAggregate),
+        "session_aggregate" => Ok(UsageGrain::SessionAggregate),
+        _ => Err(invalid_persisted_enum(column, "usage grain", slug)),
+    }
+}
+
+fn latest_supported_schema_version() -> u32 {
+    MIGRATIONS.last().map_or(0, |migration| migration.version)
+}
+
+fn migration_table_exists(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'schema_migrations'
+         )",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+fn ensure_supported_schema_version(conn: &Connection) -> Result<()> {
+    if !migration_table_exists(conn)? {
+        return Ok(());
+    }
+
+    let version: Option<i64> =
+        conn.query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })?;
+    if let Some(version) = version {
+        let supported = i64::from(latest_supported_schema_version());
+        if version > supported {
+            anyhow::bail!(
+                "Database schema version {version} is newer than this sess build supports ({supported})"
+            );
+        }
+        if version < 0 {
+            anyhow::bail!("Database contains an invalid negative schema version: {version}");
+        }
+    }
+    Ok(())
+}
+
+fn migrations_are_current(conn: &Connection) -> Result<bool> {
+    if !migration_table_exists(conn)? {
+        return Ok(false);
+    }
+    ensure_supported_schema_version(conn)?;
+    for migration in MIGRATIONS {
+        let applied = conn
+            .query_row(
+                "SELECT 1 FROM schema_migrations WHERE version = ?",
+                [migration.version],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if !applied {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Migration definition
@@ -63,6 +161,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 3,
         name: "add_usage_events",
         sql: include_str!("migrations/003_add_usage_events.sql"),
+    },
+    Migration {
+        version: 4,
+        name: "usage_provenance",
+        sql: include_str!("migrations/004_usage_provenance.sql"),
     },
 ];
 
@@ -107,11 +210,11 @@ impl Storage {
 
         // Enable WAL mode and other optimizations
         conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
+            "PRAGMA busy_timeout = 5000;  -- 5s, lets concurrent opens/indexes wait
+             PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA foreign_keys = ON;
              PRAGMA cache_size = -64000;  -- 64MB
-             PRAGMA busy_timeout = 5000;  -- 5s, lets background refresh wait
             ",
         )
         .context("Failed to set database pragmas")?;
@@ -126,25 +229,69 @@ impl Storage {
         Ok(storage)
     }
 
+    /// Open an existing database without creating files, changing persistent
+    /// journal state, or applying migrations. This is used by index previews
+    /// whose contract is filesystem read-only, including against an older schema.
+    pub fn open_read_only(path: &Path) -> Result<Option<Self>> {
+        if !path
+            .try_exists()
+            .with_context(|| format!("Failed to inspect database path {}", path.display()))?
+        {
+            return Ok(None);
+        }
+
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("Failed to open database read-only at {}", path.display()))?;
+        conn.execute_batch(
+            "PRAGMA query_only = ON;
+             PRAGMA foreign_keys = ON;
+             PRAGMA busy_timeout = 5000;",
+        )
+        .context("Failed to configure read-only database connection")?;
+        ensure_supported_schema_version(&conn)?;
+
+        Ok(Some(Self {
+            conn,
+            path: path.to_path_buf(),
+        }))
+    }
+
     /// Run database migrations
     fn run_migrations(&mut self) -> Result<()> {
-        self.conn.execute(
+        // Avoid taking a writer lock on every read-oriented CLI invocation once
+        // the schema is current. The locked path below rechecks all markers, so
+        // this optimistic check does not weaken concurrent first-open safety.
+        if migrations_are_current(&self.conn)? {
+            return Ok(());
+        }
+
+        // Acquire the writer lock before inspecting migration markers. A second
+        // process opening the same database waits, then observes the markers
+        // committed by the first instead of racing the same ALTER statements.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
             "CREATE TABLE IF NOT EXISTS schema_migrations (
                 version INTEGER PRIMARY KEY,
                 applied_at INTEGER NOT NULL
             )",
             [],
         )?;
+        ensure_supported_schema_version(&tx)?;
 
         for migration in MIGRATIONS {
-            let exists: bool = self
-                .conn
+            let exists = tx
                 .query_row(
                     "SELECT 1 FROM schema_migrations WHERE version = ?",
                     [migration.version],
-                    |_| Ok(true),
+                    |row| row.get::<_, i64>(0),
                 )
-                .unwrap_or(false);
+                .optional()?
+                .is_some();
 
             if !exists {
                 tracing::info!(
@@ -152,14 +299,17 @@ impl Storage {
                     migration.version,
                     migration.name
                 );
-                self.conn.execute_batch(migration.sql)?;
-                self.conn.execute(
+                // Schema changes and their markers share this transaction, so
+                // interruption cannot leave a partially applied migration.
+                tx.execute_batch(migration.sql)?;
+                tx.execute(
                     "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
                     rusqlite::params![migration.version, chrono::Utc::now().timestamp_millis(),],
                 )?;
             }
         }
 
+        tx.commit()?;
         Ok(())
     }
 
@@ -186,7 +336,7 @@ impl Storage {
                 let id: i64 = row.get(0)?;
                 let agent_slug: String = row.get(1)?;
                 let path: String = row.get(2)?;
-                Ok((id, agent_from_slug(&agent_slug), PathBuf::from(path)))
+                Ok((id, agent_from_slug(&agent_slug, 1)?, PathBuf::from(path)))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
@@ -220,6 +370,28 @@ impl Storage {
             .map(|p| p.to_string_lossy().to_string());
         let indexed_at = chrono::Utc::now().timestamp_millis();
         let mtime_max = conv.source_mtime_max();
+        let logical_session_id = conv.metadata.logical_session_id.as_deref().or_else(|| {
+            conv.external_id
+                .as_deref()
+                .filter(|value| !value.is_empty())
+        });
+        let record_kind = conv
+            .metadata
+            .record_kind
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .unwrap_or("top_level");
+        let is_synthetic = conv.metadata.is_synthetic
+            || conv.usage.iter().any(|record| {
+                record
+                    .provider
+                    .as_deref()
+                    .is_some_and(|value| value.eq_ignore_ascii_case("faux"))
+                    || record
+                        .model
+                        .as_deref()
+                        .is_some_and(|value| value.eq_ignore_ascii_case("faux"))
+            });
 
         // Check if conversation exists
         let existing: Option<i64> = tx
@@ -250,19 +422,27 @@ impl Storage {
                         ended_at = ?,
                         indexed_at = ?,
                         source_mtime_max = ?,
-                        source_fingerprint = ?
+                        source_fingerprint = ?,
+                        logical_session_id = ?,
+                        parent_external_id = ?,
+                        record_kind = ?,
+                        is_synthetic = ?
                     WHERE id = ?",
-                    [
+                    rusqlite::params![
                         conv.agent.slug(),
-                        conv.external_id.as_deref().unwrap_or(""),
+                        conv.external_id.as_deref(),
                         conv.derive_title().as_str(),
-                        workspace_str.as_deref().unwrap_or(""),
-                        &conv.started_at.unwrap_or(0).to_string(),
-                        &conv.ended_at.unwrap_or(0).to_string(),
-                        &indexed_at.to_string(),
-                        &mtime_max.to_string(),
+                        workspace_str.as_deref(),
+                        conv.started_at,
+                        conv.ended_at,
+                        indexed_at,
+                        mtime_max,
                         &conv.source_fingerprint,
-                        &id.to_string(),
+                        logical_session_id,
+                        conv.metadata.parent_external_id.as_deref(),
+                        record_kind,
+                        is_synthetic,
+                        id,
                     ],
                 )?;
 
@@ -284,19 +464,24 @@ impl Storage {
             tx.execute(
                 "INSERT INTO conversations
                     (agent, external_id, title, workspace, source_path,
-                     started_at, ended_at, indexed_at, source_mtime_max, source_fingerprint)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                [
+                     started_at, ended_at, indexed_at, source_mtime_max, source_fingerprint,
+                     logical_session_id, parent_external_id, record_kind, is_synthetic)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                rusqlite::params![
                     conv.agent.slug(),
-                    conv.external_id.as_deref().unwrap_or(""),
+                    conv.external_id.as_deref(),
                     conv.derive_title().as_str(),
-                    workspace_str.as_deref().unwrap_or(""),
+                    workspace_str.as_deref(),
                     &source_path_str,
-                    &conv.started_at.unwrap_or(0).to_string(),
-                    &conv.ended_at.unwrap_or(0).to_string(),
-                    &indexed_at.to_string(),
-                    &mtime_max.to_string(),
+                    conv.started_at,
+                    conv.ended_at,
+                    indexed_at,
+                    mtime_max,
                     &conv.source_fingerprint,
+                    logical_session_id,
+                    conv.metadata.parent_external_id.as_deref(),
+                    record_kind,
+                    is_synthetic,
                 ],
             )?;
 
@@ -322,21 +507,15 @@ impl Storage {
     pub fn get_all_conversations(&self) -> Result<Vec<ConversationRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, agent, external_id, title, workspace, source_path,
-                    started_at, ended_at, source_fingerprint
+                    started_at, ended_at, source_fingerprint, logical_session_id,
+                    parent_external_id, record_kind, is_synthetic
              FROM conversations
              ORDER BY id",
         )?;
 
         let rows = stmt.query_map([], |row| {
             let agent_slug: String = row.get(1)?;
-            let agent = match agent_slug.as_str() {
-                "claude_code" => Agent::ClaudeCode,
-                "codex" => Agent::Codex,
-                "hermes" => Agent::Hermes,
-                "opencode" => Agent::OpenCode,
-                "pi_agent" => Agent::PiAgent,
-                _ => Agent::ClaudeCode, // Default
-            };
+            let agent = agent_from_slug(&agent_slug, 1)?;
 
             Ok(ConversationRow {
                 id: row.get(0)?,
@@ -348,6 +527,10 @@ impl Storage {
                 started_at: row.get(6)?,
                 ended_at: row.get(7)?,
                 source_fingerprint: row.get(8)?,
+                logical_session_id: row.get(9)?,
+                parent_external_id: row.get(10)?,
+                record_kind: row.get(11)?,
+                is_synthetic: row.get(12)?,
             })
         })?;
 
@@ -365,19 +548,13 @@ impl Storage {
             .conn
             .query_row(
                 "SELECT id, agent, external_id, title, workspace, source_path,
-                    started_at, ended_at, source_fingerprint
+                    started_at, ended_at, source_fingerprint, logical_session_id,
+                    parent_external_id, record_kind, is_synthetic
              FROM conversations WHERE id = ?",
                 [id],
                 |row| {
                     let agent_slug: String = row.get(1)?;
-                    let agent = match agent_slug.as_str() {
-                        "claude_code" => Agent::ClaudeCode,
-                        "codex" => Agent::Codex,
-                        "hermes" => Agent::Hermes,
-                        "opencode" => Agent::OpenCode,
-                        "pi_agent" => Agent::PiAgent,
-                        _ => Agent::ClaudeCode,
-                    };
+                    let agent = agent_from_slug(&agent_slug, 1)?;
 
                     Ok(ConversationRow {
                         id: row.get(0)?,
@@ -389,6 +566,10 @@ impl Storage {
                         started_at: row.get(6)?,
                         ended_at: row.get(7)?,
                         source_fingerprint: row.get(8)?,
+                        logical_session_id: row.get(9)?,
+                        parent_external_id: row.get(10)?,
+                        record_kind: row.get(11)?,
+                        is_synthetic: row.get(12)?,
                     })
                 },
             )
@@ -422,6 +603,12 @@ impl Storage {
             ended_at: row.ended_at,
             messages,
             usage,
+            metadata: ConversationMetadata {
+                logical_session_id: row.logical_session_id,
+                parent_external_id: row.parent_external_id,
+                record_kind: Some(row.record_kind),
+                is_synthetic: row.is_synthetic,
+            },
         }))
     }
 
@@ -436,13 +623,7 @@ impl Storage {
 
         let rows = stmt.query_map([conversation_id], |row| {
             let role_str: String = row.get(1)?;
-            let role = match role_str.as_str() {
-                "user" => Role::User,
-                "assistant" => Role::Assistant,
-                "tool" => Role::Tool,
-                "system" => Role::System,
-                _ => Role::User,
-            };
+            let role = role_from_slug(&role_str, 1)?;
 
             Ok(Message {
                 idx: row.get(0)?,
@@ -466,7 +647,12 @@ impl Storage {
         let mut stmt = self.conn.prepare(
             "SELECT timestamp, provider, model, source_event_id, api_calls, input_tokens, output_tokens,
                     cache_read_tokens, cache_write_tokens, reasoning_tokens,
-                    total_tokens, actual_cost_usd, estimated_cost_usd
+                    total_tokens, actual_cost_usd, estimated_cost_usd,
+                    interval_start, interval_end, usage_grain, provider_family,
+                    provider_inference_source, provider_inference_confidence,
+                    model_family, model_variant, task, billing_base_url, billing_mode,
+                    request_attempts, reported_total_tokens, component_total_tokens,
+                    token_semantics, cost_status, cost_source, cost_currency, pricing_version
              FROM usage_events
              WHERE conversation_id = ?
              ORDER BY idx",
@@ -486,6 +672,31 @@ impl Storage {
                 total_tokens: row.get(10)?,
                 actual_cost_usd: row.get(11)?,
                 estimated_cost_usd: row.get(12)?,
+                metadata: UsageMetadata {
+                    interval_start: row.get(13)?,
+                    interval_end: row.get(14)?,
+                    grain: usage_grain_from_slug(&row.get::<_, String>(15)?, 15)?,
+                    provider_family: row.get(16)?,
+                    provider_inference_source: row.get(17)?,
+                    provider_inference_confidence: row.get(18)?,
+                    model_family: row.get(19)?,
+                    model_variant: row.get(20)?,
+                    task: row.get(21)?,
+                    billing_base_url: row.get(22)?,
+                    billing_mode: row.get(23)?,
+                    request_attempts: row.get::<_, i64>(24)?.max(0) as u64,
+                    reported_total_tokens: row
+                        .get::<_, Option<i64>>(25)?
+                        .map(|value| value.max(0) as u64),
+                    component_total_tokens: row
+                        .get::<_, Option<i64>>(26)?
+                        .map(|value| value.max(0) as u64),
+                    token_semantics: row.get(27)?,
+                    cost_status: row.get(28)?,
+                    cost_source: row.get(29)?,
+                    cost_currency: row.get(30)?,
+                    pricing_version: row.get(31)?,
+                },
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -495,44 +706,121 @@ impl Storage {
     /// the analytics renderers.
     pub fn usage_dataset(&self) -> Result<UsageDataset> {
         let mut stmt = self.conn.prepare(
-            "SELECT u.conversation_id, c.agent, c.workspace, u.timestamp,
-                    u.provider, u.model, u.source_event_id, u.api_calls, u.input_tokens,
-                    u.output_tokens, u.cache_read_tokens, u.cache_write_tokens,
-                    u.reasoning_tokens, u.total_tokens, u.actual_cost_usd,
-                    u.estimated_cost_usd
+            "SELECT u.conversation_id, c.agent, c.workspace, c.logical_session_id,
+                    c.record_kind, c.is_synthetic, u.timestamp, u.interval_start,
+                    u.interval_end, u.usage_grain, u.provider, u.provider_family,
+                    u.provider_inference_source, u.provider_inference_confidence,
+                    u.model, u.model_family, u.model_variant, u.task,
+                    u.billing_base_url, u.billing_mode, u.source_event_id, u.api_calls,
+                    u.request_attempts, u.input_tokens, u.output_tokens,
+                    u.cache_read_tokens, u.cache_write_tokens, u.reasoning_tokens,
+                    u.total_tokens, u.reported_total_tokens, u.component_total_tokens,
+                    u.token_semantics, u.actual_cost_usd, u.estimated_cost_usd,
+                    u.cost_status, u.cost_source, u.cost_currency, u.pricing_version
              FROM usage_events u
              JOIN conversations c ON c.id = u.conversation_id
-             ORDER BY u.timestamp, u.conversation_id, u.idx",
+             ORDER BY COALESCE(u.timestamp, u.interval_start), u.conversation_id, u.idx",
         )?;
         let rows = stmt.query_map([], |row| {
             let agent: String = row.get(1)?;
             let nonnegative = |value: i64| value.max(0) as u64;
             Ok(UsageEventRow {
                 conversation_id: row.get(0)?,
-                agent: agent_from_slug(&agent),
+                agent: agent_from_slug(&agent, 1)?,
                 workspace: row.get(2)?,
-                timestamp: row.get(3)?,
-                provider: row.get(4)?,
-                model: row.get(5)?,
-                source_event_id: row.get(6)?,
-                api_calls: nonnegative(row.get(7)?),
+                logical_session_id: row.get(3)?,
+                record_kind: row.get(4)?,
+                is_synthetic: row.get(5)?,
+                timestamp: row.get(6)?,
+                interval_start: row.get(7)?,
+                interval_end: row.get(8)?,
+                usage_grain: usage_grain_from_slug(&row.get::<_, String>(9)?, 9)?,
+                provider: row.get(10)?,
+                provider_family: row.get(11)?,
+                provider_inference_source: row.get(12)?,
+                provider_inference_confidence: row.get(13)?,
+                model: row.get(14)?,
+                model_family: row.get(15)?,
+                model_variant: row.get(16)?,
+                task: row.get(17)?,
+                billing_base_url: row.get(18)?,
+                billing_mode: row.get(19)?,
+                source_event_id: row.get(20)?,
+                api_calls: nonnegative(row.get(21)?),
+                request_attempts: nonnegative(row.get(22)?),
                 tokens: TokenCounts {
-                    input: nonnegative(row.get(8)?),
-                    output: nonnegative(row.get(9)?),
-                    cache_read: nonnegative(row.get(10)?),
-                    cache_write: nonnegative(row.get(11)?),
-                    reasoning: nonnegative(row.get(12)?),
-                    total: nonnegative(row.get(13)?),
+                    input: nonnegative(row.get(23)?),
+                    output: nonnegative(row.get(24)?),
+                    cache_read: nonnegative(row.get(25)?),
+                    cache_write: nonnegative(row.get(26)?),
+                    reasoning: nonnegative(row.get(27)?),
+                    total: nonnegative(row.get(28)?),
                 },
-                actual_cost_usd: row.get(14)?,
-                estimated_cost_usd: row.get(15)?,
+                reported_total_tokens: row.get::<_, Option<i64>>(29)?.map(nonnegative),
+                component_total_tokens: row.get::<_, Option<i64>>(30)?.map(nonnegative),
+                token_semantics: row.get(31)?,
+                actual_cost_usd: row.get(32)?,
+                estimated_cost_usd: row.get(33)?,
+                cost_status: row.get(34)?,
+                cost_source: row.get(35)?,
+                cost_currency: row.get(36)?,
+                pricing_version: row.get(37)?,
             })
         })?;
+        let events = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        let mut coverage_stmt = self.conn.prepare(
+            "WITH message_counts AS (
+                 SELECT conversation_id,
+                        SUM(CASE WHEN role = 'assistant' THEN 1 ELSE 0 END) AS assistant_messages
+                 FROM messages GROUP BY conversation_id
+             ), usage_counts AS (
+                 SELECT conversation_id, COUNT(*) AS usage_records,
+                        SUM(api_calls) AS api_calls,
+                        SUM(request_attempts) AS request_attempts,
+                        SUM(total_tokens) AS total_tokens
+                 FROM usage_events GROUP BY conversation_id
+             )
+             SELECT c.agent, COUNT(*),
+                    COUNT(DISTINCT COALESCE(NULLIF(c.logical_session_id, ''), 'record:' || c.id)),
+                    SUM(COALESCE(m.assistant_messages, 0)),
+                    SUM(CASE WHEN COALESCE(m.assistant_messages, 0) > 0 THEN 1 ELSE 0 END),
+                    SUM(COALESCE(u.usage_records, 0)),
+                    SUM(CASE WHEN COALESCE(u.usage_records, 0) > 0 THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN COALESCE(m.assistant_messages, 0) > 0
+                                  AND COALESCE(u.usage_records, 0) = 0 THEN 1 ELSE 0 END),
+                    SUM(COALESCE(u.api_calls, 0)),
+                    SUM(COALESCE(u.request_attempts, 0)),
+                    SUM(COALESCE(u.total_tokens, 0))
+             FROM conversations c
+             LEFT JOIN message_counts m ON m.conversation_id = c.id
+             LEFT JOIN usage_counts u ON u.conversation_id = c.id
+             GROUP BY c.agent ORDER BY c.agent",
+        )?;
+        let source_coverage = coverage_stmt
+            .query_map([], |row| {
+                Ok(SourceCoverage {
+                    agent: row.get(0)?,
+                    transcript_records: nonnegative_i64(row.get(1)?),
+                    logical_sessions: nonnegative_i64(row.get(2)?),
+                    assistant_messages: nonnegative_i64(row.get(3)?),
+                    assistant_records: nonnegative_i64(row.get(4)?),
+                    usage_records: nonnegative_i64(row.get(5)?),
+                    usage_bearing_records: nonnegative_i64(row.get(6)?),
+                    assistant_without_usage_records: nonnegative_i64(row.get(7)?),
+                    api_calls: nonnegative_i64(row.get(8)?),
+                    request_attempts: nonnegative_i64(row.get(9)?),
+                    total_tokens: nonnegative_i64(row.get(10)?),
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         let stats = self.stats()?;
         Ok(UsageDataset {
-            events: rows.collect::<std::result::Result<Vec<_>, _>>()?,
+            events,
             indexed_conversations: stats.total_conversations as u64,
             indexed_messages: stats.total_messages as u64,
+            source_coverage,
         })
     }
 
@@ -577,7 +865,7 @@ impl Storage {
         let mut missing = Vec::new();
         let mut uncertain = Vec::new();
         for (id, agent_slug, path) in rows {
-            let agent = agent_from_slug(&agent_slug);
+            let agent = agent_from_slug(&agent_slug, 1)?;
             if !detected_agents.contains(&agent) {
                 continue;
             }
@@ -678,14 +966,7 @@ impl Storage {
         let mut by_agent = HashMap::new();
         let rows = stmt.query_map([], |row| {
             let agent_slug: String = row.get(0)?;
-            let agent = match agent_slug.as_str() {
-                "claude_code" => Agent::ClaudeCode,
-                "codex" => Agent::Codex,
-                "hermes" => Agent::Hermes,
-                "opencode" => Agent::OpenCode,
-                "pi_agent" => Agent::PiAgent,
-                _ => Agent::ClaudeCode,
-            };
+            let agent = agent_from_slug(&agent_slug, 0)?;
 
             Ok((
                 agent,
@@ -844,6 +1125,10 @@ pub struct ConversationRow {
     pub started_at: Option<i64>,
     pub ended_at: Option<i64>,
     pub source_fingerprint: String,
+    pub logical_session_id: Option<String>,
+    pub parent_external_id: Option<String>,
+    pub record_kind: String,
+    pub is_synthetic: bool,
 }
 
 fn insert_messages(tx: &Transaction, conversation_id: i64, messages: &[Message]) -> Result<()> {
@@ -862,8 +1147,8 @@ fn insert_messages(tx: &Transaction, conversation_id: i64, messages: &[Message])
             msg.idx as i64,
             msg.role.as_str(),
             msg.content.as_str(),
-            msg.timestamp.unwrap_or(0),
-            msg.model.as_deref().unwrap_or(""),
+            msg.timestamp,
+            msg.model.as_deref(),
             hash,
         ])?;
     }
@@ -880,11 +1165,18 @@ fn insert_usage_events(
         "INSERT INTO usage_events
             (conversation_id, idx, timestamp, provider, model, source_event_id, api_calls, input_tokens,
              output_tokens, cache_read_tokens, cache_write_tokens,
-             reasoning_tokens, total_tokens, actual_cost_usd, estimated_cost_usd)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             reasoning_tokens, total_tokens, actual_cost_usd, estimated_cost_usd,
+             interval_start, interval_end, usage_grain, provider_family,
+             provider_inference_source, provider_inference_confidence,
+             model_family, model_variant, task, billing_base_url, billing_mode,
+             request_attempts, reported_total_tokens, component_total_tokens,
+             token_semantics, cost_status, cost_source, cost_currency, pricing_version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )?;
 
     for (idx, record) in usage.iter().enumerate() {
+        let mut record = record.clone();
+        record.enrich_metadata();
         stmt.execute(rusqlite::params![
             conversation_id,
             idx as i64,
@@ -901,6 +1193,25 @@ fn insert_usage_events(
             sqlite_counter(record.total_tokens),
             record.actual_cost_usd,
             record.estimated_cost_usd,
+            record.metadata.interval_start,
+            record.metadata.interval_end,
+            record.metadata.grain.as_str(),
+            record.metadata.provider_family.as_deref(),
+            record.metadata.provider_inference_source.as_deref(),
+            record.metadata.provider_inference_confidence.as_deref(),
+            record.metadata.model_family.as_deref(),
+            record.metadata.model_variant.as_deref(),
+            record.metadata.task.as_deref(),
+            record.metadata.billing_base_url.as_deref(),
+            record.metadata.billing_mode.as_deref(),
+            sqlite_counter(record.metadata.request_attempts),
+            record.metadata.reported_total_tokens.map(sqlite_counter),
+            record.metadata.component_total_tokens.map(sqlite_counter),
+            record.metadata.token_semantics.as_deref(),
+            record.metadata.cost_status.as_deref(),
+            record.metadata.cost_source.as_deref(),
+            record.metadata.cost_currency.as_deref(),
+            record.metadata.pricing_version.as_deref(),
         ])?;
     }
 
@@ -911,10 +1222,36 @@ fn sqlite_counter(value: u64) -> i64 {
     value.min(i64::MAX as u64) as i64
 }
 
+fn nonnegative_i64(value: i64) -> u64 {
+    value.max(0) as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    fn create_v3_database(path: &Path) -> Connection {
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    applied_at INTEGER NOT NULL
+                );",
+            )
+            .unwrap();
+        for migration in MIGRATIONS.iter().filter(|migration| migration.version <= 3) {
+            connection.execute_batch(migration.sql).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?, 0)",
+                    [migration.version],
+                )
+                .unwrap();
+        }
+        connection
+    }
 
     fn create_test_conversation() -> Conversation {
         Conversation {
@@ -948,6 +1285,7 @@ mod tests {
                 },
             ],
             usage: vec![],
+            metadata: Default::default(),
         }
     }
 
@@ -986,6 +1324,12 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let mut storage = Storage::new(temp_file.path()).unwrap();
         let mut conv = create_test_conversation();
+        conv.metadata = ConversationMetadata {
+            logical_session_id: Some("logical-session".to_string()),
+            parent_external_id: Some("parent-session".to_string()),
+            record_kind: Some("child_agent".to_string()),
+            is_synthetic: true,
+        };
         conv.usage = vec![UsageRecord {
             timestamp: Some(2_000),
             provider: Some("anthropic".to_string()),
@@ -1000,20 +1344,59 @@ mod tests {
             total_tokens: 180,
             actual_cost_usd: None,
             estimated_cost_usd: Some(0.25),
+            metadata: UsageMetadata {
+                interval_start: Some(1_000),
+                interval_end: Some(2_000),
+                grain: UsageGrain::IntervalAggregate,
+                provider_family: Some("anthropic".to_string()),
+                provider_inference_source: Some("raw_provider".to_string()),
+                provider_inference_confidence: Some("high".to_string()),
+                model_family: Some("claude".to_string()),
+                model_variant: Some("high".to_string()),
+                task: Some("review".to_string()),
+                billing_base_url: Some("https://api.anthropic.com".to_string()),
+                billing_mode: Some("api".to_string()),
+                request_attempts: 3,
+                reported_total_tokens: Some(180),
+                component_total_tokens: Some(180),
+                token_semantics: Some("test-v1".to_string()),
+                cost_status: Some("source_estimated".to_string()),
+                cost_source: Some("fixture".to_string()),
+                cost_currency: Some("USD".to_string()),
+                pricing_version: Some("fixture-v1".to_string()),
+            },
         }];
+        conv.usage[0].enrich_metadata();
 
         let outcome = storage.upsert_conversation(&conv).unwrap();
         let stored = storage
             .get_conversation(outcome.conversation_id)
             .unwrap()
             .unwrap();
+        assert_eq!(stored.metadata, conv.metadata);
         assert_eq!(stored.usage, conv.usage);
 
         let dataset = storage.usage_dataset().unwrap();
         assert_eq!(dataset.events.len(), 1);
         assert_eq!(dataset.events[0].agent, Agent::ClaudeCode);
         assert_eq!(dataset.events[0].api_calls, 2);
+        assert_eq!(dataset.events[0].request_attempts, 3);
         assert_eq!(dataset.events[0].tokens.total, 180);
+        assert_eq!(
+            dataset.events[0].provider_family.as_deref(),
+            Some("anthropic")
+        );
+        assert_eq!(dataset.events[0].model_family.as_deref(), Some("claude"));
+        assert_eq!(dataset.events[0].model_variant.as_deref(), Some("high"));
+        assert_eq!(dataset.events[0].task.as_deref(), Some("review"));
+        assert_eq!(
+            dataset.events[0].token_semantics.as_deref(),
+            Some("test-v1")
+        );
+        assert_eq!(
+            dataset.events[0].pricing_version.as_deref(),
+            Some("fixture-v1")
+        );
         assert_eq!(dataset.indexed_conversations, 1);
         assert_eq!(dataset.indexed_messages, 2);
 
@@ -1023,6 +1406,308 @@ mod tests {
         let replaced = storage.get_usage(outcome.conversation_id).unwrap();
         assert_eq!(replaced.len(), 1);
         assert_eq!(replaced[0].total_tokens, 200);
+    }
+
+    #[test]
+    fn migration_004_preserves_raw_dimensions_and_backfills_only_known_provenance() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let connection = create_v3_database(temp_file.path());
+        connection
+            .execute(
+                "INSERT INTO conversations
+                    (agent, external_id, title, workspace, source_path, started_at, ended_at,
+                     indexed_at, source_mtime_max, source_fingerprint)
+                 VALUES ('opencode', 'legacy-session', 'Legacy', '/workspace', '/legacy/session',
+                         0, 0, 3000, 4000, 'legacy-fingerprint')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute_batch(
+                "UPDATE conversations SET workspace = '' WHERE id = 1;
+                 INSERT INTO conversations
+                    (agent, external_id, title, workspace, source_path, started_at, ended_at,
+                     indexed_at, source_mtime_max, source_fingerprint)
+                 VALUES ('opencode', '', 'No external ID', '', '/legacy/no-id',
+                         0, 0, 3000, 4000, 'legacy-no-id');
+                 INSERT INTO messages
+                    (conversation_id, idx, role, content, timestamp, model, content_hash)
+                 VALUES (1, 0, 'assistant', 'Legacy message', 0, '', 'hash');
+                 INSERT INTO usage_events
+                    (conversation_id, idx, provider, model, api_calls, input_tokens,
+                     output_tokens, cache_read_tokens, cache_write_tokens, total_tokens,
+                     actual_cost_usd, estimated_cost_usd)
+                 VALUES
+                    (1, 0, 'vertex', 'gpt-5.6-sol', 2, 10, 20, 3, 4, 37, 0, 0),
+                    (1, 1, 'anthropic', 'claude-4', 1, 1, 2, 0, 0, 3, 1.25, 2.5),
+                    (1, 2, 'openai', 'gpt-5', 1, 2, 3, 0, 0, 5, NULL, 0.75),
+                    (1, 3, 'openai', 'gpt-5', 1, 2, 3, 0, 0, 5, 1e999, NULL),
+                    (1, 4, 'openai', 'gpt-5', 1, 9223372036854775807, 1, 0, 0,
+                     9223372036854775807, NULL, NULL);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let storage = Storage::new(temp_file.path()).unwrap();
+        let conversation = storage.get_conversation(1).unwrap().unwrap();
+        assert_eq!(
+            conversation.metadata.logical_session_id.as_deref(),
+            Some("legacy-session")
+        );
+        assert_eq!(conversation.metadata.parent_external_id, None);
+        assert_eq!(
+            conversation.metadata.record_kind.as_deref(),
+            Some("top_level")
+        );
+        assert!(!conversation.metadata.is_synthetic);
+        assert_eq!(conversation.workspace, None);
+        assert_eq!(conversation.started_at, None);
+        assert_eq!(conversation.ended_at, None);
+        assert_eq!(conversation.messages[0].timestamp, None);
+        assert_eq!(conversation.messages[0].model, None);
+
+        let no_external_id = storage.get_conversation(2).unwrap().unwrap();
+        assert_eq!(no_external_id.external_id, None);
+        assert_eq!(no_external_id.workspace, None);
+        assert_eq!(no_external_id.metadata.logical_session_id, None);
+
+        let usage = conversation.usage;
+        assert_eq!(usage.len(), 5);
+        assert_eq!(usage[0].provider.as_deref(), Some("vertex"));
+        assert_eq!(usage[0].model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(usage[0].metadata.provider_family, None);
+        assert_eq!(usage[0].metadata.provider_inference_source, None);
+        assert_eq!(usage[0].metadata.provider_inference_confidence, None);
+        assert_eq!(usage[0].metadata.model_family, None);
+        assert_eq!(usage[0].metadata.request_attempts, 2);
+        assert_eq!(usage[0].metadata.reported_total_tokens, None);
+        assert_eq!(usage[0].metadata.component_total_tokens, Some(37));
+        assert_eq!(usage[0].metadata.token_semantics, None);
+        assert_eq!(usage[0].metadata.cost_status.as_deref(), Some("unknown"));
+        assert_eq!(usage[0].metadata.cost_currency, None);
+
+        assert_eq!(
+            usage[1].metadata.cost_status.as_deref(),
+            Some("reported_actual")
+        );
+        assert_eq!(usage[1].metadata.cost_currency.as_deref(), Some("USD"));
+        assert_eq!(
+            usage[2].metadata.cost_status.as_deref(),
+            Some("source_estimated")
+        );
+        assert_eq!(usage[2].metadata.cost_currency.as_deref(), Some("USD"));
+        assert_eq!(usage[3].metadata.cost_status.as_deref(), Some("unknown"));
+        assert_eq!(usage[3].metadata.cost_currency, None);
+        assert_eq!(
+            usage[4].metadata.component_total_tokens,
+            Some(i64::MAX as u64)
+        );
+
+        let latest: u32 = storage
+            .conn
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(latest, 4);
+    }
+
+    #[test]
+    fn optional_conversation_and_message_fields_round_trip_as_null() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut storage = Storage::new(temp_file.path()).unwrap();
+        let mut conversation = create_test_conversation();
+        conversation.external_id = None;
+        conversation.workspace = None;
+        conversation.started_at = None;
+        conversation.ended_at = None;
+        for message in &mut conversation.messages {
+            message.timestamp = None;
+            message.model = None;
+        }
+
+        let outcome = storage.upsert_conversation(&conversation).unwrap();
+        let stored = storage
+            .get_conversation(outcome.conversation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.external_id, None);
+        assert_eq!(stored.workspace, None);
+        assert_eq!(stored.started_at, None);
+        assert_eq!(stored.ended_at, None);
+        assert!(
+            stored
+                .messages
+                .iter()
+                .all(|message| message.timestamp.is_none())
+        );
+        assert!(
+            stored
+                .messages
+                .iter()
+                .all(|message| message.model.is_none())
+        );
+
+        conversation.external_id = Some("temporary-id".to_string());
+        conversation.workspace = Some(PathBuf::from("/temporary"));
+        conversation.started_at = Some(10);
+        conversation.ended_at = Some(20);
+        conversation.messages[0].timestamp = Some(10);
+        conversation.messages[0].model = Some("temporary-model".to_string());
+        conversation.source_fingerprint = "temporary-values".to_string();
+        storage.upsert_conversation(&conversation).unwrap();
+
+        conversation.external_id = None;
+        conversation.workspace = None;
+        conversation.started_at = None;
+        conversation.ended_at = None;
+        conversation.messages[0].timestamp = None;
+        conversation.messages[0].model = None;
+        conversation.source_fingerprint = "cleared-values".to_string();
+        storage.upsert_conversation(&conversation).unwrap();
+        let cleared = storage
+            .get_conversation(outcome.conversation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cleared.external_id, None);
+        assert_eq!(cleared.workspace, None);
+        assert_eq!(cleared.started_at, None);
+        assert_eq!(cleared.ended_at, None);
+        assert_eq!(cleared.messages[0].timestamp, None);
+        assert_eq!(cleared.messages[0].model, None);
+    }
+
+    #[test]
+    fn future_schema_versions_are_rejected_without_applying_missing_migrations() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let connection = create_v3_database(temp_file.path());
+        connection
+            .execute(
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (5, 0)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let error = match Storage::new(temp_file.path()) {
+            Ok(_) => panic!("future schema must be rejected"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("schema version 5 is newer"));
+        let read_only_error = match Storage::open_read_only(temp_file.path()) {
+            Ok(_) => panic!("future schema must be rejected read-only"),
+            Err(error) => error,
+        };
+        assert!(format!("{read_only_error:#}").contains("schema version 5 is newer"));
+
+        let connection = Connection::open_with_flags(
+            temp_file.path(),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .unwrap();
+        let v4_columns: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('conversations')
+                 WHERE name = 'logical_session_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(v4_columns, 0);
+    }
+
+    #[test]
+    fn unknown_persisted_enum_values_return_errors() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut storage = Storage::new(temp_file.path()).unwrap();
+        let mut conversation = create_test_conversation();
+        conversation.usage = vec![UsageRecord {
+            api_calls: 1,
+            total_tokens: 1,
+            ..UsageRecord::default()
+        }];
+        let outcome = storage.upsert_conversation(&conversation).unwrap();
+
+        storage
+            .conn
+            .execute(
+                "UPDATE conversations SET agent = 'future_agent' WHERE id = ?",
+                [outcome.conversation_id],
+            )
+            .unwrap();
+        let agent_error = storage
+            .get_conversation(outcome.conversation_id)
+            .unwrap_err();
+        assert!(format!("{agent_error:#}").contains("Unknown persisted agent"));
+        storage
+            .conn
+            .execute(
+                "UPDATE conversations SET agent = 'claude_code' WHERE id = ?",
+                [outcome.conversation_id],
+            )
+            .unwrap();
+
+        storage
+            .conn
+            .execute(
+                "UPDATE messages SET role = 'future_role' WHERE conversation_id = ?",
+                [outcome.conversation_id],
+            )
+            .unwrap();
+        let role_error = storage.get_messages(outcome.conversation_id).unwrap_err();
+        assert!(format!("{role_error:#}").contains("Unknown persisted message role"));
+        storage
+            .conn
+            .execute(
+                "UPDATE messages SET role = 'user' WHERE conversation_id = ?",
+                [outcome.conversation_id],
+            )
+            .unwrap();
+
+        storage
+            .conn
+            .execute(
+                "UPDATE usage_events SET usage_grain = 'future_grain'
+                 WHERE conversation_id = ?",
+                [outcome.conversation_id],
+            )
+            .unwrap();
+        let grain_error = storage.get_usage(outcome.conversation_id).unwrap_err();
+        assert!(format!("{grain_error:#}").contains("Unknown persisted usage grain"));
+        let dataset_error = storage.usage_dataset().unwrap_err();
+        assert!(format!("{dataset_error:#}").contains("Unknown persisted usage grain"));
+    }
+
+    #[test]
+    fn concurrent_openers_serialize_and_recheck_migrations() {
+        let temp_file = NamedTempFile::new().unwrap();
+        drop(create_v3_database(temp_file.path()));
+        let path = temp_file.path().to_path_buf();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    Storage::new(&path).map(drop)
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+
+        let storage = Storage::new(&path).unwrap();
+        let v4_markers: i64 = storage
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 4",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(v4_markers, 1);
     }
 
     #[test]
