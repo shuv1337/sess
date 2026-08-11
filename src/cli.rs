@@ -25,6 +25,14 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
 
+    /// Ignore project scope and operate on all sessions.
+    ///
+    /// By default, running sess inside a git/jj repository scopes search,
+    /// stats, usage, and the TUI to sessions whose workspace is in that
+    /// repository (across all harnesses).
+    #[arg(short = 'g', long = "all", visible_alias = "global", global = true)]
+    pub all: bool,
+
     /// Skip auto-indexing on startup
     #[arg(long, global = true)]
     pub no_auto_index: bool,
@@ -324,6 +332,10 @@ pub struct SearchHitOutput {
 
 #[derive(Serialize)]
 pub struct StatsOutput {
+    /// Project scope description when stats are directory-scoped; absent for
+    /// the global view.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
     pub agents: std::collections::HashMap<String, AgentStatsOutput>,
     pub total_conversations: usize,
     pub total_messages: usize,
@@ -395,6 +407,7 @@ impl StatsOutput {
             .collect();
 
         Self {
+            scope: None,
             agents,
             total_conversations: stats.total_conversations,
             total_messages: stats.total_messages,

@@ -8,6 +8,7 @@ mod cli;
 mod connectors;
 mod indexer;
 mod model;
+mod scope;
 mod search;
 mod storage;
 mod tui;
@@ -31,12 +32,18 @@ fn maybe_auto_refresh(flags: &GlobalFlags, indexer: &mut Indexer) -> Result<()> 
     if indexer.needs_initial_index()? {
         eprintln!("No existing index found. Running initial index...");
         indexer.full_index()?;
+        // A fresh index only contains documents written by this binary.
+        indexer.mark_tantivy_docs_current()?;
         return Ok(());
     }
     if indexer.needs_connector_rescan()? {
         eprintln!("Connector data model changed. Refreshing source records...");
         indexer.incremental_index()?;
         return Ok(());
+    }
+    if indexer.needs_tantivy_doc_upgrade()? {
+        eprintln!("Search index document format changed. Rebuilding from local data (one-time)...");
+        indexer.rebuild()?;
     }
     if flags.no_refresh {
         return Ok(());
@@ -88,6 +95,10 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     let flags = GlobalFlags::from_cli(&cli);
 
+    // Project scope: default to the repository containing the cwd; global
+    // when outside a repo or with `-g/--all`.
+    let project_scope = scope::resolve_current(cli.all);
+
     // Determine data directory
     let data_dir = cli
         .data_dir
@@ -121,7 +132,7 @@ fn run() -> Result<()> {
             let storage = indexer.storage();
 
             // Run TUI
-            tui::run_app(storage, &tantivy, refresh_cfg)?;
+            tui::run_app(storage, &tantivy, refresh_cfg, project_scope)?;
         }
         Some(Commands::Search {
             query,
@@ -140,11 +151,19 @@ fn run() -> Result<()> {
 
             maybe_auto_refresh(&flags, &mut indexer)?;
 
+            // Explicit --workspace overrides implicit project scope.
+            let scope_roots = if workspace.is_none() {
+                project_scope.as_ref().map(|s| s.roots.clone())
+            } else {
+                None
+            };
+
             // Build search query
             let mut search_query = search::SearchQuery {
                 text: query.clone(),
                 agent_filter: agent.as_ref().and_then(|a| a.parse().ok()),
                 workspace_filter: workspace,
+                scope_roots: scope_roots.clone(),
                 since: since.and_then(|s| cli::parse_date(&s).ok()),
                 until: until.and_then(|u| cli::parse_until_date(&u).ok()),
                 limit,
@@ -163,7 +182,15 @@ fn run() -> Result<()> {
                     let embeddings = indexer.storage().get_all_embeddings()?;
 
                     if !embeddings.is_empty() {
-                        let semantic_results = semantic_idx.search(&query, &embeddings, 50)?;
+                        let mut semantic_results = semantic_idx.search(&query, &embeddings, 50)?;
+
+                        // Semantic hits are unscoped conversation ids; drop
+                        // out-of-scope ones before fusion so they cannot leak
+                        // back into a project-scoped result set.
+                        if let Some(ref roots) = scope_roots {
+                            let allowed = indexer.storage().scoped_conversation_ids(roots)?;
+                            semantic_results.retain(|(id, _)| allowed.contains(id));
+                        }
 
                         // Merge using RRF
                         keyword_results.hits = search::query::rrf_fusion(
@@ -182,6 +209,11 @@ fn run() -> Result<()> {
             } else {
                 // Human-friendly output
                 println!("Query: {}", query);
+                if let Some(ref scope) = project_scope
+                    && scope_roots.is_some()
+                {
+                    println!("Scope: {} (use -g/--all for everything)", scope.describe());
+                }
                 println!(
                     "Found {} results in {}ms",
                     keyword_results.total_hits, keyword_results.query_time_ms
@@ -275,15 +307,22 @@ fn run() -> Result<()> {
         Some(Commands::Stats { json }) => {
             let _ = &flags;
             let indexer = Indexer::new(&data_dir, false)?;
-            let stats = indexer.storage().stats()?;
+            let stats = indexer
+                .storage()
+                .stats_scoped(project_scope.as_ref().map(|s| s.roots.as_slice()))?;
 
             if json {
-                let output = StatsOutput::from_storage_stats(stats);
+                let mut output = StatsOutput::from_storage_stats(stats);
+                output.scope = project_scope.as_ref().map(|s| s.describe());
                 println!("{}", serde_json::to_string_pretty(&output)?);
             } else {
                 println!("Storage Statistics");
                 println!("==================");
                 println!();
+                if let Some(ref scope) = project_scope {
+                    println!("Scope: {} (use -g/--all for everything)", scope.describe());
+                    println!();
+                }
                 println!("Total Conversations: {}", stats.total_conversations);
                 println!("Total Messages: {}", stats.total_messages);
                 println!("Database Size: {} bytes", stats.db_size_bytes);
@@ -338,11 +377,17 @@ fn run() -> Result<()> {
             {
                 anyhow::bail!("--since must not be later than --until");
             }
+            let scope_roots = if workspace.is_none() {
+                project_scope.as_ref().map(|s| s.roots.clone())
+            } else {
+                None
+            };
             let filters = usage::UsageFilters {
                 agents,
                 providers: provider,
                 models: model,
                 workspace,
+                scope_roots,
                 variants: variant,
                 tasks: task,
                 exclude_synthetic,

@@ -3,7 +3,8 @@
 > Search coding-agent transcripts from one local index.
 
 `sess` is a local-first Rust CLI and terminal UI for people who work across
-Claude Code, Codex CLI, Hermes Agent, OpenCode, and Pi Agent sessions. It normalizes local
+Claude Code, Codex CLI, Factory Droid, Hermes Agent, Oh My Pi, OpenCode, Pi Agent,
+Prime Agent, and shuvlr sessions. It normalizes local
 transcripts into SQLite, derives a Tantivy keyword index, and can add optional
 FastEmbed-powered semantic ranking.
 
@@ -47,6 +48,16 @@ Use the command help for the complete, generated interface:
 `search` accepts agent, workspace, date, pagination, and ranking filters. Use
 `--semantic` on a search to combine keyword results with embeddings when they
 are available. `view` accepts either a conversation ID or its source path.
+
+### Project scope
+
+Running `sess` inside a git or jj repository scopes `search`, `stats`, `usage`,
+and the TUI to sessions whose recorded workspace lives in that repository —
+across every harness. Worktrees of the same repository count as one project,
+and sessions with no recorded workspace stay visible. Outside a repository the
+view is global. Pass `-g`/`--all` to ignore project scope, or press `Ctrl+G`
+in the TUI to toggle it. An explicit `--workspace` filter always overrides the
+implicit scope.
 
 ```bash
 ./target/release/sess search --help
@@ -141,9 +152,13 @@ intentionally mutually exclusive.
 |---|---|---|
 | Claude Code | `~/.claude/projects` | — |
 | Codex CLI | `~/.codex/sessions`, `~/.codex/archived_sessions` | `CODEX_HOME` |
+| Factory Droid | `~/.factory/sessions` | — |
 | Hermes Agent | `~/.hermes/state.db`, `~/.hermes/profiles/*/state.db` | `HERMES_HOME` |
+| Oh My Pi | `~/.omp/agent` | — |
 | OpenCode / shuvcode | `~/.local/share/opencode/storage`, `~/.local/share/opencode/*.db` | `OPENCODE_STORAGE_ROOT`, `OPENCODE_DB` |
 | Pi Agent and compatible layouts | `~/.pi/agent`, `~/.shuvpi/agent`, `~/.shuvhelm/pi-agent`, `~/.shuvhelm/mate`, `~/.local/share/shiv`, `~/.openclaw` | `SESS_PI_AGENT_DIRS`, `PI_CODING_AGENT_DIR`, `SHIV_AGENT_DIR`, `OPENCLAW_HOME` |
+| Prime Agent | `~/.prime/agent` | — |
+| shuvlr | `~/.shuvlr` | — |
 
 `SESS_PI_AGENT_DIRS` accepts a platform path list (`:`-separated on Unix) for
 additional Pi-compatible agent roots. The legacy single-root
@@ -151,8 +166,13 @@ additional Pi-compatible agent roots. The legacy single-root
 the personal Pi root, Codex external-runtime Pi root, or the standard shuvhelm
 fleet and mate roots.
 
+Factory Droid, Oh My Pi, Prime Agent, and shuvlr use the Pi-family JSONL parser
+but retain distinct agent identities in search and usage output. Oh My Pi files
+whose session IDs already exist in the standard Pi roots are skipped to avoid
+indexing copied sessions twice.
+
 OpenCode discovery reads both legacy file storage and every top-level SQLite
-store, including late-v1 and v2/shuvcode layouts, and merges duplicate sessions
+store, including `session`, `session_v2`, late-v1, and v2/shuvcode layouts, and merges duplicate sessions
 deterministically. Rows whose parent session cannot be found are excluded by
 default; set `SESS_OPENCODE_RECOVER_ORPHANS=1` for a deliberate recovery scan
 that indexes those rows as synthetic orphan records instead of silently mixing

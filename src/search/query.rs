@@ -62,6 +62,10 @@ pub struct SearchQuery {
     pub text: String,
     pub agent_filter: Option<Agent>,
     pub workspace_filter: Option<String>,
+    /// Project-scope roots: match conversations whose workspace equals a root
+    /// or lives underneath one. Conversations with no recorded workspace also
+    /// match (indexed as an empty workspace term).
+    pub scope_roots: Option<Vec<String>>,
     pub since: Option<i64>,
     pub until: Option<i64>,
     pub limit: usize,
@@ -76,6 +80,7 @@ impl Default for SearchQuery {
             text: String::new(),
             agent_filter: None,
             workspace_filter: None,
+            scope_roots: None,
             since: None,
             until: None,
             limit: 20,
@@ -139,11 +144,17 @@ pub fn execute(query: &SearchQuery, index: &TantivyIndex) -> Result<SearchResult
         subqueries.push((Occur::Must, Box::new(term_query)));
     }
 
-    // Workspace filter
+    // Workspace filter (exact)
     if let Some(ref workspace) = query.workspace_filter {
         let term = Term::from_field_text(field_workspace, workspace);
         let term_query = TermQuery::new(term, IndexRecordOption::Basic);
         subqueries.push((Occur::Must, Box::new(term_query)));
+    }
+
+    // Project scope filter: workspace equals a root, lives under a root, or
+    // is unknown (indexed as the empty string).
+    if let Some(ref roots) = query.scope_roots {
+        subqueries.push((Occur::Must, scope_filter_query(field_workspace, roots)));
     }
 
     // Time range filter
@@ -227,9 +238,13 @@ pub fn execute(query: &SearchQuery, index: &TantivyIndex) -> Result<SearchResult
         let agent = match agent_slug.as_str() {
             "claude_code" => Agent::ClaudeCode,
             "codex" => Agent::Codex,
+            "factory" => Agent::Factory,
             "hermes" => Agent::Hermes,
+            "oh_my_pi" => Agent::OhMyPi,
             "opencode" => Agent::OpenCode,
             "pi_agent" => Agent::PiAgent,
+            "prime_agent" => Agent::PrimeAgent,
+            "shuvlr" => Agent::Shuvlr,
             _ => Agent::ClaudeCode,
         };
 
@@ -237,9 +252,12 @@ pub fn execute(query: &SearchQuery, index: &TantivyIndex) -> Result<SearchResult
             .get_first(field_title)
             .and_then(|v| v.as_str().map(|s| s.to_string()));
 
+        // Missing workspaces are indexed as "" so scoped queries can match
+        // them; normalize back to None for consumers.
         let workspace = doc
             .get_first(field_workspace)
-            .and_then(|v| v.as_str().map(|s| s.to_string()));
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .filter(|s| !s.is_empty());
 
         let source_path = doc
             .get_first(field_source_path)
@@ -293,6 +311,54 @@ pub fn execute(query: &SearchQuery, index: &TantivyIndex) -> Result<SearchResult
         total_hits,
         query_time_ms,
     })
+}
+
+/// Build the project-scope filter: OR over every root's exact term and
+/// subtree prefix, plus the empty-workspace term for unknown workspaces.
+fn scope_filter_query(
+    field_workspace: tantivy::schema::Field,
+    roots: &[String],
+) -> Box<dyn tantivy::query::Query> {
+    let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = Vec::new();
+
+    // Unknown workspace: indexed as "".
+    clauses.push((
+        Occur::Should,
+        Box::new(TermQuery::new(
+            Term::from_field_text(field_workspace, ""),
+            IndexRecordOption::Basic,
+        )),
+    ));
+
+    for root in roots {
+        let root = root.trim_end_matches('/');
+        if root.is_empty() {
+            continue;
+        }
+        // Exact match on the root itself.
+        clauses.push((
+            Occur::Should,
+            Box::new(TermQuery::new(
+                Term::from_field_text(field_workspace, root),
+                IndexRecordOption::Basic,
+            )),
+        ));
+        // Subtree prefix: ["<root>/", "<root>/\u{10FFFF}") — component
+        // boundary is enforced by the trailing slash.
+        let lower = Term::from_field_text(field_workspace, &format!("{root}/"));
+        let upper = Term::from_field_text(field_workspace, &format!("{root}/\u{10FFFF}"));
+        clauses.push((
+            Occur::Should,
+            Box::new(RangeQuery::new_term_bounds(
+                "workspace".to_string(),
+                tantivy::schema::Type::Str,
+                &Bound::Included(lower),
+                &Bound::Excluded(upper),
+            )),
+        ));
+    }
+
+    Box::new(BooleanQuery::new(clauses))
 }
 
 fn parse_text_query(

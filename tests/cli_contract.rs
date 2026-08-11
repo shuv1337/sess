@@ -38,7 +38,9 @@ fn make_conversation(
     }];
 
     let (provider, model, input, output, estimate) = match agent {
-        Agent::PiAgent => (Some("anthropic"), "claude-sonnet", 100, 50, Some(0.01)),
+        Agent::PiAgent | Agent::Factory | Agent::OhMyPi | Agent::PrimeAgent | Agent::Shuvlr => {
+            (Some("anthropic"), "claude-sonnet", 100, 50, Some(0.01))
+        }
         Agent::Codex => (Some("openai"), "gpt-5", 200, 100, None),
         Agent::ClaudeCode => (None, "claude-opus", 80, 40, None),
         Agent::Hermes => (Some("openrouter"), "hermes-model", 50, 25, Some(0.02)),
@@ -163,9 +165,12 @@ fn seed_data() -> SeededData {
 
 fn run_search(data_dir: &Path, args: &[&str]) -> Value {
     let mut cmd = Command::cargo_bin("sess").expect("sess binary");
+    // These tests assert the global contract; `--all` pins that even when the
+    // test process happens to run inside a repository (project scoping).
     cmd.arg("--data-dir")
         .arg(data_dir)
         .arg("--no-auto-index")
+        .arg("--all")
         .arg("search");
 
     for arg in args {
@@ -182,6 +187,7 @@ fn run_usage_json(data_dir: &Path, args: &[&str]) -> Value {
     cmd.arg("--data-dir")
         .arg(data_dir)
         .arg("--no-auto-index")
+        .arg("--all")
         .arg("usage");
     for arg in args {
         cmd.arg(arg);
@@ -423,6 +429,7 @@ fn cli_usage_accepts_harness_alias_and_writes_standalone_html() {
     cmd.arg("--data-dir")
         .arg(&seeded.data_dir)
         .arg("--no-auto-index")
+        .arg("--all")
         .arg("usage")
         .arg("--html")
         .arg(&report_path)

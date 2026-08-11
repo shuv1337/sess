@@ -5,7 +5,8 @@
 - Rust 2024 CLI/TUI (`sess`) for indexing and searching coding-agent transcripts.
 - Connectors in `src/connectors/` normalize source records into `Conversation`/`Message`.
 - SQLite is the source of truth; Tantivy is a derived search index. `src/indexer.rs` must keep both consistent.
-- Supported sources: Claude Code, Codex CLI, OpenCode, and Pi Agent-compatible layouts.
+- Supported sources: Claude Code, Codex CLI, Factory Droid, Hermes, Oh My Pi,
+  OpenCode, Pi Agent-compatible layouts, Prime Agent, and shuvlr.
 
 ## Connector conventions
 
@@ -28,6 +29,7 @@ The repository currently emits pre-existing compiler and Clippy warnings; do not
 
 - Build: `cargo build --release`
 - ONNX Runtime is loaded dynamically through FastEmbed's `ort-load-dynamic` feature. On Linux it resolves `libonnxruntime.so` at semantic initialization, avoiding startup-time ELF symbol-version coupling to a particular distro package release.
+- `sess` is project-scoped by default: inside a git/jj repo, `search`, `stats`, `usage`, and the TUI only cover sessions whose workspace is in that repo (worktrees unify; missing workspaces stay visible). Use `-g`/`--all` for the global view; explicit `--workspace` overrides scope.
 - Full re-index: `sess --no-semantic index --full`
 - Inspect detection/stats: `sess agents --json`; `sess stats --json`
 - Default index data is under the platform local-data directory, commonly `~/.local/share/sess` on Linux.

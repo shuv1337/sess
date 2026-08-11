@@ -9,9 +9,13 @@ use serde::{Deserialize, Serialize};
 pub enum Agent {
     ClaudeCode,
     Codex,
+    Factory,
     Hermes,
+    OhMyPi,
     OpenCode,
     PiAgent,
+    PrimeAgent,
+    Shuvlr,
 }
 
 impl Agent {
@@ -19,9 +23,13 @@ impl Agent {
         match self {
             Agent::ClaudeCode => "claude_code",
             Agent::Codex => "codex",
+            Agent::Factory => "factory",
             Agent::Hermes => "hermes",
+            Agent::OhMyPi => "oh_my_pi",
             Agent::OpenCode => "opencode",
             Agent::PiAgent => "pi_agent",
+            Agent::PrimeAgent => "prime_agent",
+            Agent::Shuvlr => "shuvlr",
         }
     }
 
@@ -29,9 +37,13 @@ impl Agent {
         match self {
             Agent::ClaudeCode => "Claude Code",
             Agent::Codex => "Codex",
+            Agent::Factory => "Factory Droid",
             Agent::Hermes => "Hermes Agent",
+            Agent::OhMyPi => "Oh My Pi",
             Agent::OpenCode => "OpenCode",
             Agent::PiAgent => "Pi Agent",
+            Agent::PrimeAgent => "Prime Agent",
+            Agent::Shuvlr => "shuvlr",
         }
     }
 
@@ -39,9 +51,13 @@ impl Agent {
         match self {
             Agent::ClaudeCode => "●",
             Agent::Codex => "◆",
+            Agent::Factory => "⬟",
             Agent::Hermes => "♦",
+            Agent::OhMyPi => "◭",
             Agent::OpenCode => "■",
             Agent::PiAgent => "▲",
+            Agent::PrimeAgent => "◇",
+            Agent::Shuvlr => "▰",
         }
     }
 
@@ -49,9 +65,13 @@ impl Agent {
         match self {
             Agent::ClaudeCode => (147, 112, 219), // Purple
             Agent::Codex => (50, 205, 50),        // Green
+            Agent::Factory => (245, 158, 11),     // Amber
             Agent::Hermes => (0, 206, 209),       // Dark turquoise
+            Agent::OhMyPi => (251, 113, 133),     // Rose
             Agent::OpenCode => (30, 144, 255),    // Blue
             Agent::PiAgent => (255, 165, 0),      // Orange
+            Agent::PrimeAgent => (168, 85, 247),  // Violet
+            Agent::Shuvlr => (20, 184, 166),      // Teal
         }
     }
 }
@@ -69,9 +89,13 @@ impl std::str::FromStr for Agent {
         match s.to_lowercase().as_str() {
             "claude_code" | "claude" | "claudecode" => Ok(Agent::ClaudeCode),
             "codex" => Ok(Agent::Codex),
+            "factory" | "factory_droid" | "droid" => Ok(Agent::Factory),
             "hermes" | "hermes_agent" | "hermesagent" => Ok(Agent::Hermes),
+            "oh_my_pi" | "ohmypi" | "omp" => Ok(Agent::OhMyPi),
             "opencode" | "open_code" => Ok(Agent::OpenCode),
             "pi_agent" | "piagent" | "pi" => Ok(Agent::PiAgent),
+            "prime_agent" | "primeagent" | "prime" => Ok(Agent::PrimeAgent),
+            "shuvlr" => Ok(Agent::Shuvlr),
             _ => anyhow::bail!("Unknown agent: {}", s),
         }
     }
@@ -676,18 +700,26 @@ mod tests {
     fn test_agent_slug() {
         assert_eq!(Agent::ClaudeCode.slug(), "claude_code");
         assert_eq!(Agent::Codex.slug(), "codex");
+        assert_eq!(Agent::Factory.slug(), "factory");
         assert_eq!(Agent::Hermes.slug(), "hermes");
+        assert_eq!(Agent::OhMyPi.slug(), "oh_my_pi");
         assert_eq!(Agent::OpenCode.slug(), "opencode");
         assert_eq!(Agent::PiAgent.slug(), "pi_agent");
+        assert_eq!(Agent::PrimeAgent.slug(), "prime_agent");
+        assert_eq!(Agent::Shuvlr.slug(), "shuvlr");
     }
 
     #[test]
     fn test_agent_display_name() {
         assert_eq!(Agent::ClaudeCode.display_name(), "Claude Code");
         assert_eq!(Agent::Codex.display_name(), "Codex");
+        assert_eq!(Agent::Factory.display_name(), "Factory Droid");
         assert_eq!(Agent::Hermes.display_name(), "Hermes Agent");
+        assert_eq!(Agent::OhMyPi.display_name(), "Oh My Pi");
         assert_eq!(Agent::OpenCode.display_name(), "OpenCode");
         assert_eq!(Agent::PiAgent.display_name(), "Pi Agent");
+        assert_eq!(Agent::PrimeAgent.display_name(), "Prime Agent");
+        assert_eq!(Agent::Shuvlr.display_name(), "shuvlr");
     }
 
     #[test]
@@ -702,13 +734,17 @@ mod tests {
         assert_eq!("claude".parse::<Agent>().unwrap(), Agent::ClaudeCode);
         assert_eq!("claudecode".parse::<Agent>().unwrap(), Agent::ClaudeCode);
         assert_eq!("codex".parse::<Agent>().unwrap(), Agent::Codex);
+        assert_eq!("droid".parse::<Agent>().unwrap(), Agent::Factory);
         assert_eq!("hermes".parse::<Agent>().unwrap(), Agent::Hermes);
         assert_eq!("hermes_agent".parse::<Agent>().unwrap(), Agent::Hermes);
+        assert_eq!("omp".parse::<Agent>().unwrap(), Agent::OhMyPi);
         assert_eq!("opencode".parse::<Agent>().unwrap(), Agent::OpenCode);
         assert_eq!("open_code".parse::<Agent>().unwrap(), Agent::OpenCode);
         assert_eq!("pi_agent".parse::<Agent>().unwrap(), Agent::PiAgent);
         assert_eq!("piagent".parse::<Agent>().unwrap(), Agent::PiAgent);
         assert_eq!("pi".parse::<Agent>().unwrap(), Agent::PiAgent);
+        assert_eq!("prime".parse::<Agent>().unwrap(), Agent::PrimeAgent);
+        assert_eq!("shuvlr".parse::<Agent>().unwrap(), Agent::Shuvlr);
         // Case insensitive
         assert_eq!("CLAUDE".parse::<Agent>().unwrap(), Agent::ClaudeCode);
         assert_eq!("Codex".parse::<Agent>().unwrap(), Agent::Codex);
@@ -722,14 +758,18 @@ mod tests {
         let icons: Vec<&str> = [
             Agent::ClaudeCode,
             Agent::Codex,
+            Agent::Factory,
             Agent::Hermes,
+            Agent::OhMyPi,
             Agent::OpenCode,
             Agent::PiAgent,
+            Agent::PrimeAgent,
+            Agent::Shuvlr,
         ]
         .iter()
         .map(|a| a.icon())
         .collect();
-        assert_eq!(icons.len(), 5);
+        assert_eq!(icons.len(), 9);
         for i in 0..icons.len() {
             for j in (i + 1)..icons.len() {
                 assert_ne!(icons[i], icons[j]);
@@ -740,9 +780,13 @@ mod tests {
         let colors: Vec<(u8, u8, u8)> = [
             Agent::ClaudeCode,
             Agent::Codex,
+            Agent::Factory,
             Agent::Hermes,
+            Agent::OhMyPi,
             Agent::OpenCode,
             Agent::PiAgent,
+            Agent::PrimeAgent,
+            Agent::Shuvlr,
         ]
         .iter()
         .map(Agent::color_code)

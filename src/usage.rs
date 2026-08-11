@@ -156,6 +156,10 @@ pub struct UsageFilters {
     pub providers: Vec<String>,
     pub models: Vec<String>,
     pub workspace: Option<String>,
+    /// Project-scope roots: keep events whose workspace equals a root, lives
+    /// underneath one, or is unrecorded. Ignored when `workspace` is set.
+    #[serde(default)]
+    pub scope_roots: Option<Vec<String>>,
     pub variants: Vec<String>,
     pub tasks: Vec<String>,
     pub exclude_synthetic: bool,
@@ -1081,7 +1085,26 @@ fn event_matches_dimensions(event: &UsageEventRow, filters: &UsageFilters) -> bo
     {
         return false;
     }
+    if filters.workspace.is_none()
+        && let Some(roots) = filters.scope_roots.as_deref()
+        && !workspace_in_scope(event.workspace.as_deref(), roots)
+    {
+        return false;
+    }
     true
+}
+
+/// Project-scope membership: unrecorded workspaces stay visible; recorded
+/// workspaces must equal a root or live underneath one.
+fn workspace_in_scope(workspace: Option<&str>, roots: &[String]) -> bool {
+    let Some(ws) = workspace else { return true };
+    let ws = ws.trim_end_matches('/');
+    if ws.is_empty() {
+        return true;
+    }
+    roots
+        .iter()
+        .any(|root| crate::scope::path_is_within(ws, root))
 }
 
 fn event_matches_time(event: &DeduplicatedEvent<'_>, filters: &UsageFilters) -> bool {
@@ -2153,9 +2176,13 @@ fn harness_icon(key: &str) -> &'static str {
     match key {
         "claude_code" => "●",
         "codex" => "◆",
+        "factory" => "⬟",
         "hermes" => "♦",
+        "oh_my_pi" => "◭",
         "opencode" => "■",
         "pi_agent" => "▲",
+        "prime_agent" => "◇",
+        "shuvlr" => "▰",
         _ => "",
     }
 }
@@ -2880,6 +2907,10 @@ fn format_filters(filters: &UsageFilters) -> String {
     }
     if let Some(workspace) = filters.workspace.as_deref() {
         dimensions.push(format!("Workspace {workspace}"));
+    } else if let Some(roots) = filters.scope_roots.as_deref()
+        && let Some(primary) = roots.first()
+    {
+        dimensions.push(format!("Project {primary}"));
     }
     if filters.exclude_synthetic {
         dimensions.push("Organic only".to_string());

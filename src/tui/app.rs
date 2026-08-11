@@ -17,6 +17,7 @@ use ratatui::{
 };
 
 use crate::model::{Agent, Conversation};
+use crate::scope::ProjectScope;
 use crate::search::{RankingMode, SearchQuery, SearchResult};
 use crate::storage::Storage;
 use crate::tui::refresh::{RefreshConfig, RefreshEvent, RefreshThread};
@@ -84,6 +85,10 @@ pub struct App {
     pub show_help: bool,
     pub indexing: bool,
     pub last_index_status: Option<String>,
+    /// Project scope resolved from the launch directory, if any.
+    pub scope: Option<ProjectScope>,
+    /// Whether the project scope is currently applied (Ctrl+G toggles).
+    pub scope_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,7 +100,13 @@ pub enum Focus {
 
 impl App {
     pub fn new() -> Self {
+        Self::with_scope(None)
+    }
+
+    pub fn with_scope(scope: Option<ProjectScope>) -> Self {
         Self {
+            scope_enabled: scope.is_some(),
+            scope,
             query: String::new(),
             cursor_pos: 0,
             results: Vec::new(),
@@ -157,6 +168,11 @@ impl App {
             text: self.query.clone(),
             agent_filter: self.agent_filter,
             workspace_filter: None,
+            scope_roots: if self.scope_enabled {
+                self.scope.as_ref().map(|s| s.roots.clone())
+            } else {
+                None
+            },
             since: self.time_filter.to_since_timestamp(),
             until: None,
             limit: 50,
@@ -172,6 +188,13 @@ impl App {
             KeyCode::Char('q') if key.modifiers.is_empty() => return false,
             KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => return false,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return false,
+            KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.scope.is_some() {
+                    self.scope_enabled = !self.scope_enabled;
+                    self.trigger_search();
+                }
+                return true;
+            }
             KeyCode::Char('?') => {
                 self.show_help = !self.show_help;
                 return true;
@@ -340,10 +363,14 @@ impl App {
         self.agent_filter = match self.agent_filter {
             None => Some(Agent::ClaudeCode),
             Some(Agent::ClaudeCode) => Some(Agent::Codex),
-            Some(Agent::Codex) => Some(Agent::Hermes),
-            Some(Agent::Hermes) => Some(Agent::OpenCode),
+            Some(Agent::Codex) => Some(Agent::Factory),
+            Some(Agent::Factory) => Some(Agent::Hermes),
+            Some(Agent::Hermes) => Some(Agent::OhMyPi),
+            Some(Agent::OhMyPi) => Some(Agent::OpenCode),
             Some(Agent::OpenCode) => Some(Agent::PiAgent),
-            Some(Agent::PiAgent) => None,
+            Some(Agent::PiAgent) => Some(Agent::PrimeAgent),
+            Some(Agent::PrimeAgent) => Some(Agent::Shuvlr),
+            Some(Agent::Shuvlr) => None,
         };
         self.trigger_search();
     }
@@ -441,6 +468,7 @@ pub fn run_app(
     storage: &Storage,
     tantivy: &Arc<crate::search::index::TantivyIndex>,
     refresh_cfg: RefreshConfig,
+    scope: Option<ProjectScope>,
 ) -> Result<()> {
     // Setup terminal
     enable_raw_mode()?;
@@ -456,7 +484,7 @@ pub fn run_app(
     let refresh = RefreshThread::spawn(refresh_cfg);
 
     // Create app
-    let mut app = App::new();
+    let mut app = App::with_scope(scope);
 
     // Initial search
     search_thread.search(

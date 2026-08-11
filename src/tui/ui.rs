@@ -83,10 +83,15 @@ fn draw_search_bar(f: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(C_BORDER_INACTIVE)
     };
 
+    let scope_part = match (&app.scope, app.scope_enabled) {
+        (Some(scope), true) => format!(" │ ⌂ {}", scope.short_label()),
+        (Some(_), false) => " │ ⌂ all".to_string(),
+        (None, _) => String::new(),
+    };
     let title = if app.indexing {
-        " sess │ indexing… ".to_string()
+        format!(" sess{scope_part} │ indexing… ")
     } else {
-        " sess ".to_string()
+        format!(" sess{scope_part} ")
     };
 
     let block = Block::default()
@@ -575,6 +580,10 @@ fn draw_help(f: &mut Frame, _app: &App) {
         Span::styled("  F12        ", Style::default().fg(C_ACCENT)),
         Span::raw("Cycle ranking mode"),
     ]));
+    help_lines.push(Line::from(vec![
+        Span::styled("  Ctrl+G     ", Style::default().fg(C_ACCENT)),
+        Span::raw("Toggle project scope (this repo ↔ all sessions)"),
+    ]));
     help_lines.push(Line::from(""));
 
     help_lines.push(Line::from(vec![Span::styled(
@@ -613,7 +622,9 @@ fn draw_help(f: &mut Frame, _app: &App) {
     )]));
     help_lines.push(Line::from(vec![
         Span::styled("  Agent:  ", Style::default().fg(C_META)),
-        Span::raw("Claude Code ●  Codex ◆  Hermes ♦  OpenCode ■  Pi Agent ▲"),
+        Span::raw(
+            "Claude ●  Codex ◆  Factory ⬟  Hermes ♦  OMP ◭  OpenCode ■  Pi ▲  Prime ◇  shuvlr ▰",
+        ),
     ]));
     help_lines.push(Line::from(vec![
         Span::styled("  Rank:   ", Style::default().fg(C_META)),

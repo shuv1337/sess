@@ -30,6 +30,14 @@ pub struct IndexStats {
     pub time_ms: u64,
 }
 
+/// Version of the Tantivy document format written by this binary.
+///
+/// Bump when the per-document field layout changes in a way that requires a
+/// rebuild of derived documents (e.g. v2: missing workspaces are indexed as
+/// an empty `workspace` term so project-scoped filters can match them).
+const TANTIVY_DOC_VERSION: &str = "2";
+const TANTIVY_DOC_VERSION_KEY: &str = "tantivy_doc_version";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ConnectorScanPlan {
     since_ts: Option<i64>,
@@ -340,6 +348,7 @@ impl Indexer {
 
         // Rebuild Tantivy
         self.tantivy.rebuild_from_sqlite(&full_conversations)?;
+        self.mark_tantivy_docs_current()?;
 
         // Rebuild embeddings
         if self.semantic.is_some() {
@@ -434,6 +443,22 @@ impl Indexer {
     pub fn needs_initial_index(&self) -> Result<bool> {
         let stats = self.storage.stats()?;
         Ok(stats.total_conversations == 0)
+    }
+
+    /// Whether Tantivy documents were written by an older doc format and need
+    /// a one-time rebuild from SQLite (no source rescan).
+    pub fn needs_tantivy_doc_upgrade(&self) -> Result<bool> {
+        let recorded = self.storage.get_meta(TANTIVY_DOC_VERSION_KEY)?;
+        Ok(recorded.as_deref() != Some(TANTIVY_DOC_VERSION))
+    }
+
+    /// Record that every Tantivy document now uses the current doc format.
+    ///
+    /// Call only after a write path that rewrote all documents (rebuild, or
+    /// an initial index into an empty database).
+    pub fn mark_tantivy_docs_current(&self) -> Result<()> {
+        self.storage
+            .set_meta(TANTIVY_DOC_VERSION_KEY, TANTIVY_DOC_VERSION)
     }
 
     /// Age of the last completed scan, if any.

@@ -144,9 +144,14 @@ impl TantivyIndex {
 
         doc.add_text(self.field_agent, conv.agent.slug());
 
-        if let Some(ref workspace) = conv.workspace {
-            doc.add_text(self.field_workspace, workspace.to_string_lossy());
-        }
+        // Always index the workspace field ("" when unknown) so scoped
+        // queries can positively match missing-workspace conversations.
+        let workspace = conv
+            .workspace
+            .as_ref()
+            .map(|w| w.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        doc.add_text(self.field_workspace, &workspace);
 
         doc.add_text(self.field_source_path, conv.source_path.to_string_lossy());
 
@@ -243,9 +248,7 @@ impl TantivyIndex {
 
             doc.add_text(self.field_agent, row.agent.slug());
 
-            if let Some(ref workspace) = row.workspace {
-                doc.add_text(self.field_workspace, workspace);
-            }
+            doc.add_text(self.field_workspace, row.workspace.as_deref().unwrap_or(""));
 
             doc.add_text(self.field_source_path, &row.source_path);
 
@@ -253,8 +256,14 @@ impl TantivyIndex {
             doc.add_text(self.field_title, &title);
             doc.add_text(self.field_content, full_text);
 
+            // Truncate on a char boundary; a byte slice panics on multi-byte
+            // UTF-8 (e.g. curly quotes) in real transcripts.
             let preview = if full_text.len() > 300 {
-                format!("{}...", &full_text[..300])
+                let mut end = 300;
+                while !full_text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!("{}...", &full_text[..end])
             } else {
                 full_text.clone()
             };

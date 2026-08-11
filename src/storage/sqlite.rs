@@ -50,13 +50,42 @@ fn invalid_persisted_enum(column: usize, kind: &str, value: &str) -> rusqlite::E
     )
 }
 
+/// Build a SQL condition matching a workspace column against project-scope
+/// roots. NULL/empty workspaces always match (unknown cwd stays visible).
+/// Returns the condition and its positional parameters, in order.
+fn scope_condition(column: &str, roots: &[String]) -> (String, Vec<String>) {
+    let mut clauses = vec![format!("{column} IS NULL"), format!("{column} = ''")];
+    let mut params = Vec::new();
+    for root in roots {
+        let root = root.trim_end_matches('/');
+        if root.is_empty() {
+            continue;
+        }
+        clauses.push(format!("{column} = ?"));
+        params.push(root.to_string());
+        clauses.push(format!("{column} LIKE ? ESCAPE '\\'"));
+        params.push(format!("{}/%", escape_like(root)));
+    }
+    (format!("({})", clauses.join(" OR ")), params)
+}
+
+fn escape_like(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 fn agent_from_slug(slug: &str, column: usize) -> rusqlite::Result<Agent> {
     match slug {
         "claude_code" => Ok(Agent::ClaudeCode),
         "codex" => Ok(Agent::Codex),
+        "factory" => Ok(Agent::Factory),
         "hermes" => Ok(Agent::Hermes),
+        "oh_my_pi" => Ok(Agent::OhMyPi),
         "opencode" => Ok(Agent::OpenCode),
         "pi_agent" => Ok(Agent::PiAgent),
+        "prime_agent" => Ok(Agent::PrimeAgent),
+        "shuvlr" => Ok(Agent::Shuvlr),
         _ => Err(invalid_persisted_enum(column, "agent", slug)),
     }
 }
@@ -944,42 +973,92 @@ impl Storage {
         Ok(summary)
     }
 
+    /// Conversation ids whose workspace is inside the given project scope
+    /// (or unrecorded). Used to constrain result sets built outside SQL,
+    /// e.g. semantic search hits.
+    pub fn scoped_conversation_ids(
+        &self,
+        scope_roots: &[String],
+    ) -> Result<std::collections::HashSet<i64>> {
+        let (cond, params) = scope_condition("c.workspace", scope_roots);
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT c.id FROM conversations c WHERE {cond}"))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            row.get::<_, i64>(0)
+        })?;
+        let mut ids = std::collections::HashSet::new();
+        for row in rows {
+            ids.insert(row?);
+        }
+        Ok(ids)
+    }
+
     /// Get storage statistics
     pub fn stats(&self) -> Result<StorageStats> {
-        let total_conversations: i64 =
-            self.conn
-                .query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))?;
+        self.stats_scoped(None)
+    }
 
-        let total_messages: i64 =
-            self.conn
-                .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))?;
+    /// Get storage statistics, optionally scoped to project roots.
+    ///
+    /// A scoped view counts conversations whose workspace equals a root, lives
+    /// underneath one, or is unrecorded (NULL/empty) — sources that never
+    /// record a cwd must not vanish from scoped views.
+    pub fn stats_scoped(&self, scope_roots: Option<&[String]>) -> Result<StorageStats> {
+        let (cond, params) = match scope_roots {
+            Some(roots) => scope_condition("c.workspace", roots),
+            None => ("1=1".to_string(), Vec::new()),
+        };
 
-        // Get stats by agent
-        let mut stmt = self.conn.prepare(
-            "SELECT agent, COUNT(*) as conv_count,
-             (SELECT COUNT(*) FROM messages WHERE conversation_id IN
-              (SELECT id FROM conversations c2 WHERE c2.agent = c1.agent)) as msg_count
-             FROM conversations c1
-             GROUP BY agent",
+        let total_conversations: i64 = self.conn.query_row(
+            &format!("SELECT COUNT(*) FROM conversations c WHERE {cond}"),
+            rusqlite::params_from_iter(params.iter()),
+            |row| row.get(0),
         )?;
 
-        let mut by_agent = HashMap::new();
-        let rows = stmt.query_map([], |row| {
-            let agent_slug: String = row.get(0)?;
-            let agent = agent_from_slug(&agent_slug, 0)?;
+        let total_messages: i64 = self.conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM messages m
+                 JOIN conversations c ON m.conversation_id = c.id
+                 WHERE {cond}"
+            ),
+            rusqlite::params_from_iter(params.iter()),
+            |row| row.get(0),
+        )?;
 
-            Ok((
-                agent,
-                AgentStats {
-                    conversations: row.get::<_, i64>(1)? as usize,
-                    messages: row.get::<_, i64>(2)? as usize,
-                },
-            ))
-        })?;
+        // Conversation counts by agent
+        let mut by_agent: HashMap<Agent, AgentStats> = HashMap::new();
+        {
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT c.agent, COUNT(*) FROM conversations c WHERE {cond} GROUP BY c.agent"
+            ))?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                let agent_slug: String = row.get(0)?;
+                let agent = agent_from_slug(&agent_slug, 0)?;
+                Ok((agent, row.get::<_, i64>(1)? as usize))
+            })?;
+            for row in rows {
+                let (agent, conversations) = row?;
+                by_agent.entry(agent).or_default().conversations = conversations;
+            }
+        }
 
-        for row in rows {
-            let (agent, stats) = row?;
-            by_agent.insert(agent, stats);
+        // Message counts by agent
+        {
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT c.agent, COUNT(*) FROM messages m
+                 JOIN conversations c ON m.conversation_id = c.id
+                 WHERE {cond} GROUP BY c.agent"
+            ))?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                let agent_slug: String = row.get(0)?;
+                let agent = agent_from_slug(&agent_slug, 0)?;
+                Ok((agent, row.get::<_, i64>(1)? as usize))
+            })?;
+            for row in rows {
+                let (agent, messages) = row?;
+                by_agent.entry(agent).or_default().messages = messages;
+            }
         }
 
         // Get database file size
