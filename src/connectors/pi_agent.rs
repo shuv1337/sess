@@ -18,7 +18,7 @@ use crate::model::{
     source_fingerprint,
 };
 
-const PARSER_REVISION: &str = "4";
+const PARSER_REVISION: &str = "5";
 
 const PI_STANDARD_TOKEN_SEMANTICS: &str = "pi.reported-total-with-additive-components.v1";
 const PI_CURSOR_TOKEN_SEMANTICS: &str = "pi.cursor-sdk.cumulative-reported-total.v1";
@@ -26,6 +26,64 @@ const PI_GOOGLE_TOKEN_SEMANTICS: &str = "pi.google.input-includes-cache-read.v1"
 
 pub struct PiAgentConnector {
     home_dir: Option<PathBuf>,
+}
+
+pub(crate) struct PiFamilyConnector {
+    agent: Agent,
+    home_dir: Option<PathBuf>,
+    root_suffix: &'static str,
+    accept_any_jsonl: bool,
+    deduplicate_standard_pi: bool,
+}
+
+impl PiFamilyConnector {
+    pub(crate) fn factory() -> Self {
+        Self::new(Agent::Factory, ".factory", false, false)
+    }
+
+    pub(crate) fn oh_my_pi() -> Self {
+        Self::new(Agent::OhMyPi, ".omp/agent", false, true)
+    }
+
+    pub(crate) fn prime_agent() -> Self {
+        Self::new(Agent::PrimeAgent, ".prime/agent", false, false)
+    }
+
+    pub(crate) fn shuvlr() -> Self {
+        Self::new(Agent::Shuvlr, ".shuvlr", true, false)
+    }
+
+    fn new(
+        agent: Agent,
+        root_suffix: &'static str,
+        accept_any_jsonl: bool,
+        deduplicate_standard_pi: bool,
+    ) -> Self {
+        Self {
+            agent,
+            home_dir: dirs::home_dir(),
+            root_suffix,
+            accept_any_jsonl,
+            deduplicate_standard_pi,
+        }
+    }
+
+    fn roots(&self) -> Vec<PathBuf> {
+        self.home_dir
+            .as_ref()
+            .map(|home| vec![home.join(self.root_suffix)])
+            .unwrap_or_default()
+    }
+
+    fn excluded_session_ids(&self) -> HashSet<String> {
+        if !self.deduplicate_standard_pi {
+            return HashSet::new();
+        }
+        let helper = PiAgentConnector {
+            home_dir: self.home_dir.clone(),
+        };
+        inventory_pi_session_ids(&helper, &helper.default_roots())
+    }
 }
 
 fn push_unique_root(roots: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, root: PathBuf) {
@@ -95,18 +153,18 @@ impl PiAgentConnector {
         self.home_dir.as_ref().map(|h| h.join(".openclaw"))
     }
 
-    fn session_roots_for_scan(&self, root: &Path) -> (Vec<PathBuf>, bool) {
+    fn session_roots_for_scan(&self, root: &Path, agent: Agent) -> (Vec<PathBuf>, bool) {
         let mut session_roots = Vec::new();
         let mut complete = true;
 
         let direct_sessions = root.join("sessions");
-        if directory_is_accessible(&direct_sessions, &mut complete) {
+        if directory_is_accessible(&direct_sessions, agent, &mut complete) {
             session_roots.push(direct_sessions);
         }
 
         // OpenClaw layout: ~/.openclaw/agents/<agent>/sessions
         let agents_dir = root.join("agents");
-        if directory_is_accessible(&agents_dir, &mut complete) {
+        if directory_is_accessible(&agents_dir, agent, &mut complete) {
             match std::fs::read_dir(&agents_dir) {
                 Ok(entries) => {
                     for entry in entries {
@@ -119,7 +177,7 @@ impl PiAgentConnector {
                                     Err(error) => {
                                         complete = false;
                                         tracing::warn!(
-                                            agent = Agent::PiAgent.slug(),
+                                            agent = agent.slug(),
                                             root = %agent_root.display(),
                                             error = %error,
                                             "Failed to inspect an OpenClaw agent entry"
@@ -128,14 +186,14 @@ impl PiAgentConnector {
                                     }
                                 }
                                 let path = agent_root.join("sessions");
-                                if directory_is_accessible(&path, &mut complete) {
+                                if directory_is_accessible(&path, agent, &mut complete) {
                                     session_roots.push(path);
                                 }
                             }
                             Err(error) => {
                                 complete = false;
                                 tracing::warn!(
-                                    agent = Agent::PiAgent.slug(),
+                                    agent = agent.slug(),
                                     root = %agents_dir.display(),
                                     error = %error,
                                     "Failed to inspect an OpenClaw agent directory"
@@ -147,7 +205,7 @@ impl PiAgentConnector {
                 Err(error) => {
                     complete = false;
                     tracing::warn!(
-                        agent = Agent::PiAgent.slug(),
+                        agent = agent.slug(),
                         root = %agents_dir.display(),
                         error = %error,
                         "Failed to read OpenClaw agent directories"
@@ -162,15 +220,20 @@ impl PiAgentConnector {
     fn scan_matching(
         &self,
         roots: &[PathBuf],
+        agent: Agent,
+        accept_any_jsonl: bool,
+        excluded_session_ids: &HashSet<String>,
         scan_kind: &'static str,
         should_parse: &dyn Fn(&Path) -> Result<bool>,
     ) -> Result<ConnectorScan> {
         let mut conversations = Vec::new();
         let mut seen_session_roots = HashSet::new();
         let mut complete = true;
+        let mut discovered = 0usize;
+        let mut parse_errors = 0usize;
 
         for root in roots {
-            let (session_roots, roots_complete) = self.session_roots_for_scan(root);
+            let (session_roots, roots_complete) = self.session_roots_for_scan(root, agent);
             complete &= roots_complete;
             for sessions_root in session_roots {
                 if !seen_session_roots.insert(path_identity(&sessions_root)) {
@@ -182,7 +245,7 @@ impl PiAgentConnector {
                         Err(error) => {
                             complete = false;
                             tracing::warn!(
-                                agent = Agent::PiAgent.slug(),
+                                agent = agent.slug(),
                                 root = %sessions_root.display(),
                                 scan_kind,
                                 error = %error,
@@ -204,19 +267,25 @@ impl PiAgentConnector {
                         .file_name()
                         .and_then(|name| name.to_str())
                         .unwrap_or("");
-                    if !is_supported_session_filename(file_name) || !should_parse(path)? {
+                    if (!accept_any_jsonl && !is_supported_session_filename(file_name))
+                        || !should_parse(path)?
+                        || session_id_from_header(path)
+                            .is_some_and(|id| excluded_session_ids.contains(&id))
+                    {
                         continue;
                     }
+                    discovered += 1;
 
-                    match parse_pi_session(path) {
+                    match parse_pi_family_session(path, agent) {
                         Ok(Some(conv)) => conversations.push(conv),
                         Ok(None) => {}
                         Err(error) => {
                             complete = false;
+                            parse_errors += 1;
                             match self.on_parse_error(path, &error) {
                                 crate::connectors::ErrorAction::Skip => {
                                     tracing::warn!(
-                                        agent = Agent::PiAgent.slug(),
+                                        agent = agent.slug(),
                                         source_path = %path.display(),
                                         scan_kind,
                                         error = %error,
@@ -238,6 +307,16 @@ impl PiAgentConnector {
             }
         }
 
+        tracing::info!(
+            agent = agent.slug(),
+            roots = roots.len(),
+            discovered,
+            parsed = conversations.len(),
+            parse_errors,
+            scan_kind,
+            "Completed Pi-family session scan"
+        );
+
         Ok(ConnectorScan::new(conversations, complete))
     }
 }
@@ -248,13 +327,13 @@ impl Default for PiAgentConnector {
     }
 }
 
-fn directory_is_accessible(path: &Path, complete: &mut bool) -> bool {
+fn directory_is_accessible(path: &Path, agent: Agent, complete: &mut bool) -> bool {
     match std::fs::metadata(path) {
         Ok(metadata) if metadata.is_dir() => true,
         Ok(_) => {
             *complete = false;
             tracing::warn!(
-                agent = Agent::PiAgent.slug(),
+                agent = agent.slug(),
                 root = %path.display(),
                 "Pi Agent session path exists but is not a directory"
             );
@@ -264,7 +343,7 @@ fn directory_is_accessible(path: &Path, complete: &mut bool) -> bool {
         Err(error) => {
             *complete = false;
             tracing::warn!(
-                agent = Agent::PiAgent.slug(),
+                agent = agent.slug(),
                 root = %path.display(),
                 error = %error,
                 "Failed to inspect Pi Agent session directory"
@@ -281,7 +360,7 @@ impl Connector for PiAgentConnector {
 
     fn detect(&self) -> bool {
         self.default_roots().iter().any(|root| {
-            let (session_roots, complete) = self.session_roots_for_scan(root);
+            let (session_roots, complete) = self.session_roots_for_scan(root, Agent::PiAgent);
             !session_roots.is_empty() || !complete
         })
     }
@@ -299,9 +378,14 @@ impl Connector for PiAgentConnector {
     }
 
     fn scan(&self, roots: &[PathBuf], since_ts: Option<i64>) -> Result<ConnectorScan> {
-        self.scan_matching(roots, "mtime", &|path| {
-            Ok(file_modified_since(path, since_ts))
-        })
+        self.scan_matching(
+            roots,
+            Agent::PiAgent,
+            false,
+            &HashSet::new(),
+            "mtime",
+            &|path| Ok(file_modified_since(path, since_ts)),
+        )
     }
 
     fn scan_unindexed_sources(
@@ -314,12 +398,84 @@ impl Connector for PiAgentConnector {
             return Ok(ConnectorScan::new(Vec::new(), true));
         };
 
-        self.scan_matching(roots, "unindexed-backstop", &|path| {
-            if file_modified_since(path, since_ts) {
-                return Ok(false);
-            }
-            Ok(!is_indexed(path)?)
+        self.scan_matching(
+            roots,
+            Agent::PiAgent,
+            false,
+            &HashSet::new(),
+            "unindexed-backstop",
+            &|path| {
+                if file_modified_since(path, since_ts) {
+                    return Ok(false);
+                }
+                Ok(!is_indexed(path)?)
+            },
+        )
+    }
+
+    fn parser_revision(&self) -> Option<&'static str> {
+        Some(PARSER_REVISION)
+    }
+}
+
+impl Connector for PiFamilyConnector {
+    fn agent(&self) -> Agent {
+        self.agent
+    }
+
+    fn detect(&self) -> bool {
+        let helper = PiAgentConnector {
+            home_dir: self.home_dir.clone(),
+        };
+        self.roots().iter().any(|root| {
+            let (session_roots, complete) = helper.session_roots_for_scan(root, self.agent);
+            !session_roots.is_empty() || !complete
         })
+    }
+
+    fn default_roots(&self) -> Vec<PathBuf> {
+        self.roots()
+    }
+
+    fn scan(&self, roots: &[PathBuf], since_ts: Option<i64>) -> Result<ConnectorScan> {
+        let helper = PiAgentConnector {
+            home_dir: self.home_dir.clone(),
+        };
+        helper.scan_matching(
+            roots,
+            self.agent,
+            self.accept_any_jsonl,
+            &self.excluded_session_ids(),
+            "mtime",
+            &|path| Ok(file_modified_since(path, since_ts)),
+        )
+    }
+
+    fn scan_unindexed_sources(
+        &self,
+        roots: &[PathBuf],
+        since_ts: Option<i64>,
+        is_indexed: &dyn Fn(&Path) -> Result<bool>,
+    ) -> Result<ConnectorScan> {
+        let Some(_) = since_ts else {
+            return Ok(ConnectorScan::new(Vec::new(), true));
+        };
+        let helper = PiAgentConnector {
+            home_dir: self.home_dir.clone(),
+        };
+        helper.scan_matching(
+            roots,
+            self.agent,
+            self.accept_any_jsonl,
+            &self.excluded_session_ids(),
+            "unindexed-backstop",
+            &|path| {
+                if file_modified_since(path, since_ts) {
+                    return Ok(false);
+                }
+                Ok(!is_indexed(path)?)
+            },
+        )
     }
 
     fn parser_revision(&self) -> Option<&'static str> {
@@ -346,6 +502,53 @@ fn is_supported_session_filename(file_name: &str) -> bool {
     }
 
     false
+}
+
+fn session_id_from_header(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    BufReader::new(file)
+        .lines()
+        .map_while(std::result::Result::ok)
+        .filter(|line| !line.trim().is_empty())
+        .take(4)
+        .find_map(|line| {
+            let value: Value = serde_json::from_str(&line).ok()?;
+            matches!(
+                value.get("type").and_then(Value::as_str),
+                Some("session") | Some("session_start")
+            )
+            .then(|| value.get("id").and_then(Value::as_str).map(str::to_owned))
+            .flatten()
+        })
+}
+
+fn inventory_pi_session_ids(helper: &PiAgentConnector, roots: &[PathBuf]) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    for root in roots {
+        let (session_roots, _) = helper.session_roots_for_scan(root, Agent::PiAgent);
+        for sessions_root in session_roots {
+            for entry in WalkDir::new(sessions_root)
+                .follow_links(true)
+                .into_iter()
+                .flatten()
+            {
+                if entry.file_type().is_file()
+                    && entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "jsonl")
+                    && entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(is_supported_session_filename)
+                    && let Some(id) = session_id_from_header(entry.path())
+                {
+                    ids.insert(id);
+                }
+            }
+        }
+    }
+    ids
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -482,7 +685,12 @@ fn path_has_segment(path: &Path, needle: &str) -> bool {
     path.to_string_lossy().contains(needle)
 }
 
+#[cfg(test)]
 fn parse_pi_session(path: &Path) -> Result<Option<Conversation>> {
+    parse_pi_family_session(path, Agent::PiAgent)
+}
+
+fn parse_pi_family_session(path: &Path, agent: Agent) -> Result<Option<Conversation>> {
     let file = File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
     let reader = BufReader::new(file);
 
@@ -522,7 +730,7 @@ fn parse_pi_session(path: &Path) -> Result<Option<Conversation>> {
         let entry_type = value.get("type").and_then(|v| v.as_str());
 
         match entry_type {
-            Some("session") => {
+            Some("session") | Some("session_start") => {
                 // Extract session info
                 if let Some(cwd) = value.get("cwd").and_then(|v| v.as_str()) {
                     workspace = Some(PathBuf::from(cwd));
@@ -686,7 +894,8 @@ fn parse_pi_session(path: &Path) -> Result<Option<Conversation>> {
 
     let source_files = vec![source_file];
     let fingerprint = format!(
-        "pi-v{PARSER_REVISION}:{}",
+        "{}-v{PARSER_REVISION}:{}",
+        agent.slug(),
         source_fingerprint(&source_files)
     );
 
@@ -727,7 +936,7 @@ fn parse_pi_session(path: &Path) -> Result<Option<Conversation>> {
     let logical_session_id = parent_external_id.clone().or_else(|| external_id.clone());
 
     Ok(Some(Conversation {
-        agent: Agent::PiAgent,
+        agent,
         external_id,
         title,
         workspace,
@@ -1222,7 +1431,8 @@ mod tests {
             home_dir: Some(PathBuf::from("/nonexistent")),
         };
 
-        let (session_roots, complete) = connector.session_roots_for_scan(root.path());
+        let (session_roots, complete) =
+            connector.session_roots_for_scan(root.path(), Agent::PiAgent);
         assert!(complete);
         assert_eq!(session_roots, vec![root.path().join("sessions")]);
     }
@@ -1441,5 +1651,90 @@ mod tests {
             .scan_unindexed_sources(&roots, Some(since_ts), &|_| Ok(true))
             .unwrap();
         assert!(already_indexed.is_empty());
+    }
+
+    #[test]
+    fn pi_family_connectors_preserve_attribution_and_factory_metadata() {
+        let home = TempDir::new().unwrap();
+        let sessions = home.path().join(".factory/sessions/project");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("8a39b2de-8817-4448-84fb-3733494d81d7.jsonl"),
+            r#"{"type":"session_start","id":"factory-1","cwd":"/factory","title":"Factory task"}
+{"type":"message","timestamp":"2026-08-11T10:00:00Z","message":{"role":"user","content":"build it"}}
+"#,
+        )
+        .unwrap();
+        let connector = PiFamilyConnector {
+            agent: Agent::Factory,
+            home_dir: Some(home.path().to_path_buf()),
+            root_suffix: ".factory",
+            accept_any_jsonl: false,
+            deduplicate_standard_pi: false,
+        };
+
+        let scan = connector.scan(&connector.default_roots(), None).unwrap();
+        assert_eq!(scan.len(), 1);
+        assert_eq!(scan[0].agent, Agent::Factory);
+        assert_eq!(scan[0].external_id.as_deref(), Some("factory-1"));
+        assert_eq!(scan[0].workspace.as_deref(), Some(Path::new("/factory")));
+    }
+
+    #[test]
+    fn oh_my_pi_excludes_session_ids_already_in_standard_pi_roots() {
+        let home = TempDir::new().unwrap();
+        let pi_sessions = home.path().join(".pi/agent/sessions/project");
+        let omp_sessions = home.path().join(".omp/agent/sessions/project");
+        std::fs::create_dir_all(&pi_sessions).unwrap();
+        std::fs::create_dir_all(&omp_sessions).unwrap();
+        let duplicate = r#"{"type":"session","id":"duplicate","cwd":"/work"}
+{"type":"message","message":{"role":"user","content":"same"}}
+"#;
+        std::fs::write(pi_sessions.join("2026_duplicate.jsonl"), duplicate).unwrap();
+        std::fs::write(omp_sessions.join("2026_duplicate.jsonl"), duplicate).unwrap();
+        std::fs::write(
+            omp_sessions.join("2026_unique.jsonl"),
+            r#"{"type":"session","id":"unique","cwd":"/work"}
+{"type":"message","message":{"role":"user","content":"new"}}
+"#,
+        )
+        .unwrap();
+        let connector = PiFamilyConnector {
+            agent: Agent::OhMyPi,
+            home_dir: Some(home.path().to_path_buf()),
+            root_suffix: ".omp/agent",
+            accept_any_jsonl: false,
+            deduplicate_standard_pi: true,
+        };
+
+        let scan = connector.scan(&connector.default_roots(), None).unwrap();
+        assert_eq!(scan.len(), 1);
+        assert_eq!(scan[0].agent, Agent::OhMyPi);
+        assert_eq!(scan[0].external_id.as_deref(), Some("unique"));
+    }
+
+    #[test]
+    fn shuvlr_accepts_named_jsonl_sessions() {
+        let home = TempDir::new().unwrap();
+        let sessions = home.path().join(".shuvlr/sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("repo-audit.jsonl"),
+            r#"{"type":"session","id":"audit","cwd":"/work"}
+{"type":"message","message":{"role":"user","content":"audit"}}
+"#,
+        )
+        .unwrap();
+        let connector = PiFamilyConnector {
+            agent: Agent::Shuvlr,
+            home_dir: Some(home.path().to_path_buf()),
+            root_suffix: ".shuvlr",
+            accept_any_jsonl: true,
+            deduplicate_standard_pi: false,
+        };
+
+        let scan = connector.scan(&connector.default_roots(), None).unwrap();
+        assert_eq!(scan.len(), 1);
+        assert_eq!(scan[0].agent, Agent::Shuvlr);
     }
 }

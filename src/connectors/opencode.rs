@@ -147,12 +147,12 @@ impl Connector for OpenCodeConnector {
                     continue;
                 }
             };
-            if !table_exists(&connection, "session")? {
+            let Some(session_table) = session_table(&connection)? else {
                 continue;
-            }
+            };
             if connection
                 .query_row(
-                    "SELECT 1 FROM session WHERE id = ? LIMIT 1",
+                    &format!("SELECT 1 FROM {session_table} WHERE id = ? LIMIT 1"),
                     [&session_id],
                     |_| Ok(()),
                 )
@@ -273,11 +273,11 @@ fn scan_opencode_roots(roots: &[PathBuf], since_ts: Option<i64>) -> Result<Conne
                 }
                 Err(error) => {
                     parse_errors += 1;
-                    tracing::debug!(
+                    tracing::warn!(
                         agent = Agent::OpenCode.slug(),
                         database = %database.display(),
                         error = %error,
-                        "Skipping unsupported OpenCode database"
+                        "Failed to scan OpenCode database"
                     );
                 }
             }
@@ -358,7 +358,7 @@ fn scan_unindexed_opencode_sources(
                 }
                 Err(error) => {
                     complete = false;
-                    tracing::debug!(
+                    tracing::warn!(
                         agent = Agent::OpenCode.slug(),
                         database = %database.display(),
                         error = %error,
@@ -413,7 +413,7 @@ fn scan_unindexed_opencode_sources(
                 }
                 Err(error) => {
                     complete = false;
-                    tracing::debug!(
+                    tracing::warn!(
                         agent = Agent::OpenCode.slug(),
                         database = %database.display(),
                         error = %error,
@@ -1273,6 +1273,16 @@ fn table_exists(connection: &Connection, table: &str) -> Result<bool> {
         .is_some())
 }
 
+fn session_table(connection: &Connection) -> Result<Option<&'static str>> {
+    if table_exists(connection, "session")? {
+        Ok(Some("session"))
+    } else if table_exists(connection, "session_v2")? {
+        Ok(Some("session_v2"))
+    } else {
+        Ok(None)
+    }
+}
+
 fn table_columns(connection: &Connection, table: &str) -> Result<HashSet<String>> {
     let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
     Ok(statement
@@ -1286,14 +1296,19 @@ fn optional_table_column<'a>(columns: &HashSet<String>, name: &'a str) -> &'a st
 
 fn inventory_database_session_ids(database: &Path) -> Result<HashSet<String>> {
     let connection = open_read_only(database)?;
-    if !table_exists(&connection, "session")? {
-        anyhow::bail!("missing session table");
-    }
-    let columns = table_columns(&connection, "session")?;
+    let Some(session_table) = session_table(&connection)? else {
+        tracing::debug!(
+            agent = Agent::OpenCode.slug(),
+            database = %database.display(),
+            "Ignoring SQLite database without an OpenCode session table"
+        );
+        return Ok(HashSet::new());
+    };
+    let columns = table_columns(&connection, session_table)?;
     if !columns.contains("id") {
         anyhow::bail!("unsupported session schema: missing id");
     }
-    let mut statement = connection.prepare("SELECT id FROM session")?;
+    let mut statement = connection.prepare(&format!("SELECT id FROM {session_table}"))?;
     Ok(statement
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<std::result::Result<HashSet<_>, _>>()?)
@@ -1309,10 +1324,15 @@ fn scan_opencode_database_matching(
     session_filter: Option<&HashSet<String>>,
 ) -> Result<Vec<Conversation>> {
     let connection = open_read_only(database)?;
-    if !table_exists(&connection, "session")? {
-        anyhow::bail!("missing session table");
-    }
-    let columns = table_columns(&connection, "session")?;
+    let Some(session_table) = session_table(&connection)? else {
+        tracing::debug!(
+            agent = Agent::OpenCode.slug(),
+            database = %database.display(),
+            "Ignoring SQLite database without an OpenCode session table"
+        );
+        return Ok(Vec::new());
+    };
+    let columns = table_columns(&connection, session_table)?;
     for required in ["id", "directory", "title", "time_created", "time_updated"] {
         if !columns.contains(required) {
             anyhow::bail!("unsupported session schema: missing {required}");
@@ -1337,7 +1357,7 @@ fn scan_opencode_database_matching(
                 {parent_id}, {fork_session_id}, {agent}, \
                 {cost}, {tokens_input}, {tokens_output}, {tokens_reasoning}, \
                 {tokens_cache_read}, {tokens_cache_write} \
-         FROM session ORDER BY time_created, id"
+         FROM {session_table} ORDER BY time_created, id"
     );
     let has_v1 = table_exists(&connection, "message")? && table_exists(&connection, "part")?;
     let has_v2 = table_exists(&connection, "session_message")?;
@@ -1391,7 +1411,9 @@ fn scan_opencode_database_matching(
         if messages.is_empty() && usage.is_empty() {
             continue;
         }
-        let title = Some(session.title.clone())
+        let title = session
+            .title
+            .clone()
             .filter(|title| !title.trim().is_empty())
             .or_else(|| derive_title(&messages));
         let started_at = messages
@@ -1468,7 +1490,7 @@ fn scan_opencode_database_matching(
 struct DatabaseSession {
     id: String,
     directory: String,
-    title: String,
+    title: Option<String>,
     created_at: i64,
     updated_at: i64,
     model: Option<String>,
@@ -3003,6 +3025,49 @@ mod tests {
         let roots = connector.default_roots();
         assert_eq!(roots.len(), 1);
         assert_eq!(roots[0], PathBuf::from("/test/storage"));
+    }
+
+    #[test]
+    fn database_without_session_store_is_ignored_without_incomplete_scan() {
+        let root = TempDir::new().unwrap();
+        let connection = Connection::open(root.path().join("unrelated.db")).unwrap();
+        connection
+            .execute("CREATE TABLE cache (key TEXT PRIMARY KEY, value TEXT)", [])
+            .unwrap();
+        drop(connection);
+
+        let scan = scan_opencode_roots(&[root.path().to_path_buf()], None).unwrap();
+        assert!(scan.complete);
+        assert!(scan.is_empty());
+    }
+
+    #[test]
+    fn test_scan_session_v2_table_with_nullable_title() {
+        let root = TempDir::new().unwrap();
+        let connection = Connection::open(root.path().join("opencode-local.db")).unwrap();
+        connection
+            .execute_batch(
+                r#"CREATE TABLE session_v2 (
+                    id TEXT PRIMARY KEY, directory TEXT NOT NULL, title TEXT,
+                    time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, model TEXT
+                );
+                CREATE TABLE session_message (
+                    id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL,
+                    seq INTEGER NOT NULL, time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL, data TEXT NOT NULL
+                );
+                INSERT INTO session_v2 VALUES ('local-v2', '/tmp/local', NULL, 1000, 2000, NULL);
+                INSERT INTO session_message VALUES
+                    ('u1', 'local-v2', 'user', 1, 1000, 1000, '{"text":"local user text"}');"#,
+            )
+            .unwrap();
+        drop(connection);
+
+        let scan = scan_opencode_roots(&[root.path().to_path_buf()], None).unwrap();
+        assert!(scan.complete);
+        assert_eq!(scan.len(), 1);
+        assert_eq!(scan[0].external_id.as_deref(), Some("local-v2"));
+        assert_eq!(scan[0].title.as_deref(), Some("local user text"));
     }
 
     #[test]

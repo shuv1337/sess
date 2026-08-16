@@ -276,9 +276,13 @@ pub fn all_connectors() -> Vec<Box<dyn Connector>> {
     vec![
         Box::new(crate::connectors::claude_code::ClaudeCodeConnector::new()),
         Box::new(crate::connectors::codex::CodexConnector::new()),
+        Box::new(crate::connectors::pi_agent::PiFamilyConnector::factory()),
         Box::new(crate::connectors::hermes::HermesConnector::new()),
+        Box::new(crate::connectors::pi_agent::PiFamilyConnector::oh_my_pi()),
         Box::new(crate::connectors::opencode::OpenCodeConnector::new()),
         Box::new(crate::connectors::pi_agent::PiAgentConnector::new()),
+        Box::new(crate::connectors::pi_agent::PiFamilyConnector::prime_agent()),
+        Box::new(crate::connectors::pi_agent::PiFamilyConnector::shuvlr()),
     ]
 }
 
@@ -433,15 +437,19 @@ mod tests {
     // ── all_connectors ─────────────────────────────────────
 
     #[test]
-    fn test_all_connectors_returns_five() {
+    fn test_all_connectors_returns_supported_agents() {
         let connectors = all_connectors();
-        assert_eq!(connectors.len(), 5);
+        assert_eq!(connectors.len(), 9);
 
         let agents: Vec<Agent> = connectors.iter().map(|c| c.agent()).collect();
         assert!(agents.contains(&Agent::ClaudeCode));
         assert!(agents.contains(&Agent::Codex));
+        assert!(agents.contains(&Agent::Factory));
         assert!(agents.contains(&Agent::Hermes));
+        assert!(agents.contains(&Agent::OhMyPi));
         assert!(agents.contains(&Agent::OpenCode));
         assert!(agents.contains(&Agent::PiAgent));
+        assert!(agents.contains(&Agent::PrimeAgent));
+        assert!(agents.contains(&Agent::Shuvlr));
     }
 }
